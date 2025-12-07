@@ -4,7 +4,15 @@ import uuid
 import json
 import sys
 from datetime import datetime
+
 import sidraCore
+
+import importlib
+
+readDrivers = {}
+for driver in sidraCore.driversRead:
+    readDrivers[driver] = importlib.import_module(driver)
+    print("Loaded read driver: " + driver)
 
 #reader info
 readerName = ""
@@ -15,8 +23,9 @@ READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
 TAG_FILTER = "000000"
-POWER_MAX = "30" #330"
 AUTH = True
+
+power = "0"
 
 DEBUG = True
 
@@ -259,13 +268,18 @@ def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAu
     # get plate and class from userData
     tagPlate, tagClass = sidraCore.decodeUserData(userData)
 
-    trn = sidraCore.trnPrefix() + str(uuid.uuid4())
+    trnId = str(uuid.uuid4())
+
+    trn = sidraCore.trnPrefix() + trnId
     tDate = str(dt) #datetime.now()
     #print(" ------>DT " + str(dt))
     #print("RSSI trans: " + str(rssi))
+    
+    print("tDate: " + str(tDate))
 
     #sidraCore.log(str(tDate) + " trn:" + trn + " site:" + READER_NAME + " epc:" + str(epc) + " ant:" + str(antenna) + " rssi:" + str(rssi) + " dt:" + str(dt))
     tData = {
+        'id': trnId,
         'date': str(dt),
         'reader': reader,
         'lane': lane,
@@ -282,6 +296,11 @@ def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAu
         "tidAuthentic": tidAuthentic,
         "pwAuthentic": pwAuthentic,
     }
+    
+    for driver in readDrivers:
+        driver.read(tData)
+        
+    
     sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
 
     tDate = sidraCore.rfStrToDt(tDate)
@@ -317,6 +336,7 @@ for reader in sidraCore.readers:
     if reader['name'] == readerName:
         readerIp = reader['ip']
         antennas = reader['antennas']
+        power = reader['power']
 
 if DEBUG:
         print("Reader " + readerName + " Starting")
@@ -389,10 +409,10 @@ if CONFIGURE:
         ret = xrCmd("tag.security.password_authentication_enable=0")
         ret = xrCmd("tag.security.tid_authentication_enable=0")
     ret = xrCmd("tag.security.tid_mask.enable=0")
-    ret = xrCmd("antennas.1.conducted_power=" + POWER_MAX)
-    ret = xrCmd("antennas.2.conducted_power=" + POWER_MAX)
-    ret = xrCmd("antennas.3.conducted_power=" + POWER_MAX)
-    ret = xrCmd("antennas.4.conducted_power=" + POWER_MAX)
+    ret = xrCmd("antennas.1.conducted_power=" + power)
+    ret = xrCmd("antennas.2.conducted_power=" + power)
+    ret = xrCmd("antennas.3.conducted_power=" + power)
+    ret = xrCmd("antennas.4.conducted_power=" + power)
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
     ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
     #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")

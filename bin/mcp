@@ -896,7 +896,13 @@ while run:
             thisLane = eventRF['lane']
             closestCFid = ""
             closestOffset = 99999
-            possibleLanes = [eventRF['lane'], eventRF['lane'] -1, eventRF['lane'] +1]
+            
+            # lane sanity (same or adjacent lane) unless single lane then only this lane
+            if sidraCore.landMode == sidraCore.LANE_MODE_MULTI:
+                possibleLanes = [eventRF['lane'], eventRF['lane'] - 1, eventRF['lane'] + 1]
+            else:
+                possibleLanes = [eventRF['lane']]
+            #possibleLanes = [eventRF['lane'], eventRF['lane'] -1, eventRF['lane'] +1]
             checked = 0
 
             #print("CHK: " + str(eventQ['epc']))
@@ -951,7 +957,7 @@ while run:
 
         if diffMs < 0:
             if eventCF["type"] == sidraCore.EVENT_CAM:
-                print(" BAD TIME: cam " + str(eventCF['lane']) + " " + eventCF['facing'] + " " + str(diffMs))
+                print(" BAD TIME: cam " + str(eventCF['lane']) + " " + eventCF['facing'] + " " + str(diffMs) + " " + str(eventCF['date']))
             if eventCF["type"] == sidraCore.EVENT_RF:
                 print(" BAD TIME: reader lane " + str(eventCF['lane']) + " " + str(diffMs))
 
@@ -1316,8 +1322,12 @@ while run:
                     if eventR.get('used'):
                         continue
 
-                    # lane sanity (same or adjacent lane)
-                    possibleLanes = [eventR['lane'], eventR['lane'] - 1, eventR['lane'] + 1]
+                    # lane sanity (same or adjacent lane) unless single lane then only this lane
+                    if sidraCore.landMode == sidraCore.LANE_MODE_MULTI:
+                        possibleLanes = [eventR['lane'], eventR['lane'] - 1, eventR['lane'] + 1]
+                    else:
+                        possibleLanes = [eventR['lane']]
+                        
                     if (xmitEvent['laneFront'] not in possibleLanes) and (xmitEvent['laneRear'] not in possibleLanes):
                         continue
 

@@ -20,6 +20,7 @@ VERSION = "0.02.06"
 #config defaults
 sidraApi = ""  #API server to use
 plazaId = "000"
+laneMode = "single"
 eventMargin = 8     #time margin for accepting events as together
 
 #raw config json
@@ -31,8 +32,10 @@ cams = []
 readers = []
 massSensors = []
 lidar = []
-
-
+driversRead = []
+driversServer = []
+driversXmit = []
+servers = []
 
 #max age of image files before they are purged
 imageRetentionSeconds = 36000
@@ -49,6 +52,7 @@ TRN_DONE_DIR = "/var/sidra/trn/done"
 TRN_TMP_DIR = "/var/sidra/trn/tmp"
 XMIT_DIR = "/var/sidra/xmit"
 MASS_DIR = "/var/sidra/mass"
+STREAM_DIR = "/var/sidra/stream"
 LOG_FILE = "sidra.log"
 ERR_LOG_FILE = "errors.log"
 TRN_LOG_FILE = "transactions.log"
@@ -74,6 +78,12 @@ EVENT_CAM = "cam"
 EVENT_RF = "rf"
 EVENT_LIDAR = "lidar"
 
+MASS_OCCUPIED = 1
+MASS_EMPTY = 0
+
+LANE_MODE_SINGLE = "single"
+LANE_MODE_MULTI = "multi"
+
 #absolute positioning
 POS_MIN = 0
 POS_MAX = 1000
@@ -95,6 +105,10 @@ def loadConfig():
     #system info
     global sidraApi
     global plazaId
+    global laneMode
+    global driversRead
+    global driversXmit
+    global driversServer
     global ipList
     global cams
     global readers
@@ -116,13 +130,33 @@ def loadConfig():
     config = cfg
     #print(cfg)
 
+    #drivers read
+    if not cfg.get("driversRead") == None:
+        cams = cfg.get("driversRead")
+
+    #drivers server
+    if not cfg.get("driversServer") == None:
+        driversServer = cfg.get("driversServer")
+        
+    #drivers xmit
+    if not cfg.get("driversXmit") == None:
+        driversXmit = cfg.get("driversXmit")
+        
+    #servers
+        if not cfg.get("servers") == None:
+            cams = cfg.get("servers")
+
     if not cfg.get("sidraApi") == None:
         sidraApi = cfg.get("sidraApi")
 
     # plaza id
     if not cfg.get("plazaId") == None:
         plazaId = cfg.get("plazaId")
-
+        
+    # lane mode
+    if not cfg.get("laneMode") == None:
+        plazaId = cfg.get("laneMode")
+        
     #ipList
     if not cfg.get("ipList") == None:
         ipList = cfg.get("ipList")
@@ -330,6 +364,34 @@ def decodeUserData(userData):
         log("decudeUserData() error: " + str(ex) + " userData: " + str(userData))
 
     return tagPlate, tagClass
+
+####################################################
+# get state for a mass sensor
+####################################################
+def massState(name):
+
+    raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
+    ret = json.dumps(raw)
+
+    return ret
+    trip = ""
+    main = ""
+    
+###########################
+def massOccupied(name):
+    
+    state = massState(name)
+    occupied = True
+    
+    for mass in massSensors:
+        if name == mass['name']:
+            trip = mass['trip']
+            main = mass['main']
+            
+    if state.get(trip) == MASS_EMPTY and state.get(main) == STATE_EMPTY:
+        occupied = False
+        
+    return occupied
 
 ####################################################
 # image encoding/decoding

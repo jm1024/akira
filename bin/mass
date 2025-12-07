@@ -200,9 +200,7 @@ def parseGpio(text):
 def updateMass(current):
 
     output = json.dumps(current)
-    print("OUT")
-    print(output)
-    fileName = sidraCore.MASS_DIR + "/" + lane + sidraCore.STATE_EXTENSION_MASS 
+    fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
     sidraCore.writeFile(fileName, output)
 
 #############################
@@ -250,10 +248,10 @@ if __name__ == "__main__":
     name = args.name
 
     for mass in sidraCore.massSensors:
-        print(name)
-        print(mass["name"])
-        print(mass["ip"])
-        print(mass["lane"])
+        #print(name)
+        #print(mass["name"])
+        #print(mass["ip"])
+        #print(mass["lane"])
         if mass["name"] == name:
             name = mass["name"]
             lane = mass["lane"]

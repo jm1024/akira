@@ -37,6 +37,14 @@ if not sidraCore.isRunning("mcp"):
 if not sidraCore.isRunning("xmit"):
     sidraCore.log("watchdog: xmit down")
     bOk = False
+    
+#check drivers
+for driverXmit in sidraCore.driversXmit:
+    if not sidraCore.isRunning(driverXmit):
+        bOk = False
+for driverServer in sidraCore.driversServer:
+        if not sidraCore.isRunning(driverServer):
+            bOk = False
 
 if not bOk:
     print("Restarting Sidra")

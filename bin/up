@@ -1,7 +1,44 @@
-#!/bin/bash
-/var/sidra/bin/cam &
-/var/sidra/bin/readerInit &
-/var/sidra/bin/massInit &
-/var/sidra/bin/lidar &
-/var/sidra/bin/mcp &
-/var/sidra/bin/xmit &
+#!/usr/bin/env python3
+import subprocess
+import time
+import sidraCore
+
+commands = [
+	"/var/sidra/bin/cam",
+	"/var/sidra/bin/readerInit",
+	"/var/sidra/bin/massInit",
+	"/var/sidra/bin/lidar",
+	"/var/sidra/bin/mcp",
+	"/var/sidra/bin/xmit",
+]
+
+#commands = []
+
+for driverXmit in sidraCore.driversXmit:
+	commands.append("/var/sidra/bin/" + driverXmit)
+	
+for driverServer in sidraCore.driversServer:
+	commands.append("/var/sidra/bin/" + driverServer)
+
+#############################
+def startProcesses():
+
+	processList = []
+	for cmd in commands:
+		print(cmd)
+		try:
+			proc = subprocess.Popen([cmd])
+			processList.append(proc)
+			print(f"Started {cmd} with PID {proc.pid}", flush=True)
+		except Exception as e:
+			print(f"Failed to start {cmd}: {e}", flush=True)
+	return processList
+
+
+#############################
+def main():
+	processList = startProcesses()
+
+#############################
+if __name__ == "__main__":
+	main()

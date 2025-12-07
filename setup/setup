@@ -1,0 +1,4 @@
+#!/bin/bash
+apt install python3-psutil
+apt install python3-ping
+apt install fping

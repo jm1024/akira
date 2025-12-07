@@ -194,8 +194,6 @@ class handler(BaseHTTPRequestHandler):
         #2024-05-29_14:28:18.958
         dtFormat = "%Y-%m-%d_%H:%M:%S"
         sDate = d["transit"]["timestamps"]["image"]
-        #print(sDate)
-        #s2 = sDate.split('.')
 
         #tDate = datetime.strptime(s2[0],dtFormat)
         #milliseconds = int(s2[1])

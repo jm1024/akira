@@ -3,10 +3,11 @@ import psutil
 import time
 import os
 import datetime
-from icmplib import ping
+#from icmplib import ping
 import psutil
 import json
 import glob
+import subprocess
 
 import sidraCore
 
@@ -20,6 +21,34 @@ intervals = (
     ('m', 60),
     ('s', 1),
 )
+
+##########################################
+def ping(host, timeoutMs=500):
+    
+    try:
+        result = subprocess.run(
+            ["fping", "-c1", f"-t{timeoutMs}", host],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+    
+        # fping prints results to stderr
+        line = result.stderr.strip()
+    
+        if result.returncode != 0:
+            return 0
+    
+        # Extract avg latency from: "min/avg/max = A/B/C"
+        if "min/avg/max" in line:
+            stats = line.split("min/avg/max = ")[1]
+            avgLatency = stats.split("/")[1]
+            return float(avgLatency)
+    
+        return 0
+    
+    except Exception:
+        return 0
 
 ##########################################
 def ps(process_name):
@@ -53,8 +82,8 @@ def countFiles(dir_path):
 def isUp(hostname):
 
     ret = "DOWN"
-    host = ping(hostname, count=1, interval=0.2, timeout=.5)
-    ret = round(host.avg_rtt,2)
+    ret = ping(hostname)
+    #ret = round(host.avg_rtt,2)
     if ret == 0:
         ret = "DOWN"
     else:
