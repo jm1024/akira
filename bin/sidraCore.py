@@ -29,6 +29,7 @@ config = {}
 ipList = []
 cams = []
 readers = []
+massSensors = []
 lidar = []
 
 
@@ -47,11 +48,14 @@ TRN_WORKING_DIR = "/var/sidra/trn/working"
 TRN_DONE_DIR = "/var/sidra/trn/done"
 TRN_TMP_DIR = "/var/sidra/trn/tmp"
 XMIT_DIR = "/var/sidra/xmit"
+MASS_DIR = "/var/sidra/mass"
 LOG_FILE = "sidra.log"
 ERR_LOG_FILE = "errors.log"
 TRN_LOG_FILE = "transactions.log"
 MCP_LOG_FILE = "mcp.log"
 CONFIG_FILE = "sidra.cfg"
+
+STATE_EXTENSION_MASS = ".sm"
 
 TRN_EXTENSION_CAM = ".tc"
 TRN_EXTENSION_READER = ".tr"
@@ -94,6 +98,7 @@ def loadConfig():
     global ipList
     global cams
     global readers
+    global massSensors
     global lidar
     global imageRetentionSeconds
     global logTo
@@ -109,6 +114,7 @@ def loadConfig():
 
     #save raw json
     config = cfg
+    #print(cfg)
 
     if not cfg.get("sidraApi") == None:
         sidraApi = cfg.get("sidraApi")
@@ -128,6 +134,10 @@ def loadConfig():
     #readers
     if not cfg.get("readers") == None:
         readers = cfg.get("readers")
+
+    #massSensors
+    if not cfg.get("massSensors") == None:
+        massSensors = cfg.get("massSensors")
 
     #lidar
     if not cfg.get("lidar") == None:

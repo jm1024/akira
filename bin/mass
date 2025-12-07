@@ -1,191 +1,298 @@
 #!/usr/bin/env python3
-import socket
+import telnetlib
 import time
+import argparse
+import sys
+import os
+import json
+import signal
+
 import sidraCore
 
-HOST = "10.3.1.81"
 PORT = 23
 
-USERNAME = "admin"   # change if you changed it on the board
-PASSWORD = "admin"   # change if you changed it on the board
+USERNAME = "admin"
+PASSWORD = "admin"
 
 DEBUG = True
 
-#############################
-def recvNonblocking(sock, timeout=1.0):
-	"""Read whatever is available (non-fatal on timeout)."""
-	
-	ret = ""
-	
-	sock.settimeout(timeout)
-	try:
-		data = sock.recv(4096)
-		if not data:
-			ret = ""
-		ret = data.decode(errors="ignore")
-	except socket.timeout as es:
-		sidraCore.log("mass error: " + str(es))
-		ret = ""
-	except OSError as eo:
-		sidraCore.log("mass error: " + str(eo))
-		ret = ""
+name = ""
+lane = ""
+ip = ""
+state = {}
 
-	if DEBUG:
-		if not ret == "":
-			print("<< " + ret)
-		
-	return ret
-
-#############################
-def sendLine(sock, line, echo=True):
-	
-	msg = (line + "\r").encode("ascii")
-	
-	if DEBUG:
-		print(">> " + str(msg))
-	
-	sock.sendall(msg)
-	if echo:
-		time.sleep(0.1)
-		resp = recvNonblocking(sock)
-		if DEBUG:
-			if resp:
-				print("<<", resp)
-
-#############################
-def login(sock):
-	"""
-	Very simple login: send username then password, ignoring prompts.
-	This works even if we don't parse the exact 'User name:' text.
-	"""
-	time.sleep(0.3)
-	banner = recvNonblocking(sock)
-	if banner:
-		print("<<", banner.strip())
-
-	sendLine(sock, USERNAME)
-	time.sleep(0.2)
-	resp = recvNonblocking(sock)
-	if resp:
-		print("<<", resp.strip())
-
-	sendLine(sock, PASSWORD)
-	time.sleep(0.3)
-	resp = recvNonblocking(sock)
-	if resp:
-		print("<<", resp.strip())
-
-	sendLine(sock, "", echo=False)
-	time.sleep(0.2)
-	resp = recvNonblocking(sock)
-	if resp:
-		print("<<", resp.strip())
+tnConn = None
 
 
 #############################
-def setAllInputsAndNotify(sock):
-	"""
-	- Unmask all GPIOs (iomask ffff)
-	- Set direction: all GPIOs as input (iodir ffff)
-	- Read initial state (readall)
-	- Enable notifications (gpio notify on)
-	"""
-	sendLine(sock, "gpio iomask ffff")
-	sendLine(sock, "gpio iodir ffff")
-	sendLine(sock, "gpio readall")
-	sendLine(sock, "gpio notify on")
-
-	time.sleep(0.05)
-	junk = recvNonblocking(sock)
-	if junk:
-		print("<<", junk.strip())
+def readUntil(tn, marker, timeout=5):
+    """Read until marker bytes are seen or timeout expires."""
+    if DEBUG:
+        print(f"readUntil({marker!r})")
+    data = tn.read_until(marker.encode("ascii"), timeout)
+    if DEBUG and data:
+        try:
+            print("<<", data.decode(errors="ignore"))
+        except Exception:
+            print("<<", data)
+    return data
 
 
 #############################
-def decodeNotifyLine(line):
-	"""
-	Parse a notify line: '<current> <previous> <iodir>'
-	and return a list of (channel, old, new) for changed pins.
-
-	Returns None if the line doesn't look like a notify message.
-	"""
-	parts = line.strip().split()
-	if len(parts) != 3:
-		return None
-
-	curHex, prevHex, iodirHex = parts
-	try:
-		cur = int(curHex, 16)
-		prev = int(prevHex, 16)
-		iodir = int(iodirHex, 16)
-	except ValueError:
-		return None
-
-	changed = cur ^ prev
-	if changed == 0:
-		return []
-
-	changes = []
-	for bit in range(16):
-		mask = 1 << bit
-		if not (iodir & mask):
-			continue
-		if changed & mask:
-			old = 1 if (prev & mask) else 0
-			new = 1 if (cur & mask) else 0
-			changes.append((bit, old, new))
-
-	return changes
+def sendLine(tn, line):
+    """Send a line terminated with CRLF."""
+    msg = (line + "\r\n").encode("ascii")
+    if DEBUG:
+        print(">>", msg)
+    tn.write(msg)
 
 
 #############################
-def monitorNotifications(sock):
-	print("Monitoring GPIO\n")
-	buffer = ""
+def login(tn):
+    # Wait for "User Name:" prompt
+    readUntil(tn, "User Name:", timeout=5)
 
-	try:
-		while True:
-			chunk = recvNonblocking(sock, timeout=1.0)
-			if not chunk:
-				continue
+    # Send username
+    sendLine(tn, USERNAME)
 
-			buffer += chunk
+    # Wait for "Password:" prompt
+    readUntil(tn, "Password:", timeout=5)
 
-			while "\n" in buffer:
-				line, buffer = buffer.split("\n", 1)
-				line = line.strip()
-				if not line:
-					continue
+    # Send password
+    sendLine(tn, PASSWORD)
 
-				changes = decodeNotifyLine(line)
-				if changes is None:
-					print("RAW:", line)
-					continue
+    # Read a little bit of what comes next
+    time.sleep(0.2)
+    data = tn.read_very_eager()
+    text = data.decode(errors="ignore") if data else ""
 
-				if not changes:
-					print("NOTIFY (no bit change?):", line)
-					continue
+    if DEBUG and text:
+        print("LOGIN RESPONSE RAW:\n", text)
 
-				for ch, old, new in changes:
-					print(f"GPIO {ch:02d}: {old} -> {new}   (line: {line})")
+    if "Access denied" in text:
+        print("LOGIN FAILED (Access denied)")
+        raise SystemExit(1)
 
-	except KeyboardInterrupt:
-		print("\nStopping, sending 'gpio notify off'...")
-		try:
-			sendLine(sock, "gpio notify off")
-		except Exception:
-			pass
+    # If no explicit error, treat as success
+    print("Logged in OK")
 
 
 #############################
-def main():
-	print(f"Connecting to Numato GPIO @ {HOST}:{PORT} ...")
-	with socket.create_connection((HOST, PORT), timeout=5) as sock:
-		print("Connected.")
-		login(sock)
-		setAllInputsAndNotify(sock)
-		monitorNotifications(sock)
+def setAllInputsAndNotify(tn):
+    """
+    - iomask: affect all 16 bits
+    - iodir: 1 = input, so ffff = all inputs
+    - readall once (and set initial global state)
+    - enable notifications
+    """
+    global state
 
+    # iomask: affect all 16 bits
+    sendLine(tn, "gpio iomask ffff")
+    time.sleep(0.1)
+    tn.read_very_eager()
 
+    # iodir: 1 = input, so ffff = all inputs
+    sendLine(tn, "gpio iodir ffff")
+    time.sleep(0.1)
+    tn.read_very_eager()
+
+    # initial read
+    sendLine(tn, "gpio readall")
+    time.sleep(0.1)
+    resp = tn.read_very_eager()
+
+    if resp:
+        text = resp.decode(errors="ignore").strip()
+        if DEBUG:
+            print("READALL:\n", text)
+
+        parsed = parseGpio(text)
+        if parsed is not None:
+            state = parsed
+            if DEBUG:
+                print(state)
+
+    # enable notifications
+    sendLine(tn, "gpio notify on")
+    time.sleep(0.1)
+    tn.read_very_eager()
+
+#############################
+def monitorNotifications(tn):
+    
+    global state
+    
+    print("Monitoring GPIO")
+    try:
+        while True:
+            # read one line-ish at a time
+            data = tn.read_until(b"\n", timeout=1)
+            if not data:
+                continue
+            text = data.decode(errors="ignore").strip()
+            if not text:
+                continue
+            state = parseGpio(text)
+            print(state)
+            #print("EVENT RAW:", text)
+    except Exception as ex:
+        print("Exception in monitorNotification: " + str(ex))
+
+#############################
+def parseGpio(text):
+    """
+    Parse either:
+      - notify line: '# FFFF FEFF FFFF'
+      - readall result: 'FEFF', '>>FEFF', etc.
+    Returns dict: {'100':1, ..., '115':0} or None on failure.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    parts = text.split()
+    if not parts:
+        return None
+
+    hexChars = "0123456789ABCDEFabcdef"
+    hexVal = None
+
+    # Case 1: notification line like '# FFFF FEFF FFFF'
+    if parts[0] == "#" and len(parts) >= 3:
+        candidate = "".join(c for c in parts[2] if c in hexChars)
+        if candidate:
+            hexVal = candidate
+
+    # Case 2: readall or anything else: first token that has any hex in it
+    if hexVal is None:
+        for p in parts:
+            candidate = "".join(c for c in p if c in hexChars)
+            if candidate:
+                hexVal = candidate
+                break
+
+    if hexVal is None:
+        if DEBUG:
+            print("parseGpio: no hex found in:", repr(text))
+        return None
+
+    try:
+        value = int(hexVal, 16)
+    except ValueError:
+        if DEBUG:
+            print("parseGpio: bad hex:", hexVal)
+        return None
+
+    # 16-bit, LSB = io100
+    bits = f"{value:016b}"[::-1]
+
+    result = {}
+    for i in range(16):
+        pin = i + 100
+        result[f"{pin}"] = int(bits[i])
+        
+    updateMass(result)
+
+    return result
+    
+#############################
+def updateMass(current):
+
+    output = json.dumps(current)
+    print("OUT")
+    print(output)
+    fileName = sidraCore.MASS_DIR + "/" + lane + sidraCore.STATE_EXTENSION_MASS 
+    sidraCore.writeFile(fileName, output)
+
+#############################
+def handleSignal(signum, frame):
+    global tnConn
+
+    if DEBUG:
+        print(f"handleSignal: received signal {signum}", flush=True)
+
+    if tnConn is not None:
+        try:
+            if DEBUG:
+                print("handleSignal: sending 'gpio notify off' and closing telnet", flush=True)
+            try:
+                sendLine(tnConn, "gpio notify off")
+                time.sleep(0.1)
+            except Exception:
+                pass
+            try:
+                tnConn.close()
+            except Exception:
+                pass
+        finally:
+            tnConn = None
+
+    # exit cleanly (this raises SystemExit, so finally in main will still run)
+    sys.exit(0)
+
+##########################################################
 if __name__ == "__main__":
-	main()
+
+    # debug so we can see what Python sees
+    if DEBUG:
+        print("ARGV:", sys.argv)
+
+    parser = argparse.ArgumentParser(prog="mass")
+    parser.add_argument(
+        "name",
+        nargs="?",
+        default=""
+    )
+
+    args = parser.parse_args()
+
+    name = args.name
+
+    for mass in sidraCore.massSensors:
+        print(name)
+        print(mass["name"])
+        print(mass["ip"])
+        print(mass["lane"])
+        if mass["name"] == name:
+            name = mass["name"]
+            lane = mass["lane"]
+            ip = mass["ip"]
+            print(mass)
+
+    if DEBUG:
+        print(f"Connecting to Numato GPIO @ {ip}:23")
+
+    tnConn = None
+
+    try:
+        tnConn = telnetlib.Telnet(ip, PORT, timeout=5)
+
+        # explicitly own both SIGINT (^C) and SIGHUP
+        signal.signal(signal.SIGINT, handleSignal)
+        signal.signal(signal.SIGHUP, handleSignal)
+
+        login(tnConn)
+        setAllInputsAndNotify(tnConn)
+        monitorNotifications(tnConn)
+
+    except KeyboardInterrupt:
+        # This might still happen if SIGINT is not delivered for some reason
+        if DEBUG:
+            print("\nCtrl+C received (KeyboardInterrupt), cleaning up...", flush=True)
+
+    finally:
+        # Final safety net: if for any reason tnConn is still open, close it here.
+        if tnConn is not None:
+            if DEBUG:
+                print("main: cleaning up telnet (finally)...", flush=True)
+            try:
+                sendLine(tnConn, "gpio notify off")
+                time.sleep(0.1)
+            except Exception:
+                pass
+            try:
+                tnConn.close()
+            except Exception:
+                pass
+            tnConn = None
