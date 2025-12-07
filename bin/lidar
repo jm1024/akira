@@ -1,0 +1,458 @@
+#!/usr/bin/python3
+import socket
+import uuid
+import json
+import os
+import codecs
+#import datetime
+from datetime import date, datetime, timedelta
+import paramiko
+#from ftplib import FTP
+from ftplib import FTP, FTP_TLS, all_errors, error_perm
+import sidraCore
+
+#requires
+#apt install python3-paramiko
+
+errLog = "/var/sidra/log/lidarErrors.log"
+
+fileServer = "10.2.10.15"
+port = 2121
+filePath = ""
+login = "ftpuser"
+password = "ftp123"
+pcdPath = "/vehiclePointCloudPCD"
+#pcdPath = "/var/lib/docker/overlay2/62e5f7b0eb39e87a9917345e54adafe03d846391dfbc9af053876c0f8637ebac/merged/opt/MultiLineApp/vehiclePointCloudPCD"
+#pcdPath = "/var/lib/docker/overlay2/706945c02bc17bf2616f1bc92a5465a17a5b390d1c96cb8ac48f7424791e0049/merged/opt/MultiLineApp/vehiclePointCloudPCD"
+#pcdPath = "/var/lib/docker/overlay2/7b867792fe3807599628d9c8e753798139914bf40263e02578573130df203fcb/merged/opt/MultiLineApp/vehiclePointCloudPCD"
+#pcdPath = "/var/lib/docker/overlay2/7b867792fe3807599628d9c8e753798139914bf40263e02578573130df203fcb/merged/opt/MultiLineApp2025-06-20 05-58-57_6074.pcd"
+#"/var/lib/docker/overlay2/7b867792fe3807599628d9c8e753798139914bf40263e02578573130df203fcb/merged/opt/MultiLineApp/vehiclePointCloudPCD/2025-06-20"
+
+SERVER_PORT = 5000
+
+DEBUG = True
+DEBUG_INPUT = False
+SAVE_FILE = True
+
+
+
+################################
+def sftpFile(host, login, password, remoteFile, localFile):
+    client = None
+    sftp = None
+    try:
+        client = paramiko.Transport((host, 22))
+        client.connect(username=login, password=password)
+        sftp = paramiko.SFTPClient.from_transport(client)
+        sftp.get(remoteFile, localFile)
+    finally:
+        # Always close, even if get() raised
+        try:
+            if sftp is not None:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
+
+################################
+def ftpFile(host, username, password, remoteFile, localFile, port=21, timeout=10, use_tls=False, passive=True):
+                """
+                Download a file via FTP or FTPS (explicit TLS) on any port.
+                """
+                os.makedirs(os.path.dirname(localFile) or ".", exist_ok=True)
+
+                cls = FTP_TLS if use_tls else FTP
+                ftp = cls()
+                try:
+                    ftp.connect(host=host, port=port, timeout=timeout)
+
+                    # For FTPS (explicit TLS), ensure data channel is protected
+                    if use_tls and isinstance(ftp, FTP_TLS):
+                        # Some servers require AUTH before LOGIN; login() usually does it,
+                        # but this is safe and explicit:
+                        try:
+                            ftp.auth()
+                        except all_errors:
+                            # If AUTH not supported or already done, continue to login
+                            pass
+
+                    ftp.login(user=username, passwd=password)
+                    if use_tls and isinstance(ftp, FTP_TLS):
+                        ftp.prot_p()  # encrypt data connection
+
+                    ftp.set_pasv(passive)
+
+                    with open(localFile, "wb") as f:
+                        # BINARY mode download
+                        ftp.retrbinary(f"RETR {remoteFile}", f.write)
+
+                except Exception as ex:
+                    errString = "lidar.ftpFile error: " + str(ex) + " " + str(remoteFile)
+                    sidraCore.appendFile(errLog, errString)
+                finally:
+                    # Try to send QUIT only if socket is still open
+                    try:
+                        if getattr(ftp, "sock", None) is not None:
+                            try:
+                                ftp.quit()
+                            finally:
+                                ftp.close()
+                        else:
+                            ftp.close()
+                    except Exception as ex:
+                        print("xxx: " + str(ex))
+                        # Swallow cleanup errors
+                        pass
+
+################################
+def getPcd_X(data):
+
+    #print(data)
+    fullData = data
+
+    imgFile = data.get('ImagePath')
+    tmpFile = imgFile.replace("./vehiclePointCloudMat", pcdPath)
+    pcdFileName = tmpFile[tmpFile.rfind("/") +1:]
+    pcdFilePath = tmpFile[:tmpFile.rfind("/") +1]
+    pcdFileName  = pcdFileName.replace(".png", ".pcd")
+    filePrefix = pcdFilePath.rstrip('/').split('/')[-1]
+    pcdFileName = filePrefix + " " + pcdFileName
+    pcdFileName = pcdFileName.replace('_','-',2)
+    pcdFile = pcdFilePath + pcdFileName
+    #print(pcdFilePath)
+    #print(pcdFileName)
+
+    #print(imgFile)
+    #print(pcdFile)
+
+    localFile = sidraCore.TRN_TMP_DIR + "/" + data['id']
+
+    try:
+        ftpFile(fileServer, login, password, pcdFile, localFile, port)
+        pcdData = sidraCore.readFile(localFile)
+        sidraCore.deleteFile(localFile)
+        fullData['pcd'] = pcdData
+    except Exception as ex:
+        print("lidar: missing file " + str(ex) + " " + pcdFile)
+
+    return fullData
+
+################################
+def getPcd(data):
+
+    #print("trying PCD")
+    fullData = data
+    imgFile = data.get('ImagePath') or ""
+
+    if not imgFile:
+        return fullData  # no PCD, but keep the event
+
+    try:
+        tmpFile = imgFile.replace("./vehiclePointCloudMat", pcdPath)
+        pcdFileName = tmpFile[tmpFile.rfind("/") + 1:].replace(".png", ".pcd")
+        pcdFilePath = tmpFile[:tmpFile.rfind("/") + 1]
+        filePrefix = pcdFilePath.rstrip('/').split('/')[-1]
+        pcdFileName = (filePrefix + " " + pcdFileName).replace('_', '-', 2)
+        pcdFile = pcdFilePath + pcdFileName
+
+        localFile = sidraCore.TRN_TMP_DIR + "/" + data['id']
+        ftpFile(fileServer, login, password, pcdFile, localFile, port)
+        pcdData = sidraCore.readFile(localFile)
+        sidraCore.deleteFile(localFile)
+        fullData['pcd'] = pcdData
+        #print("gotPCD")
+    except Exception as ex:
+        print("lidar: missing/failed PCD " + str(ex) + " " + (pcdFile if 'pcdFile' in locals() else ""))
+        # keep event even if PCD fetch fails
+
+    return fullData
+
+################################
+def invertLane(lane):
+
+    outLane = 0
+    #print("lane: " + str(lane))
+
+    if lane == 1:
+        outLane = 4
+    if lane == 2:
+        outLane = 3
+    if lane == 3:
+        outLane = 2
+    if lane == 4:
+        outLane = 1
+
+    #print("ret:  " + str(outLane))
+
+    return outLane
+
+
+################################
+def getPos_OLD(d):
+
+    thisInMid = -1
+    thisOutMid = -1
+
+    thisInLane = d.get("InLane")
+    thisInMin = round(d.get("In_MIN_Y"),2)
+    thisInMax = round(d.get("In_MAX_Y"),2)
+    thisInMid = round((thisInMin + thisInMax) /2, 2)
+
+    thisOutLane = d.get("OutLane")
+    thisOutMin = round(d.get("Out_MIN_Y"),2)
+    thisOutMax = round(d.get("Out_MAX_Y"),2)
+    thisOutMid = round((thisOutMin + thisOutMax) /2, 2)
+
+    #if DEBUG:
+    #    print("l: " + str(thisInLane) +  "   m: " + str(thisInMid).rjust(5) + "    l: " + str(thisInMin).rjust(5) + "    r: " + str(thisInMax).rjust(5))
+
+    return thisInMid, thisOutMid
+
+################################
+def getPos(d):
+
+    def f(key, default=0.0):
+        try:
+            return round(float(d.get(key, default)), 2)
+        except Exception:
+            return default
+
+    in_min = f("In_MIN_Y")
+    in_max = f("In_MAX_Y")
+    out_min = f("Out_MIN_Y")
+    out_max = f("Out_MAX_Y")
+
+    in_mid = round((in_min + in_max) / 2.0, 2)
+    out_mid = round((out_min + out_max) / 2.0, 2)
+
+    #if DEBUG:
+    #    print(f"l: {d.get('InLane')}   m: {in_mid:>5}    l: {in_min:>5}    r: {in_max:>5}")
+
+    return in_mid, out_mid
+
+
+################################
+def convertData(data):
+
+    # VanJee time format: 2025-06-23 02:30.34.756
+    #print(data)
+    thisInDtS = data.get('InTime', "")
+
+    try:
+        thisInDt = datetime.strptime(thisInDtS, "%Y-%m-%d %H:%M.%S.%f")
+    except Exception:
+        try:
+            thisInDt = datetime.strptime(thisInDtS, "%Y-%m-%d %H:%M.%S")
+        except Exception as ex:
+            print("lidar ERROR: convertData " + str(ex) + " " + str(data))
+            sidraCore.log("lidar ERROR: convertData " + str(ex) + " " + str(data))
+            return None
+
+    thisOutDtS = data.get('OutTime', "")
+    if not thisOutDtS:
+        thisOutDt = thisInDt
+    else:
+        try:
+            thisOutDt = datetime.strptime(thisOutDtS, "%Y-%m-%d %H:%M.%S.%f")
+        except Exception:
+            try:
+                thisOutDt = datetime.strptime(thisOutDtS, "%Y-%m-%d %H:%M.%S")
+            except Exception as ex1:
+                try:
+                    thisOutDt = datetime.strptime(thisOutDtS, "%Y-%m-%d %H:%M.%S")
+                except Exception as ex2:
+                    msg = f"lidar ERROR: convertData outTime parse failed: {ex1}; {ex2}; data={data}"
+                    print(msg)
+                    sidraCore.log(msg)
+                    return None
+
+    # Numeric speed (abs of possibly-negative float/string)
+    sSpeed = data.get("Speed", 0)
+    try:
+        thisSpeed = abs(float(sSpeed))
+    except Exception:
+        thisSpeed = 0.0
+
+    inPos, outPos = getPos(data)
+
+    # Adjust from GMT (+8)
+    inDate = thisInDt + timedelta(hours=8)
+    outDate = thisOutDt + timedelta(hours=8)
+
+    # Class mapping (VanJee -> MY)
+    sClass = str(data.get("VehicleType", "0"))
+    '''
+    if   sClass == "0":  sClass = "0"
+    elif sClass == "1":  sClass = "01"  # small/midsize car
+    elif sClass == "2":  sClass = "02"  # large car/bus
+    elif sClass == "3":  sClass = "02"  # small truck
+    elif sClass == "4":  sClass = "03"  # midsize truck
+    elif sClass == "5":  sClass = "03"  # large truck
+    elif sClass == "6":  sClass = "03"  # ultra large truck
+    elif sClass == "7":  sClass = "03"  # container truck
+    elif sClass == "8":  sClass = "00"  # motorcycle
+    elif sClass == "9":  sClass = "00"  # tractor
+    '''
+
+    outData = {
+        "id": data['id'],
+        "date": str(inDate),
+        "type": sidraCore.EVENT_LIDAR,
+        "plaza": sidraCore.plazaId,
+        "lane": data.get("InLane"),
+        "class": sClass,
+        "speed": thisSpeed,
+        "height": data.get("Height"),
+        "length": data.get("Length"),
+        "width": data.get("Width"),
+        "inLane": data.get("InLane"),
+        "inPos": inPos,
+        "outPos": outPos,
+        "inDate": str(inDate),
+        "outLane": data.get("OutLane"),
+        "outDate": str(outDate),
+        "axleCount": data.get("AxleNum"),
+        "tireType": data.get("TireType"),
+        "pcd": data.get("pcd"),
+        "used": False,
+        "usedReason": "",
+        "value": data,
+    }
+    return outData
+
+################################
+def run_server(host='0.0.0.0', port=SERVER_PORT):
+    decoder = json.JSONDecoder()
+
+    def handle_obj(thisData: dict):
+        # Only process vehicle frames
+        if not isinstance(thisData, dict):
+            return
+        if thisData.get("TrackId") is None:
+            # status/other frame; ignore
+            return
+
+        thisId = str(uuid.uuid4())
+        thisData["id"] = thisId
+
+        fullData = getPcd(thisData)
+        cleanData = convertData(fullData)
+        if cleanData == None:
+            print("lidar cleanData failed: ignoring")
+            return
+
+        if DEBUG:
+            vjClass = thisData.get('VehicleType')
+            print(str(datetime.now()), str(cleanData.get('inDate')) + " lane:", cleanData.get('inLane'),
+                  "class:", cleanData.get('class'),"pos:", str(cleanData.get('inPos')))
+                  #"vjc:", vjClass)
+
+        if SAVE_FILE:
+            fileName = sidraCore.trnPrefix() + thisId + sidraCore.TRN_EXTENSION_LIDAR
+            sidraCore.writeFile(sidraCore.TRN_DIR + "/" + fileName, json.dumps(cleanData))
+
+    while run:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen()
+            if DEBUG:
+                print("open:", port)
+
+            conn, addr = sock.accept()
+            if DEBUG:
+                print("conn:", addr)
+
+            buf = ""  # carry partial JSON between recv() calls
+
+            with conn:
+                decoder_utf8 = codecs.getincrementaldecoder('utf-8')()
+                buf = ""
+                while True:
+
+                    #print("LIDAR INCOMING")
+                    raw = conn.recv(65536)  # larger read less fragmentation
+                    if DEBUG:
+                        print(str(datetime.now()) + " data: " + str(len(raw)))
+                        #print(str(raw))
+                    if not raw:
+                        break
+
+                    try:
+                        #chunk = raw.decode('utf-8', errors='ignore')
+                        chunk = decoder_utf8.decode(raw, final=False)
+                    except Exception as ex:
+                        print("lidar decode error, resetting decoder:", ex)
+                        decoder_utf8 = codecs.getincrementaldecoder('utf-8')()
+                        buf = ""  # drop partial
+                        continue
+
+                    buf += chunk
+
+                    # peel as many complete JSON values as possible
+                    while True:
+                        # Skip any junk before the next JSON value
+                        #print(buf)
+                        buf = buf.lstrip()
+                        if not buf:
+                            break
+
+                        # Find start of a JSON value
+                        if buf[0] not in "{[":
+                            # Drop until next probable start
+                            next_obj = buf.find('{')
+                            next_arr = buf.find('[')
+                            candidates = [i for i in (next_obj, next_arr) if i != -1]
+                            if not candidates:
+                                buf = ""  # nothing useful left
+                                break
+                            buf = buf[min(candidates):]
+
+                        try:
+                            val, idx = decoder.raw_decode(buf)
+                        except ValueError:
+                            # Incomplete JSON; wait for more data
+                            # Avoid unbounded growth if device goes haywire
+                            #if len(buf) > 1_000_000:
+                            #    buf = buf[-100_000:]
+                            if len(buf) > 1_000_000:
+                                last_obj = buf.rfind('{')
+                                last_arr = buf.rfind('[')
+                                k = max(last_obj, last_arr)
+                                buf = buf[k:] if k != -1 else ""   # keep from last start
+                            break
+
+                        # We got a full JSON value
+                        if isinstance(val, list):
+                            print("data")
+                            #print("LE")
+                            for item in val:
+                                #handle_obj(item)
+                                try:
+                                    handle_obj(item)
+                                except Exception as ex:
+                                    msg = f"lidar handle_obj error: {ex}"
+                                    print(msg); sidraCore.log(msg)
+                        else:
+                            #handle_obj(val)
+                            try:
+                                handle_obj(val)
+                            except Exception as ex:
+                                msg = f"lidar handle_obj error: {ex}"
+                                print(msg); sidraCore.log(msg)
+
+                        # Advance buffer
+                        buf = buf[idx:]
+
+            if DEBUG:
+                print("close:")
+
+###########################################
+run = True
+
+if __name__ == '__main__':
+    run_server()

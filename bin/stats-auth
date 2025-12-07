@@ -1,0 +1,7 @@
+#!/bin/bash
+echo Total:
+grep epc /var/sidra/log/sidra.log | wc -l
+echo Inuthentic:
+grep INAUTHENTIC /var/sidra/log/sidra.log | wc -l
+echo Unknown:
+grep UNKNOWN /var/sidra/log/sidra.log | wc -l

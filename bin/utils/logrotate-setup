@@ -1,0 +1,3 @@
+#!/bin/bash
+cp /var/sidra/bin/utils/logrotate /etc/logrotate.d/sidra
+logrotate /etc/logrotate.conf --debug

@@ -1,0 +1,69 @@
+#!/usr/bin/python3
+import subprocess
+import sys
+from datetime import datetime
+import json
+
+sys.path.append('/var/sidra/bin')
+
+import sidraCore
+import monCore
+
+
+###############################################################
+# main
+###############################################################
+
+bOk = True
+
+# check driver processes
+if not sidraCore.isRunning("cam"):
+    sidraCore.log("watchdog: cam down")
+    bOk = False
+
+for reader in sidraCore.readers:
+    if not sidraCore.isRunning("reader " + reader['name']):
+        sidraCore.log("watchdog: reader " + reader['name'] + " down")
+        bOk = False
+
+if not sidraCore.isRunning("lidar"):
+    sidraCore.log("watchdog: lidar down")
+    bOk = False
+
+if not sidraCore.isRunning("mcp"):
+    sidraCore.log("watchdog: mcp down")
+    bOk = False
+
+if not sidraCore.isRunning("xmit"):
+    sidraCore.log("watchdog: xmit down")
+    bOk = False
+
+if not bOk:
+    print("Restarting Sidra")
+    sidraCore.log("watchdog: Restarting Sidra")
+    cmd = sidraCore.BIN_DIR + "/restart"
+    subprocess.call([cmd])
+    #ps = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+
+#local image server
+if not sidraCore.isRunning("http.server"):
+    sidraCore.log("watchdog: localImageServer down")
+    #print("Restarting localImageServer")
+    sidraCore.log("watchdog: Restarting localImageServer")
+    cmd = sidraCore.BIN_DIR + "/localImageServer"
+    subprocess.call([cmd])
+    #ps = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+
+#mon
+data = monCore.getAll(sidraCore.ipList)
+now = datetime.now()
+monFileName = now.strftime("%Y%m%d%H%M") + ".mon"
+sidraCore.writeFile(monCore.MON_PATH + monFileName, json.dumps(data, indent=2))
+
+#purge image files
+#sidraCore.log("Watchdog Purging Images")
+sidraCore.purgeImageFiles()
+
+#purge image files
+#sidraCore.log("Watchdog Purging Images")
+sidraCore.purgeTransactionFiles()

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import socket
+import time
+import sidraCore
+
+HOST = "10.3.1.81"
+PORT = 23
+
+USERNAME = "admin"   # change if you changed it on the board
+PASSWORD = "admin"   # change if you changed it on the board
+
+DEBUG = True
+
+#############################
+def recvNonblocking(sock, timeout=1.0):
+	"""Read whatever is available (non-fatal on timeout)."""
+	
+	ret = ""
+	
+	sock.settimeout(timeout)
+	try:
+		data = sock.recv(4096)
+		if not data:
+			ret = ""
+		ret = data.decode(errors="ignore")
+	except socket.timeout as es:
+		sidraCore.log("mass error: " + str(es))
+		ret = ""
+	except OSError as eo:
+		sidraCore.log("mass error: " + str(eo))
+		ret = ""
+
+	if DEBUG:
+		if not ret == "":
+			print("<< " + ret)
+		
+	return ret
+
+#############################
+def sendLine(sock, line, echo=True):
+	
+	msg = (line + "\r").encode("ascii")
+	
+	if DEBUG:
+		print(">> " + str(msg))
+	
+	sock.sendall(msg)
+	if echo:
+		time.sleep(0.1)
+		resp = recvNonblocking(sock)
+		if DEBUG:
+			if resp:
+				print("<<", resp)
+
+#############################
+def login(sock):
+	"""
+	Very simple login: send username then password, ignoring prompts.
+	This works even if we don't parse the exact 'User name:' text.
+	"""
+	time.sleep(0.3)
+	banner = recvNonblocking(sock)
+	if banner:
+		print("<<", banner.strip())
+
+	sendLine(sock, USERNAME)
+	time.sleep(0.2)
+	resp = recvNonblocking(sock)
+	if resp:
+		print("<<", resp.strip())
+
+	sendLine(sock, PASSWORD)
+	time.sleep(0.3)
+	resp = recvNonblocking(sock)
+	if resp:
+		print("<<", resp.strip())
+
+	sendLine(sock, "", echo=False)
+	time.sleep(0.2)
+	resp = recvNonblocking(sock)
+	if resp:
+		print("<<", resp.strip())
+
+
+#############################
+def setAllInputsAndNotify(sock):
+	"""
+	- Unmask all GPIOs (iomask ffff)
+	- Set direction: all GPIOs as input (iodir ffff)
+	- Read initial state (readall)
+	- Enable notifications (gpio notify on)
+	"""
+	sendLine(sock, "gpio iomask ffff")
+	sendLine(sock, "gpio iodir ffff")
+	sendLine(sock, "gpio readall")
+	sendLine(sock, "gpio notify on")
+
+	time.sleep(0.05)
+	junk = recvNonblocking(sock)
+	if junk:
+		print("<<", junk.strip())
+
+
+#############################
+def decodeNotifyLine(line):
+	"""
+	Parse a notify line: '<current> <previous> <iodir>'
+	and return a list of (channel, old, new) for changed pins.
+
+	Returns None if the line doesn't look like a notify message.
+	"""
+	parts = line.strip().split()
+	if len(parts) != 3:
+		return None
+
+	curHex, prevHex, iodirHex = parts
+	try:
+		cur = int(curHex, 16)
+		prev = int(prevHex, 16)
+		iodir = int(iodirHex, 16)
+	except ValueError:
+		return None
+
+	changed = cur ^ prev
+	if changed == 0:
+		return []
+
+	changes = []
+	for bit in range(16):
+		mask = 1 << bit
+		if not (iodir & mask):
+			continue
+		if changed & mask:
+			old = 1 if (prev & mask) else 0
+			new = 1 if (cur & mask) else 0
+			changes.append((bit, old, new))
+
+	return changes
+
+
+#############################
+def monitorNotifications(sock):
+	print("Monitoring GPIO\n")
+	buffer = ""
+
+	try:
+		while True:
+			chunk = recvNonblocking(sock, timeout=1.0)
+			if not chunk:
+				continue
+
+			buffer += chunk
+
+			while "\n" in buffer:
+				line, buffer = buffer.split("\n", 1)
+				line = line.strip()
+				if not line:
+					continue
+
+				changes = decodeNotifyLine(line)
+				if changes is None:
+					print("RAW:", line)
+					continue
+
+				if not changes:
+					print("NOTIFY (no bit change?):", line)
+					continue
+
+				for ch, old, new in changes:
+					print(f"GPIO {ch:02d}: {old} -> {new}   (line: {line})")
+
+	except KeyboardInterrupt:
+		print("\nStopping, sending 'gpio notify off'...")
+		try:
+			sendLine(sock, "gpio notify off")
+		except Exception:
+			pass
+
+
+#############################
+def main():
+	print(f"Connecting to Numato GPIO @ {HOST}:{PORT} ...")
+	with socket.create_connection((HOST, PORT), timeout=5) as sock:
+		print("Connected.")
+		login(sock)
+		setAllInputsAndNotify(sock)
+		monitorNotifications(sock)
+
+
+if __name__ == "__main__":
+	main()

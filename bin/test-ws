@@ -1,0 +1,5 @@
+#!/usr/bin/python3
+word = "lost"
+wordList= ["most","mist","miss","lost","fist","fish"]
+words = [w for w in wordList if sum(a!=b for a,b in zip(word,w)) == 1]
+print(words)

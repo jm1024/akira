@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+import psutil
+import time
+import os
+import datetime
+from icmplib import ping
+import psutil
+import json
+
+import sidraCore
+import monCore
+
+###########################################################################
+
+
+
+while True:
+
+    data = monCore.getAll(sidraCore.ipList)
+
+    sidraCore.writeFile(monCore.MON_FILE, json.dumps(data, indent=2))
+
+    # Get current date and time
+    #now = datetime.now()
+
+    # Format as YYYYMMDDHHmmss
+    #dtString = now.strftime("%Y%m%d%H%M%S")
+
+    monCore.clear()
+
+    #pings
+    msg = "Devices\n"
+    for ip in data['pings']:
+        msg = msg + ' ' + ip['name'].rjust(8,' ') + "  " + ip['address'].ljust(13,' ') + "  " + str(ip['state']).rjust(9,' ') + '\n'
+    print(msg)
+
+    #misc
+    msg = "Processes                      Stats\n"
+    msg = msg + "    mcp: " + str(data['mcp']).ljust(8, ' ') + "         mcp: " + str(data['mcpQ']).rjust(5, ' ') + '\n'
+    msg = msg + "   xmit: " + str(data['xmit']).ljust(8, ' ') + "        xmit: " + str(data['xmitQ']).rjust(5, ' ') + '\n'
+    msg = msg + "    cam: " + str(data['cam']).ljust(8, ' ') + "    events/m: " + str(data['epm']).rjust(5, ' ') + '\n'
+    msg = msg + " reader: " + str(data['reader']).ljust(8, ' ') + "    events/h: " + str(data['eph']).rjust(5, ' ') + '\n'
+    msg = msg + "                          img: " + str(data['img']).rjust(5, ' ') + '\n'
+    msg = msg + "                         used: " + str(data['du']).rjust(5, ' ') + '\n'
+    msg = msg + "                          cpu: " + str(data['cpu']).rjust(5, ' ')
+
+    #UPS
+    if len(data["ups"]) > 0:
+        msg = msg + '\n\n'
+        msg = msg + "UPS\n"
+        for ups in data['ups']:
+            if not ups == "":
+                try:
+                    msg = msg + "ups" + str(ups['number']) + ": " + str(ups['status']).strip(' ') + " " + str(ups['charge']) + "% " + str(ups['voltage']) + "v\n"
+                except Exception as ex:
+                    msg = msg + "ERROR: " + str(ex)
+
+    print(msg)
+
+    time.sleep(1)

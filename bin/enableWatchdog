@@ -1,0 +1,7 @@
+#!/bin/bash
+echo "enabling watchdog in cron"
+if crontab -l | grep --quiet "/var/sidra/bin/watchdog"; then
+  echo " - cron already configured"
+else
+  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/watchdog"; } | crontab -
+fi

@@ -1,0 +1,108 @@
+#!/usr/bin/python3
+from datetime import date, datetime, timedelta
+import time
+import json
+import base64
+import os
+import uuid
+import sys
+import fcntl
+
+import sidraCore
+
+DEBUG = True
+DEBUG_LOAD = True
+
+########################################
+def isFileStable(filepath, delay=0.5):
+    size1 = os.path.getsize(filepath)
+    time.sleep(delay)
+    size2 = os.path.getsize(filepath)
+    return size1 == size2
+
+########################################
+def isFileLocked(path):
+    try:
+        with open(path, 'rb') as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return False  # lock acquired and released — file is not in use
+    except BlockingIOError:
+        return True  # another process has it locked
+
+##############################################################################################
+# main
+
+#sidraCore.log("mcp Starting")
+
+run = True
+
+if "-d" in sys.argv:
+    DEBUG = True
+
+if DEBUG:
+    print("debug on")
+
+events = []
+
+while run:
+
+    #sidraCore.log("mcp L-1")
+    #if DEBUG:
+    #    print("LOAD: init")
+
+    # get list of new files
+    files = sidraCore.fileList(sidraCore.XMIT_DIR, newestFirst=True, max=100)
+
+    #let files finish writing out to disk
+    time.sleep(.1) # was .5 before file locking implemented - if file locks dont work maybe make this 1
+
+    fileCount = 0
+
+    #if DEBUG_LOAD:
+    #    print("LOAD: " + str(fileCount))
+
+    # work on each file
+    for file in files:  # JM wrap this in a try
+
+        fullPath = sidraCore.XMIT_DIR + "/" + file
+        #if not isFileStable(fullPath):
+        #    print("File still growing")
+        #    continue
+        if isFileLocked(fullPath):
+            print("File locked: " + fullPath)
+            continue
+
+        xmitResp = False
+
+        #load contents
+        #data = json.loads(sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file))
+        data = sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file)
+
+        fileCount = fileCount + 1
+
+        try:
+            dataSize = len(data)
+            ts = datetime.now()
+            xmitResp = sidraCore.xmitEvent(sidraCore.sidraApi, data)
+            td = datetime.now() - ts
+            if xmitResp:
+                if DEBUG:
+                    print("xmit: ok: " + str(file) + " " + str(td.microseconds / 1000) + " " + str(dataSize))
+                sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+            else:
+                msg = "xmit: failed: " + str(file)
+                if DEBUG:
+                    print(msg)
+                sidraCore.log((msg))
+                time.sleep(.5)
+        except Exception as ex:
+            sidraCore.log("xmit: error: " + str(ex), True)
+
+
+    if DEBUG:
+        if fileCount > 0:
+            print("xmit: sent: " + str(fileCount))
+
+    time.sleep(.05) # change to .01
+

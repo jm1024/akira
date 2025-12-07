@@ -1,0 +1,416 @@
+#!/usr/bin/python3
+import socket
+import uuid
+import json
+import sys
+from datetime import datetime
+import sidraCore
+
+#reader info
+readerName = ""
+readerIp = ""
+antennas = []
+
+READER_COMMAND_PORT = 50007
+READER_EVENT_PORT = 50008
+
+TAG_FILTER = "000000"
+POWER_MAX = "30" #330"
+AUTH = True
+
+DEBUG = True
+
+AUTH_AUTHENTIC = "AUTHENTIC"
+AUTH_INAUTHENTIC = "INAUTHENTIC"
+AUTH_UNKNOWN = "UNKNOWN"
+
+arrivals = {}
+
+#######################
+def xmitCmd(cmd):
+
+    if DEBUG:
+        print(readerIp + " -> " + cmd)
+
+    cmd = cmd + "\r\n"
+    command_socket.sendall(cmd.encode())
+
+#######################
+def recvCmd():
+
+    bResp = command_socket.recv(256)
+
+    if DEBUG:
+        print(readerIp + " <- " + bResp.decode().strip())
+
+    return bResp.decode().strip()
+
+#######################
+def xrCmd(cmd):
+
+    xmitCmd(cmd)
+    return recvCmd()
+
+#######################
+def recvEvent():
+
+    bResp = event_socket.recv(256)
+
+    if DEBUG:
+        print(readerIp + " << " + bResp.decode().strip())
+
+    return bResp.decode().strip()
+
+#######################
+def parseEvent(event):
+
+    global arrivals
+
+    # tag arrive
+    #event.tag.arrive tag_id=0x000000000000000000196358
+
+    vals = event.split(" ")
+
+    #terse arrive event
+    if vals[0] == "event.tag.raw_arrive":
+        dt = ""
+        epc = ""
+        rssi = 0
+
+        for val in vals:
+            d = val.split('=')
+            if d[0] == "first":
+                dt = sidraCore.rfStrToDt(d[1].strip(','))
+                #dt = d[1].strip(',')
+            if d[0] == "tag_id":
+                epc = d[1][2:]
+                epc = epc.strip(',')
+            if d[0] == "rssi":
+                #print(d)
+                rssi = d[1]
+                rssi = rssi.strip(',')
+                #print("RSSI: " + str(rssi))
+
+        arrival = {'dt':dt, 'rssi':rssi}
+
+        #make sure there's not alread an arrive event for this EPC
+        if not epc in arrivals:
+            #print("adding: " + str(arrival))
+            arrivals[epc] = arrival
+        else:
+            arrivals[epc]['rssi'] = rssi
+
+    #full arrive event
+    if vals[0] == "event.tag.arrive":
+        dt = ""
+        epc = ""
+        antenna = ""
+        rssi = ""
+        tid = ""
+        userData = ""
+        tidAuthentic = ""
+        pwAuthentic = ""
+
+        for val in vals:
+            d = val.split('=')
+            if d[0] == "first":
+                dt = sidraCore.rfStrToDt(d[1].strip(','))
+                #dt = d[1].strip(',')
+            if d[0] == "tag_id":
+                epc = d[1][2:]
+                epc = epc.strip(',')
+            if d[0] == "antenna":
+                antenna = d[1].strip(',')
+            if d[0] == "rssi":
+                rssi = d[1]
+                rssi = rssi.strip(',')
+            if d[0] == "tid":
+                tid = d[1]
+                tid = tid.strip(',')
+                if tid.startswith("0x"): #strip leading hex stuff
+                    tid = tid[2:]
+            if d[0] == "user_data":
+                userData = d[1]
+                userData = userData.strip(',')
+            if d[0] == "tid_authentic":
+                tidAuthentic = d[1]
+                tidAuthentic = tidAuthentic.strip(',')
+            if d[0] == "pw_authentic":
+                pwAuthentic = d[1]
+                pwAuthentic = pwAuthentic.strip(',')
+
+        try:
+            if len(tid) > 24:
+                print("reader: trim: " +str(tid))
+                tid = tid[:24]
+                print("reader: done: " +str(tid))
+        except Exception as ex:
+            print("ERROR: reader: truncating tid: " + str(ex))
+
+        arrival = {'dt':dt, 'antenna':antenna, 'rssi':rssi, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
+
+        arrivals[epc] = arrival
+
+    #print(json.dumps(arrivals))
+    #print(json.dumps(arrivals, indent=4))
+
+    #event.tag.arrive tag_id=0x7718000011ED360AAA6BBC32, antenna=2, rssi=-1, tid=, first=2000-01-01T04:51:18.342
+
+    #depart events
+    if vals[0] == "event.tag.depart": # or vals[0] == "event.tag.arrive":
+        dt = ""
+        last = ""
+        antenna = ""
+        rssi = ""
+        epc = ""
+        tid = ""
+        userData = ""
+        tidAuthentic = ""
+        pwAuthentic = ""
+
+        reader = readerName
+
+        for val in vals:
+            d = val.split('=')
+            if d[0] == "first":
+                dt = d[1].strip(',')
+            if d[0] == "last":
+                dt = d[1].strip(',')
+            if d[0] == "antenna":
+                antenna = d[1].strip(',')
+            #if d[0] == "rssi":
+            #    rssi = d[1]
+            if d[0] == "tag_id":
+                epc = d[1][2:]
+                epc = epc.strip(',')
+            if d[0] == "tid":
+                tid = d[1]
+                tid = tid.strip(',')
+                if tid.startswith("0x"): #strip leading hex stuff
+                    tid = tid[2:]
+            if d[0] == "user_data":
+                userData = d[1]
+                userData = userData.strip(',')
+            if d[0] == "tid_authentic":
+                tidAuthentic = d[1]
+                tidAuthentic = tidAuthentic.strip(',')
+            if d[0] == "pw_authentic":
+                pwAuthentic = d[1]
+                pwAuthentic = pwAuthentic.strip(',')
+
+        if tidAuthentic == "":
+            tidAuthentic = AUTH_UNKNOWN
+        if pwAuthentic == "":
+            pwAuthentic = AUTH_UNKNOWN
+
+        try:
+            if len(tid) > 24:
+                print("reader: trim: " +str(tid))
+                tid = tid[:24]
+                print("reader: done: " +str(tid))
+        except Exception as ex:
+            print("ERROR: reader: truncating tid: " + str(ex))
+
+        lane = 0
+        side = "unknown"
+        for thisAntenna in antennas:
+            #print(thisAntenna)
+            #print(thisAntenna.get('number'))
+            #print(antenna)
+            if str(thisAntenna.get('number')) == str(antenna):
+                lane = thisAntenna.get('lane')
+                side = thisAntenna.get('side')
+
+        #get arrival data because.... star :(
+        if epc in arrivals:
+            #print("FOUND ARRIVAL")
+            #print(arrivals[epc])
+            rssi = arrivals[epc].get('rssi')
+            if dt == "":
+                dt = arrivals[epc].get('dt')
+            if pwAuthentic == "" or pwAuthentic == AUTH_INAUTHENTIC:
+                pwAuthentic = arrivals[epc].get('pwAuthentic')
+            if tidAuthentic == "" or tidAuthentic == AUTH_INAUTHENTIC:
+                tidAuthentic = arrivals[epc].get('tidAuthentic')
+            if tid == "":
+                tid = arrivals[epc].get('tid')
+            if userData == "":
+                userData = arrivals[epc].get('userData')
+            #print(arrivals)
+            arrivals = sidraCore.removeDictKey(arrivals, epc)
+            #print(arrivals)
+        else:
+            sidraCore.log("NO ARRIVAL DATA: " + str(epc))
+
+        #print(epc)
+        #print(tid)
+        #print(userData)
+
+        #if no arrival then use last because.... welp
+        if dt == "":
+            dt = last
+
+        #if id.startswith(TAG_FILTER):
+        transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic)
+
+#######################
+def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic):
+
+    # get plate and class from userData
+    tagPlate, tagClass = sidraCore.decodeUserData(userData)
+
+    trn = sidraCore.trnPrefix() + str(uuid.uuid4())
+    tDate = str(dt) #datetime.now()
+    #print(" ------>DT " + str(dt))
+    #print("RSSI trans: " + str(rssi))
+
+    #sidraCore.log(str(tDate) + " trn:" + trn + " site:" + READER_NAME + " epc:" + str(epc) + " ant:" + str(antenna) + " rssi:" + str(rssi) + " dt:" + str(dt))
+    tData = {
+        'date': str(dt),
+        'reader': reader,
+        'lane': lane,
+        'side': side,
+        'antenna': antenna,
+        'ip': readerIp,
+        'ts': dt,
+        'rssi': rssi,
+        'tid': tid,
+        'epc': epc,
+        'userData': userData,
+        'tagPlate': tagPlate,
+        'tagClass': tagClass,
+        "tidAuthentic": tidAuthentic,
+        "pwAuthentic": pwAuthentic,
+    }
+    sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
+
+    tDate = sidraCore.rfStrToDt(tDate)
+
+    output = str(tDate)
+    output = output + " RF  > lane: " + str(lane)
+    output = output + " ant: " + str(antenna)
+    output = output + " epc: " + str(epc)
+    sAuth = "n"
+    if pwAuthentic == "AUTHENTIC":
+        sAuth = "y"
+    output = output + " auth: " + sAuth #str(pwAuthentic)
+    output = output + " tid: " + str(tid)
+    output = output + " user: "+  str(userData)
+    output = output + " tagP: " + str(tagPlate)
+    #output = output + " date: " + str(dt)
+
+    sidraCore.log(output)
+    if DEBUG:
+        print(output)
+
+############################################################################################
+# main
+
+CONFIGURE = True
+
+readerName = sys.argv[1]
+
+sidraCore.log("Reader " + readerName + " Starting")
+
+for reader in sidraCore.readers:
+    print(reader['name'])
+    if reader['name'] == readerName:
+        readerIp = reader['ip']
+        antennas = reader['antennas']
+
+if DEBUG:
+        print("Reader " + readerName + " Starting")
+        print("IP: " + str(readerIp))
+
+#init command connection
+command_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+command_socket.connect((readerIp, READER_COMMAND_PORT))
+
+# init event connection
+event_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+event_socket.connect((readerIp, READER_EVENT_PORT))
+#response = event_socket.recv(256)
+#i1 = response.find('event.connection id =') + len('event.connection id =')
+#i2 = response.find('\r\n\r\n')
+#id = int(response[i1:i2])
+#print "Channel ID: ", id
+#while 1:
+#response = event_socket.recv(256)
+#print response
+
+#login
+ret = xrCmd("reader.login(admin, admin)")
+
+if CONFIGURE:
+    #setup
+    ret = xrCmd("reader.login(admin, admin)")
+    ret = xrCmd("setup.operating_mode=standby")
+    #ret = xrCmd("version.detail")
+    ret = xrCmd("antennas.detected")
+    ret = xrCmd("reader.timestamp_all_events=True")
+    #ret = xrCmd("tag.reporting.arrive_fields=tag_id antenna rssi tid time")
+    #ret = xrCmd("com.network.ntp_servers=time.google.com")
+    ret = xrCmd("com.network.ntp.enabled=1")
+    #ret - xrCmd("com.network.force_ntp_sync()")
+    #ret = xrCmd("com.network.ntp_servers")
+    ret = xrCmd("com.network.tcpkeepalive=1")
+    ret = xrCmd("tag.reporting.depart_time=1000")
+    ret = xrCmd("tag.reporting.report_fields=tag_id tid time antenna rssi")
+    ret = xrCmd("tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid")
+    ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
+    ret = xrCmd("tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic")
+    ret = xrCmd("tag.reporting.taglist_fields=tag_id time tid user_data time antenna repeat pw_authentic tid_authentic")
+    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi")
+    ret = xrCmd("setup.advanced.do_opspecs_once=1")
+    ret = xrCmd("antennas.mux_sequence=0")
+    ret = xrCmd("modem.control.cognitive.auto_mux=1")
+    ret = xrCmd("modem.protocol.isoc.control.user_data_length=8")
+    ret = xrCmd("modem.protocol.isoc.control.tid_data_length=6")
+    ret = xrCmd("modem.protocol.isoc.filter.1.action=ASSERT_DEASSERT")
+    ret = xrCmd("modem.protocol.isoc.filter.1.length=8")
+    ret = xrCmd("modem.protocol.isoc.filter.1.mask=B000")
+    ret = xrCmd("modem.protocol.isoc.filter.1.mem_bank=membank_epc")
+    ret = xrCmd("modem.protocol.isoc.filter.1.offset=32")
+    ret = xrCmd("modem.protocol.isoc.filter.1.session=NOT_USED")
+    ret = xrCmd("modem.protocol.isoc.filtering.use_session=false")
+    ret = xrCmd("modem.protocol.isoc.filtering.enabled=1")
+    ret = xrCmd("modem.protocol.isoc.filter.1.enabled=true")
+    ret = xrCmd("modem.protocol.isoc.control.use_block_write=false")
+    ret = xrCmd("modem.protocol.isoc.control.auto_mac.enable=true")
+    ret = xrCmd("modem.protocol.isoc.control.inventory_both_targets=false")
+    ret = xrCmd("modem.protocol.isoc.control.query_sel=0")
+    ret = xrCmd("modem.protocol.isoc.control.query_session=0")
+    ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
+    ret = xrCmd("modem.protocol.isoc.control.session_id=SESSION_1")
+    if AUTH:
+        ret = xrCmd("tag.security.password_authentication_enable=1")
+        ret = xrCmd("tag.security.tid_authentication_enable=1")
+    else:
+        ret = xrCmd("tag.security.password_authentication_enable=0")
+        ret = xrCmd("tag.security.tid_authentication_enable=0")
+    ret = xrCmd("tag.security.tid_mask.enable=0")
+    ret = xrCmd("antennas.1.conducted_power=" + POWER_MAX)
+    ret = xrCmd("antennas.2.conducted_power=" + POWER_MAX)
+    ret = xrCmd("antennas.3.conducted_power=" + POWER_MAX)
+    ret = xrCmd("antennas.4.conducted_power=" + POWER_MAX)
+    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
+    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
+    #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
+    ret = xrCmd("tag.reporting.arrive_generation=no_wait")
+    ret = xrCmd("reader.profile.save(MalaysiaMLFF)")
+    ret = xrCmd("setup.operating_mode=active")
+
+#ret = xrCmd("reader.profile.show_running_config()")
+
+#get the event channel (rewrite this)
+event = recvEvent()
+i1 = event.find('event.connection id =') + len('event.connection id =')
+id = int(event[i1:])
+
+ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
+ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.raw_arrive)")
+#ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.report)")
+ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.depart)")
+
+while True:
+    parseEvent(recvEvent())

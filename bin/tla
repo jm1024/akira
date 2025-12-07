@@ -1,0 +1,9 @@
+#!/bin/bash
+#if [$1 -eq 0]
+#then
+#    echo no lane
+#    tail -f /var/sidra/log/sidra.log
+#else
+#    echo lane
+    tail -f /var/sidra/log/sidra.log 
+#fi

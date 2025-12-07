@@ -1,0 +1,1556 @@
+#!/usr/bin/python3
+from datetime import date, datetime, timedelta
+import time
+import json
+import base64
+import os
+import uuid
+import sys
+import re
+
+import sidraCore
+import plateUtils
+
+#timing
+PURGE_SECONDS = 12            #should probably be 30
+EVENT_MARGIN_MS = 7000        #delay before processing any events - should be 5000?
+EVENT_MARGIN_RF_MS = 1000     #max read delay between CF and RF to allow association
+
+#lidar stuff
+LIDAR_TIME_WINDOW_MS = 1000   # max time delta allowed
+LIDAR_POS_TOLERANCE = 5       # acceptable pos delta - should be 2 or 3
+LIDAR_W_TIME = 0.65           # weight of time in score
+LIDAR_W_POS = 0.35            # weight of position in score
+
+#image scores
+SEARCH_IMAGE_SCORE = 95
+LOW_IMAGE_SCORE = 80
+MINIMUM_IMAGE_SCORE = 20
+
+DATA_UNKNOWN = "UNKNOWN"
+TAG_AUTHENTIC = "AUTHENTIC"
+TAG_INAUTHENTIC = "INAUTHENTIC"
+
+USED_REASON_MATCH = "match"
+USED_REASON_MATCHPRE = "matchpre"
+USED_REASON_DUPLICATE = "dup"
+USED_REASON_TRIGGER = "trigger"
+USED_REASON_LOCKED = "locked"
+USED_REASON_PARTIAL = "partial"
+USED_REASON_ORPHAN = "orphan"
+USED_REASON_LOW = "low"
+USED_REASON_EDGE = "edge"
+USED_REASON_EXPIRED = "expired"
+
+FACING_FRONT = "front"
+FACING_REAR = "rear"
+
+DEBUG = True
+DEBUG_EVENT = True
+DEBUG_PURGE = False
+DEBUG_PURGE_EXPIRED = True
+DEBUG_LOCK = False
+DEBUG_REPAIR = True
+DEBUG_DEDUP = True
+DEBUG_LOAD = False
+DEBUG_QUEUE = False
+DEBUG_LIDAR_MATCH = True
+
+CALIBRATE = False
+calibration = {}
+
+CALIBRATION_FILE = "/var/sidra/tmp/calibration"
+
+#Tatille vehicle class translations
+vehicleClass = {'MOTORBIKE':'00', 'CAR': '01', 'VAN': '01', 'LIGHT TRUCK': '02', 'TRUCK': '02', 'HEAVY TRUCK': '03', 'TAXI':'04', 'BUS':'05'}
+
+#ANSI Colors
+ANSI_COLORS = {
+    "reset": "\033[0m",
+
+    # Standard colors
+    "black":   "\033[30m",
+    "red":     "\033[31m",
+    "green":   "\033[32m",
+    "yellow":  "\033[33m",
+    "blue":    "\033[34m",
+    "magenta": "\033[35m",
+    "cyan":    "\033[36m",
+    "white":   "\033[37m",
+
+    # Bright colors
+    "bright_black":   "\033[90m",
+    "bright_red":     "\033[91m",
+    "bright_green":   "\033[92m",
+    "bright_yellow":  "\033[93m",
+    "bright_blue":    "\033[94m",
+    "bright_magenta": "\033[95m",
+    "bright_cyan":    "\033[96m",
+    "bright_white":   "\033[97m",
+
+    # Background colors
+    "bg_black":   "\033[40m",
+    "bg_red":     "\033[41m",
+    "bg_green":   "\033[42m",
+    "bg_yellow":  "\033[43m",
+    "bg_blue":    "\033[44m",
+    "bg_magenta": "\033[45m",
+    "bg_cyan":    "\033[46m",
+    "bg_white":   "\033[47m",
+
+    # Bright background colors
+    "bg_bright_black":   "\033[100m",
+    "bg_bright_red":     "\033[101m",
+    "bg_bright_green":   "\033[102m",
+    "bg_bright_yellow":  "\033[103m",
+    "bg_bright_blue":    "\033[104m",
+    "bg_bright_magenta": "\033[105m",
+    "bg_bright_cyan":    "\033[106m",
+    "bg_bright_white":   "\033[107m",
+}
+
+###########################
+def newXmitEvent():
+
+    xmitEvent = {}
+
+    xmitEvent['cf'] = False
+    xmitEvent['cr'] = False
+    xmitEvent['rf'] = False
+    xmitEvent['lidar'] = False
+    xmitEvent['complete'] = False
+
+    #preAssigned
+    xmitEvent['lockedCf'] = ""
+    xmitEvent['lockedEpc'] = ""
+    xmitEvent['lockedCr'] = ""
+
+    #front
+    xmitEvent['laneFront'] = 0
+    xmitEvent['id'] = ""
+    xmitEvent['plaza'] = sidraCore.plazaId
+    xmitEvent['lane'] = 0
+    xmitEvent['date'] = ""
+    xmitEvent['plate'] = ""
+    xmitEvent['plateFront'] = ""
+    xmitEvent['plateFrontScore'] = 0
+    xmitEvent['make'] = ""
+    xmitEvent['model'] = ""
+    xmitEvent['color'] = ""
+    xmitEvent['class'] = ""
+    xmitEvent['vehicleScore'] = 0
+    xmitEvent['img_f'] = ""
+    xmitEvent['img_fp'] = ""
+    xmitEvent['camFrontPos'] = 0
+    xmitEvent['camRearPos'] = 0
+    xmitEvent['speedFront'] = ""
+    xmitEvent['speed'] = ""
+    xmitEvent['imageFrontCoordinates'] = ""
+
+    #rear
+    xmitEvent['laneRear'] = 0
+    xmitEvent['plateRear'] = ""
+    xmitEvent['plateRearScore'] = 0
+    xmitEvent['speedRear'] = ""
+    xmitEvent['imageRearCoordinates'] = ""
+    xmitEvent['img_r'] = ""
+    xmitEvent['img_rp'] = ""
+    xmitEvent['offsetRear'] = 0
+
+    #rf
+    xmitEvent['laneRf'] = 0
+    xmitEvent['epc'] = ""
+    xmitEvent['tid'] =  ""
+    xmitEvent['reader'] =  ""
+    xmitEvent['antenna'] = 0
+    xmitEvent['rssi'] = 0
+    xmitEvent['userData'] =  ""
+    xmitEvent['tagPlate'] = ""
+    xmitEvent['tagClass'] = ""
+    xmitEvent["authentic"] = TAG_INAUTHENTIC
+    xmitEvent['offsetRf'] = 0
+
+    #lidar
+    xmitEvent['lidarId'] = ""
+    xmitEvent['lidarClass'] = 0
+    xmitEvent['lidarSpeed'] = 0
+    xmitEvent['lidarHeight'] = 0
+    xmitEvent['lidarLength'] = 0
+    xmitEvent['lidarWidth'] = 0
+    xmitEvent['lidarInLane'] = 0
+    xmitEvent['lidarInPos'] = 0
+    xmitEvent['lidarInDate'] = ""
+    xmitEvent['lidarOutLane'] = 0
+    xmitEvent['lidarOutPos'] = 0
+    xmitEvent['lidarOutDate'] =  ""
+    xmitEvent['lidarAxleCount'] = 0
+    xmitEvent['lidarPcd'] = ""
+    xmitEvent['offsetLidar'] = 0
+
+    return xmitEvent
+
+###########################
+def colorPad(val, width, color):
+    """
+    Right-justify val to width and wrap in ANSI color codes.
+
+    Arguments:
+        val   : numeric or string value to display
+        width : field width for right-justification
+        color : ANSI escape sequence (e.g. "\033[31m" for red).
+                Default is reset/no color.
+    """
+    ret = "err"
+
+    colorCode = ANSI_COLORS.get(color)
+
+    try:
+        sVal = str(val)
+        ret = f"{colorCode}{sVal:>{width}}\033[0m"
+    except:
+        ret = "ERR"
+
+    return ret
+
+###########################
+def stripColor(text: str) -> str:
+    _ANSI_COLOR_RE = re.compile(r'\x1b\[[0-9;]*m')
+    """Remove ANSI SGR color/style codes (e.g., \x1b[31m ... \x1b[0m)."""
+    return _ANSI_COLOR_RE.sub('', text)
+
+###########################
+def lidarMatchScore(cam_event, lidar_event):
+    """
+    Return a numeric score (lower is better) or None if disqualified.
+    Uses time delta + position delta (+ optional speed consistency).
+    """
+
+    debugReason = ""
+    camId = str(cam_event['date'])
+    lidarId = str(lidar_event['date'])
+
+    #default weights
+    weightTime = LIDAR_W_TIME
+    weightPos = LIDAR_W_POS
+
+    #get lidar dt
+    lidar_dt = lidar_event.get('inDate')
+    if lidar_dt is None:
+        return None
+
+    # time
+    timeDiff = abs(sidraCore.timeOffsetMs(cam_event['date'], lidar_dt))
+    if timeDiff > LIDAR_TIME_WINDOW_MS:
+        if DEBUG_LIDAR_MATCH:
+            print(colorPad("LIDAR: " + lidarId + " time diff too high: " + str(timeDiff) + " " + camId, 0, "yellow"))
+        return None
+
+    # position
+    camPos = cam_event.get('pos')
+    lidarPos = lidar_event.get('inPos')
+    if camPos is None or lidarPos is None:
+        # No position available → fall back to time-only score
+        posDiff = 999
+        weightTime = 1.0
+        weightPos = 0.0
+    else:
+        try:
+            posDiff = abs(float(camPos) - float(lidarPos))
+        except Exception as ex:
+            print("lidarMatchScore - error " + stre(ex))
+            posDiff = 999
+
+        if posDiff > LIDAR_POS_TOLERANCE:
+            if DEBUG_LIDAR_MATCH:
+                print(colorPad("LIDAR: " + lidarId + " pos diff too high: l:" + str(lidarPos) + " c:" + str(camPos) + " d:"  + str(round(posDiff,2)) + " " + camId,0,"cyan"))
+            return None
+
+    #calculate final score
+    weight = weightTime * timeDiff + weightPos * posDiff #+ sp_pen
+
+    if DEBUG_LIDAR_MATCH:
+        print(colorPad("LIDAR: " + lidarId + " Match to: " + camId, 0 ,"green"))
+
+    return weight
+
+###########################
+def calibrateCam(lidarPos, camX, camY, leftPos, rightPos):
+
+    # Convert percent to fraction [0,1]
+    p = camX / 100.0
+    p = max(0.0, min(1.0, p))  # clamp
+
+    span = leftPos - rightPos
+    if span == 0:
+        raise ValueError("leftPos and rightPos cannot be identical")
+
+    # Compute new positions so camX aligns with lidarPos
+    newRight = lidarPos - p * span
+    newLeft = newRight + span
+
+    return round(newLeft, 2), round(newRight, 2)
+
+##############################################################################################
+# main
+
+sidraCore.log("mcp Starting")
+
+if CALIBRATE:
+    try:
+        calibration = json.loads(sidraCore.readFile(CALIBRATION_FILE))
+    except Exception as ex:
+        print("ERROR loading calibration file: " + str(ex))
+
+run = True
+
+if "-d" in sys.argv:
+    DEBUG = True
+
+if DEBUG:
+    print("debug on")
+
+sidraCore.makeDir(sidraCore.TRN_DIR)
+sidraCore.makeDir(sidraCore.TRN_WORKING_DIR)
+sidraCore.makeDir(sidraCore.TRN_DONE_DIR)
+sidraCore.makeDir(sidraCore.XMIT_DIR)
+
+events = []
+
+while run:
+
+    #print("top")
+
+    if DEBUG_LOAD:
+        print("LOAD: init")
+
+    # get list of new files
+    files = sidraCore.fileList(sidraCore.TRN_DIR)
+
+    time.sleep(.1)
+
+    fileCount = 0
+    loadCamCount = 0
+    loadRfCount = 0
+    loadLidarCount = 0
+
+    for file in files:
+        #print(file)
+        fileCount = fileCount +1
+        sidraCore.moveFile(sidraCore.TRN_DIR + '/' + file, sidraCore.TRN_WORKING_DIR + '/' + file)
+
+    if DEBUG_LOAD:
+        print("LOAD: " + str(fileCount))
+
+    # load all files
+    loadCount = 0
+    files = sidraCore.fileList(sidraCore.TRN_WORKING_DIR)
+    for file in files:  # JM wrap this in a try so one bad file doesnt kill everything
+
+        loadCount = loadCount + 1
+        #print("load " + str(loadCount))
+
+        #####################################################
+        #cam
+        #####################################################
+
+        if file.endswith(sidraCore.TRN_EXTENSION_CAM):
+
+            loadCamCount = loadCamCount +1
+
+            #print("loading: WRAP THIS IN A TRY " + str(file))
+            try:
+                data = json.loads(sidraCore.readFile(sidraCore.TRN_WORKING_DIR + "/" + file))
+            except Exception as ex:
+                sidraCore.log("mcp: error: loading file " + str(file) + " - " + str(ex), True)
+                continue
+            #print(data)
+
+            # get dateTime
+            try:
+                thisDtS = data['transit']['timestamps']["image"]
+                thisDt = sidraCore.camStrToDt(thisDtS)
+            except:
+                thisDt = datetime.now()
+
+            dev    = data.get('device', {})
+            device = dev.get('name', 'UNKNOWN')
+            lane   = dev.get('lane', 0)
+            facing = dev.get('facing', FACING_FRONT)
+
+            #get plate
+            try:
+                plate = data['transit']['plate']['text']
+            except:
+                plate = DATA_UNKNOWN
+
+            #get plate score
+            try:
+                plateScore = sidraCore.scoreToInt(data['transit']['plate']['score'])
+            except:
+                plateScore = 0
+
+            #get images
+            imageFile = data['transit']['image']
+
+            imagePlateFile = ""
+            try:
+                imagePlateFile = data['transit']['image_plate']
+                #print("IPF: " + str(imagePlateFile))
+            except Exception as ex:
+                print("error getting plate image")
+
+            try:
+                imageBin = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + imageFile)
+            except Exception as ex:
+                sidraCore.log("ERROR: mcp loading main image " + imageFile + " " + str(ex), True)
+                continue  # main image is mandatory
+
+            imagePlateBin = ""
+            if imagePlateFile:
+                try:
+                    imagePlateBin = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + imagePlateFile)
+                except Exception as ex:
+                    if DEBUG_LOAD:
+                        sidraCore.log("WARN: missing/failed plate image " + str(imagePlateFile) + " " + str(ex))
+
+
+            #get vehicle details
+            make = "UNKNOWN"
+            model = "UNKNOWN"
+            color = "UNKNOWN"
+            vClass = "01"
+            className = "UNKNOWN"
+            coordinates = ""
+
+            makeScore = sidraCore.scoreToInt(data['transit'].get('brand_score', 0))
+            modelScore = sidraCore.scoreToInt(data['transit'].get('model_score', 0))
+            colorScore = sidraCore.scoreToInt(data['transit'].get('color_score', 0))
+            vehicleScore = sidraCore.scoreToInt(data['transit'].get('model_score', 0))
+            classScore = sidraCore.scoreToInt(data['transit'].get('class_score', 0))
+            pos = data['transit'].get('pos')
+            resXpct = data['transit'].get('resXpct')
+            resYpct = data['transit'].get('resYpct')
+            leftPos = data['transit'].get('leftPos')
+            rightPos = data['transit'].get('rightPos')
+
+            try:
+                make = data['transit']['brand']
+                model = data['transit']['model']
+                color = data['transit']['color']
+            except Exception as ex:
+                make = "UNKNOWN"
+                model = "UNKNOWN"
+                color = "UNKNOWN"
+                #print("no make etc")
+
+            if facing == FACING_FRONT:
+                try:
+                    className = data['transit']['class']
+                    if className == "":
+                        className = "UNKNOWN"
+                    if not className == "":
+                        vClass = vehicleClass.get(className, "01")
+                except Exception as ex:
+                    print("error getting vehicle class: " + str(ex))
+                    vClass = "01"
+
+            try:
+                coordinates = data['transit']['plate']['bounding_box']
+            except:
+                coordinates = ""
+                #print("NO COORD")
+
+            #get speed
+            try:
+                speed = float(data['transit']['speed'])
+            except:
+                speed = 0.0
+
+            #check for taxi class - starts with "H"
+            try:
+                if plate.startswith('H'):
+                    className = "TAXI"
+                    vClass = "04"
+            except:
+                print("ERR checking for taxi class")
+
+            #create event
+            event = {
+                "id": str(uuid.uuid4()),
+                "type":sidraCore.EVENT_CAM,
+                "date":thisDt,
+                "plaza":sidraCore.plazaId,
+                "lane":lane,
+                "pos":pos,
+                "resXpct":resXpct,
+                "resYpct":resYpct,
+                "leftPos":leftPos,
+                "rightPos":rightPos,
+                "device":device,
+                'facing':facing,
+                "plate":plate,
+                'plateScore':plateScore,
+                'make':make,
+                'makeScore':makeScore,
+                'model':model,
+                'modelScore':modelScore,
+                'color':color,
+                'colorScore':colorScore,
+                'class':vClass,
+                'classScore': classScore,
+                'className':className,
+                'vehicleScore':vehicleScore,
+                'imageFile':imageFile,
+                'imagePlateFile':imagePlateFile,
+                'speed':speed,
+                'coordinates':coordinates,
+                "used":False,
+                "usedReason":"",
+                "lockedEpc":"",
+                "value":data
+            }
+
+            #toss low scores
+
+            #toss edge images
+            bEdge = False
+            if not coordinates == "":
+                try:
+                    tlX = coordinates['top_left']['x']
+                    brX = coordinates['bottom_right']['x']
+                    #print(event['plate'] + " lane: " + str(event['lane']))
+                    #print(coordinates)
+                    #print("tlx: " + str(tlX))
+                    #print("brx: " + str(brX))
+                    if not tlX == 0: #dont dump images with no plate
+                        if tlX < 50 or brX > 2400: #100% scaling
+                        #if tlX < 38 or brX > 1798:  #80% scaling
+                            bEdge = True
+                except Exception as ex:
+                    print("ERR PLATE COPORDINATES " + str(ex))
+
+            if bEdge:
+                #print("Edge")
+                event['used'] = True
+                event['usedReason'] = USED_REASON_EDGE
+
+            #print("         Color Score: " + str(colorScore))
+            #print("E-SC:" + str(event['class']))
+            #print("E-SV:" + str(vClass))
+            #event['img_r'] = imageBin
+            #event['img_rp'] = imageBinPlate
+
+            #if facing == FACING_FRONT:
+            #    print("plate: " + event['plate'] + " className: " + event['className'])
+
+            events.append(event)
+            sidraCore.moveFile(sidraCore.TRN_WORKING_DIR + '/' + file, sidraCore.TRN_DONE_DIR + '/' + file)
+
+            #xmit to sidraApi
+            xmitEvent = event
+            xmitEvent["op"] = "addCam"
+            xmitEvent['image'] = imageBin
+            xmitEvent['imagePlate'] = imagePlateBin
+
+            sidraCore.queueXmit(json.dumps(xmitEvent, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_CAM)
+            #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
+
+        #####################################################
+        #rf
+        #####################################################
+        #sidraCore.log("mcp L-R")
+        if file.endswith(sidraCore.TRN_EXTENSION_READER):
+            #print("L RF")
+            loadRfCount = loadRfCount +1
+
+            data = json.loads(sidraCore.readFile(sidraCore.TRN_WORKING_DIR + "/" + file))
+
+            thisDtS = data['date']
+            thisDt = sidraCore.rfStrToDt(thisDtS) #sidraCore.rfStrToDt(thisDtS)
+
+            #get lane and side
+            reader = data['reader']
+            lane = data['lane']
+            side = data['side']
+
+            #get antenna
+            antenna = data['antenna']
+
+            #get epc
+            epc = ""
+            try:
+                epc = data['epc']
+            except Exception as ex:
+                epc = ""
+                print("error getting ECP: " + str(ex))
+
+            #get tid
+            tid = data.get('tid', "")
+
+            #get userdata
+            try:
+                userData = data['userData']
+            except Exception as ex:
+                userData = ""
+                print("error getting userData: " + str(ex))
+
+            #plate and class
+            try:
+                tagPlate = data['tagPlate']
+                tagClass = data['tagClass']
+            except Exception as ex:
+                tagPlate = ""
+                tagClass = ""
+                print("error getting tagPlate/Class: " + str(ex))
+
+            #get RSSI
+            rssi = data['rssi']
+
+            #get authentic
+            authentic = TAG_AUTHENTIC
+            try:
+                if not data['tidAuthentic'] == TAG_AUTHENTIC:
+                    authentic = TAG_INAUTHENTIC
+                if not data['pwAuthentic'] == TAG_AUTHENTIC:
+                    authentic = TAG_INAUTHENTIC
+            except:
+                sidraCore.logMcp("Error getting tag authenticity")
+                authentic = TAG_INAUTHENTIC
+
+            #if not tagPlate == "":
+            #    print("v3 loaded: " + str(epc) + " tp: " + str(tagPlate))
+
+            #create
+            event = {
+                "id": str(uuid.uuid4()),
+                "type":sidraCore.EVENT_RF,
+                "plaza":sidraCore.plazaId,
+                "lane":lane,
+                "side":side,
+                "reader":reader,
+                "antenna":antenna,
+                "date":thisDt,
+                "rssi":rssi,
+                "epc":epc,
+                "tid":tid,
+                "userData":userData,
+                "tagPlate":tagPlate,
+                "tagClass":tagClass,
+                "authentic":authentic,
+                "used":False,
+                "usedReason":"",
+                "value":data
+            }
+
+            events.append(event)
+            sidraCore.moveFile(sidraCore.TRN_WORKING_DIR + '/' + file, sidraCore.TRN_DONE_DIR + '/' + file)
+
+            #xmit to sidraApi
+            xmitEvent = event
+            xmitEvent["op"] = "addRf"
+            sidraCore.queueXmit(json.dumps(xmitEvent, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_READER)
+            #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
+
+        #####################################################
+        #lidar
+        #####################################################
+        #sidraCore.log("mcp L-R")
+        if file.endswith(sidraCore.TRN_EXTENSION_LIDAR):
+
+            loadLidarCount = loadLidarCount +1
+
+            try:
+                data = json.loads(sidraCore.readFile(sidraCore.TRN_WORKING_DIR + "/" + file))
+
+                #create
+                event = data
+
+                #print(event['inPos'])
+
+                #cleanup where required
+                event['date'] = sidraCore.strToDt(event.get('date'))
+                event['inDate'] = sidraCore.strToDt(event.get('inDate'))
+                event['outDate'] = sidraCore.strToDt(event.get('outDate'))
+                event.setdefault('type', sidraCore.EVENT_LIDAR)
+                event.setdefault('id', str(uuid.uuid4()))
+                event.setdefault('used', False)
+                event.setdefault('usedReason', '')
+
+                if event['pcd'] == None:
+                    print("NO PCD DATA")
+
+                events.append(event)
+                sidraCore.moveFile(sidraCore.TRN_WORKING_DIR + '/' + file, sidraCore.TRN_DONE_DIR + '/' + file)
+
+                #xmit to sidraApi
+                xmitEvent = event
+                xmitEvent["op"] = "addLidar"
+                #pcdLen = len(xmitEvent["pcd"])
+                #print("pcdLen: " + str(pcdLen))
+                #print(xmitEvent)
+                sidraCore.queueXmit(json.dumps(xmitEvent, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_LIDAR)
+                #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
+            except Exception as ex:
+                sidraCore.log("ERROR: mcp - error loading lidar: " + str(ex))
+                if DEBUG:
+                    print("ERROR: mcp - error loading lidar: " + str(ex))
+
+    if DEBUG_LOAD:
+        print(" loaded: " + str(fileCount) + " cam: " + str(loadCamCount) + " rf: " + str(loadRfCount) + " lidar: " + str(loadLidarCount))
+
+    #########################################################################################################
+    # pre-sort and cleanup
+    #########################################################################################################
+
+    #################################################################
+    # cleanup camFronts
+    #################################################################
+
+    #print("p: cleanup")
+    for eventCF in events:
+
+        if eventCF["type"] == sidraCore.EVENT_CAM and eventCF['facing'] == "front" and eventCF['used'] == False:
+
+            #if it's a partial plate see if the fragment exists in a full plate on another cam
+            partialPlate = str(eventCF['plate']).strip(' ')
+            fullFound = False
+            if len(partialPlate) < 7 and len(partialPlate) > 0:
+                for eventFull in events:
+                    if eventFull["type"] == sidraCore.EVENT_CAM:
+                        if eventFull['facing'] == "front":
+                            fullPlate = str(eventFull['plate']).strip(' ')
+                            if len(fullPlate) > len(partialPlate):
+                                if fullPlate.startswith(partialPlate) or fullPlate.endswith(partialPlate):
+
+                                    if DEBUG_REPAIR:
+                                        msg = ">>> Partial: " + partialPlate + " Full: " + fullPlate
+                                        print(msg)
+                                        sidraCore.log(msg)
+
+                                    eventCF['used'] = True
+                                    eventCF['usedReason'] = USED_REASON_PARTIAL
+                                    fullFound = True
+
+            #if this was a partial and a full was found skip the rest of this loop
+            if fullFound:
+                continue
+
+            #check minimum score
+            if eventCF['plateScore'] < MINIMUM_IMAGE_SCORE:
+                eventCF['used'] = True
+                eventCF['usedReason'] = USED_REASON_LOW
+                continue
+
+            # check for other plates that are close but have a higher score - replace this plate text with better ones
+            repairedFromFront = False
+            candidates = []
+            if eventCF['plateScore'] < SEARCH_IMAGE_SCORE:
+                if DEBUG_REPAIR:
+                    msg = "<<< Low Front score - searching for replacements: " + eventCF['plate'] + " score: " + str(eventCF['plateScore'])
+                    print(msg)
+                    sidraCore.log(msg)
+
+                for eventCandidate in events:
+                    if eventCandidate["type"] == sidraCore.EVENT_CAM:
+                        if eventCandidate['plateScore'] > eventCF['plateScore']:
+                            #add to list of candidates
+                            #candidates.append(eventCandidate['plate'])
+                            candidates.append(eventCandidate)
+                #hits = sidraCore.findObo(candidates, eventCF['plate'])
+                hits = plateUtils.findMatches(candidates, eventCF)
+                #print("plate: " + eventCF['plate'] + " possibilities: " + str(hits))
+
+                if len(hits) > 0:
+                    newPlate = ""
+                    newScore = 0
+                    highestScore = 0
+                    repaired = False
+                    for hit in hits:
+                        for replacement in events:
+                            if replacement["type"] == sidraCore.EVENT_CAM:
+                                if replacement['plate'] == hit and replacement['plateScore'] > highestScore:
+                                    newPlate = replacement['plate']
+                                    newScore = replacement['plateScore']
+                                    if replacement['facing'] == "front":
+                                        repairedFromfront = True
+                                    else:
+                                        repairedFromFront = False
+                                    highestScore = newScore
+                    if eventCF['plate'] != newPlate:
+                        repaired = True
+                    eventCF['plate'] = newPlate
+                    eventCF['plateScore'] = newScore
+
+                    #repaired = True
+                    if DEBUG_REPAIR:
+                        if repaired:
+                            msg = ">>> Pepair found: " + newPlate + " score: " + str(newScore)
+                        else:
+                            msg = ">>> Replacement found: " + newPlate + " score: " + str(newScore)
+                        print(msg)
+                        sidraCore.log(msg)
+
+    #################################################################
+    # dedup camera fronts
+    #################################################################
+    #print("p: dedup")
+    for eventCF in events:
+
+        if eventCF["type"] == sidraCore.EVENT_CAM and eventCF['facing'] == "front" and eventCF['used'] == False:
+            #mark matching front plates as dups
+            for dupEventCF in events:
+                if dupEventCF['type'] == sidraCore.EVENT_CAM:
+                    if dupEventCF['facing'] == "front" and dupEventCF['plate'] == eventCF['plate'] and dupEventCF['used'] == False and not eventCF['id'] == dupEventCF['id']:
+                        #if the dup  has a lower or equal score
+                        if int(dupEventCF['plateScore']) <= int(eventCF['plateScore']):
+                            dupEventCF['used'] = True
+                            dupEventCF['usedReason'] = USED_REASON_DUPLICATE
+                            if DEBUG_DEDUP:
+                                msg = ">>> DEDUP " + eventCF['plate'] + ":" + str(eventCF['lane']) + "=" + dupEventCF['plate'] + ":" + str(dupEventCF['lane'])
+                                print(msg)
+                                sidraCore.log(msg)
+
+    #################################################################
+    #pre sort queue and lock V3 tags
+    #################################################################
+    #print("p: v3")
+    for eventQ in events:
+
+        #get age
+        diffMs = sidraCore.timeOffsetMs(eventQ['date'], datetime.now())
+        # WAS THIS --> diffMs = sidraCore.timeOffsetMs(datetime.now(), eventQ['date'])
+        #diff = datetime.now() - eventQ['date']
+        #diffSec = diff.total_seconds()
+        #if eventQ["type"] == sidraCore.EVENT_RF:
+        #    print("UR: " + str(eventQ['usedReason']) + " tp:" + str(eventQ['tagPlate']) + " epc:" + str(eventQ['epc']) + " diffMs: " + str(diffMs))
+
+        #cleanup RF and pre-assign v3 tags
+        if eventQ["type"] == sidraCore.EVENT_RF and eventQ['used'] == False and eventQ['usedReason'] == "" and diffMs > EVENT_MARGIN_RF_MS:
+
+            thisId = eventQ['id']
+            thisEpc = eventQ['epc']
+            thisTagPlate = eventQ['tagPlate']
+            #print(" @ v3 checking tagPlate: " + thisTagPlate)
+
+            #if there's a tagPlate check for dups by EPC - mark as dups any that dont have tagPlate
+            if not thisTagPlate == "":
+                if DEBUG_DEDUP:
+                    print(" @ v3 deduping tagPlate: " + str(thisTagPlate) + " epc: " + str(thisEpc))
+                for eventQ2 in events:
+                    if eventQ2['type'] == sidraCore.EVENT_RF:
+                        if eventQ2['epc'] == thisEpc:
+                            if eventQ2['tagPlate'] == '':
+                                #eventQ2['used'] = True
+                                eventQ2['usedReason'] = USED_REASON_DUPLICATE
+
+            #if it's a V3 tag lock it to any matching CF
+            bV3Match = False
+            if not thisTagPlate == "":
+                if DEBUG_LOCK:
+                    msg = " @ v3 working tagPlate: " + str(thisTagPlate) + " epc: " + str(thisEpc)
+                    sidraCore.logMcp(msg)
+                    print(msg)
+                for eventLock in events:
+                    if eventLock['type'] == sidraCore.EVENT_CAM:
+                        if eventLock['facing'] == FACING_FRONT and eventLock['used'] == False:
+                            #look for tagPlates with truncated right 0s
+                            if len(str(thisTagPlate)) < len(str(eventLock['plate'])):
+                                thisTagPlateCandidate = thisTagPlate.ljust(len(eventLock['plate']), '0')
+                                if thisTagPlateCandidate == eventLock['plate']:
+                                    thisTagPlate = thisTagPlateCandidate
+                                    eventQ['tagPlate'] = thisTagPlate
+                                    #eventQ2['tagPlate'] = thisTagPlate <- was q2 not sure if this is right?
+                            if eventLock['plate'] == thisTagPlate:
+                                eventLock['lockedEpc'] = thisEpc
+                                bV3Match = True
+                                if DEBUG_LOCK:
+                                    msg = " @ LOCK V3: " + str(eventLock['lockedEpc']) +  " lane:" + str(eventQ['lane'])+ " to " + eventLock['plate'] + " lane:" + str(eventLock['lane'])
+                                    print(msg)
+                                    sidraCore.logMcp(msg)
+
+            if not bV3Match and not thisTagPlate == "" and DEBUG_LOCK:
+                msg = " @ FAIL LOCK V3: tagPlate: " + thisTagPlate + " epc: " + thisEpc
+                print(msg)
+                sidraCore.logMcp(msg)
+
+
+    #################################################################
+    #find any unassigned tag reads and match them to their nearest plate
+
+    #print("p: unassigned")
+    for eventRF in events:
+
+        #get age
+        diffMs = sidraCore.timeOffsetMs(eventRF['date'], datetime.now())
+
+        #if eventQ["type"] == sidraCore.EVENT_RF:
+            #print(eventQ["type"])
+            #print(eventQ['used'])
+            #print(diffMs)
+
+        #look for RF events that are older than EVENT_MARGIN_RF_MS (1000ms)
+        if eventRF["type"] == sidraCore.EVENT_RF and eventRF['used'] == False and eventRF['usedReason'] == "" and diffMs > EVENT_MARGIN_RF_MS:
+            thisId = eventRF['id']
+            thisEpc = eventRF['epc']
+            thisDate = eventRF['date']
+            thisLane = eventRF['lane']
+            closestCFid = ""
+            closestOffset = 99999
+            possibleLanes = [eventRF['lane'], eventRF['lane'] -1, eventRF['lane'] +1]
+            checked = 0
+
+            #print("CHK: " + str(eventQ['epc']))
+
+            #look through all CAM FRONT events and find the best match for this RF event
+            for eventQCF in events:
+                if eventQCF["type"] == sidraCore.EVENT_CAM and eventQCF['used'] == False and eventQCF['lockedEpc'] == "" and eventQCF['facing'] ==  FACING_FRONT:
+                    checked = checked +1
+                    if eventQCF['lane'] in possibleLanes:
+                        thisOffset = abs(sidraCore.timeOffsetMs(eventQCF['date'], eventRF['date']))
+                        if thisOffset < closestOffset and thisOffset < EVENT_MARGIN_RF_MS:
+                            closestCFid = eventQCF['id']
+                            closestOffset = thisOffset
+
+            #                else:
+            #                    print("NM: " + eventQCF['plate'] + " off:" + str(thisOffset) + " closest:" + str(closestOffset) + " margin:" + str(EVENT_MARGIN_RF_MS))
+            #            else:
+            #                print("NOT IN LANES")
+            #        else:
+            #            print("NOT FRONT")
+
+            # if theres a cam assign it
+            if not closestCFid == "":
+                #eventQ['used'] = True
+                eventRF['usedReason'] = USED_REASON_MATCHPRE
+                for eventLock in events:
+                    if eventLock['id'] == closestCFid:
+                        eventLock['lockedEpc'] = thisEpc
+                        if DEBUG_LOCK:
+                            print(" @ LOCK: " + str(eventLock['lockedEpc']) +  " lane:" + str(eventQ['lane'])+ " to " + eventLock['plate'] + " lane:" + str(eventLock['lane']))
+            else:
+                if DEBUG_LOCK:
+                    print(" @ UNABLE TO MATCH " + eventQ['epc'] + " tried: " + str(checked))
+
+        #else:
+        #    if eventQ["type"] == sidraCore.EVENT_RF:
+        #        print("NOT CHECKED " + eventQ['epc'] + " diffMs:" + str(diffMs))
+
+
+
+    #################################################################
+    #go through all events and match
+    #################################################################
+    #print("tick")
+    #print("p: match")
+    for eventCF in events:
+
+        #check for bad times
+        diffMs = sidraCore.timeOffsetMs(eventCF['date'], datetime.now())
+        #print("DMS:" + str(diffMs))
+        #diffMs = sidraCore.timeOffsetMs(datetime.now(), eventQ['date'])
+
+        if diffMs < 0:
+            if eventCF["type"] == sidraCore.EVENT_CAM:
+                print(" BAD TIME: cam " + str(eventCF['lane']) + " " + eventCF['facing'] + " " + str(diffMs))
+            if eventCF["type"] == sidraCore.EVENT_RF:
+                print(" BAD TIME: reader lane " + str(eventCF['lane']) + " " + str(diffMs))
+
+        ##############################
+        # front cam - trigger
+        ##############################
+        #if eventCF["type"] == sidraCore.EVENT_CAM:
+        #    print("  q: event " + eventCF["type"] + " " + eventCF['facing'] + " " + str(eventCF['used']) + " " + str(eventCF['usedReason']))
+        if eventCF["type"] == sidraCore.EVENT_CAM and eventCF['facing'] == "front" and eventCF['used'] == False and diffMs > EVENT_MARGIN_MS:
+            #print("    x: event")
+
+            if DEBUG_LOCK:
+                msg = " @ LOCK STAT: " + str(eventCF['plate']) + "->" + str(eventCF['lockedEpc']) + " lane: " + str(eventCF['lane'])
+                print(msg)
+                sidraCore.logMcp(msg)
+
+            eventId = str(uuid.uuid4())
+
+            imgBinF = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + eventCF['imageFile'])
+            #imgBinFp = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + eventCF['imagePlateFile'])
+
+            imgBinFp = ""
+            plate_path = eventCF.get('imagePlateFile') or ""
+            if plate_path:
+                try:
+                    imgBinFp = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + plate_path)
+                except Exception as ex:
+                    if DEBUG_LOAD:
+                        sidraCore.logMcp(f"WARN: missing/failed plate crop during trigger: {plate_path} {ex}")
+
+            # create a new event
+            xmitEvent = {}
+            xmitEvent = newXmitEvent()
+
+            # copy CF data
+            xmitEvent['id'] = eventId
+            xmitEvent['plaza'] = sidraCore.plazaId
+            xmitEvent['lane'] = eventCF['lane']
+            xmitEvent['date'] = eventCF['date']
+            xmitEvent['plate'] = eventCF['plate']
+            xmitEvent['plateFront'] = eventCF['plate']
+            xmitEvent['plateFrontScore'] = eventCF['plateScore']
+            xmitEvent['make'] = eventCF['make']
+            xmitEvent['makeScore'] = eventCF['makeScore']
+            xmitEvent['model'] = eventCF['model']
+            xmitEvent['modelScore'] = eventCF['modelScore']
+            xmitEvent['color'] = eventCF['color']
+            xmitEvent['colorScore'] = eventCF['colorScore']
+            xmitEvent['class'] = eventCF['class']
+            xmitEvent['className'] = eventCF['className']
+            xmitEvent['classScore'] = eventCF['classScore']
+            xmitEvent['vehicleScore'] = eventCF['vehicleScore']
+            xmitEvent['img_f'] = imgBinF
+            xmitEvent['img_fp'] = imgBinFp
+            xmitEvent['camFrontPos'] = eventCF['pos']
+            xmitEvent['speedFront'] = eventCF['speed']
+            xmitEvent['speed'] = eventCF['speed']
+            xmitEvent['imageFrontCoordinates'] = eventCF['coordinates']
+            xmitEvent['cf'] = True
+            xmitEvent['laneFront'] = eventCF['lane']
+            xmitEvent['lockedEpc'] = eventCF['lockedEpc']
+
+            eventCF['used'] = True
+            eventCF['usedReason'] = USED_REASON_TRIGGER
+
+            #mark matching front plates as dups
+            for dupEventCF in events:
+                if dupEventCF['type'] == sidraCore.EVENT_CAM:
+                    if dupEventCF['facing'] == "front" and dupEventCF['plate'] == xmitEvent['plateFront'] and dupEventCF['used'] == False:
+                        dupEventCF['used'] = True
+                        dupEventCF['usedReason'] = USED_REASON_DUPLICATE
+
+            ##############################
+            # lidar
+            ##############################
+            bestLidarId = ""
+            bestLidarScore = 999
+            bestLidarOffset = 999
+
+            #looks for the best lidar score - time and position
+            for eventL in events:
+                if eventL.get('type') == sidraCore.EVENT_LIDAR and eventL.get('used') == False and eventL.get('usedReason', '') == "":
+                    lidarScore = lidarMatchScore(eventCF, eventL)
+                    if lidarScore is None:
+                        continue
+                    if lidarScore < bestLidarScore:
+                        bestLidarScore = lidarScore
+                        bestLidarId = eventL['id']
+
+            #if a lidar event was found
+            if not bestLidarId == "":
+
+                bFoundTarget = False
+                for eventL in events:
+                    if eventL['id'] == bestLidarId:
+
+                        bFoundTarget = True
+
+                        #add lidar details to xmitEvent
+                        xmitEvent['lidarId'] =  eventL['id']
+                        xmitEvent['lidarClass'] =  eventL['class']
+                        xmitEvent['lidarSpeed'] =  eventL['speed']
+                        xmitEvent['lidarHeight'] =  eventL['height']
+                        xmitEvent['lidarLength'] =  eventL['length']
+                        xmitEvent['lidarWidth'] =  eventL['width']
+                        xmitEvent['lidarInLane'] =  eventL['inLane']
+                        xmitEvent['lidarInPos'] =  eventL['inPos']
+                        xmitEvent['lidarInDate'] =  eventL['inDate']
+                        xmitEvent['lidarOutLane'] =  eventL['outLane']
+                        xmitEvent['lidarOutPos'] =  eventL['outPos']
+                        xmitEvent['lidarOutDate'] =  eventL['outDate']
+                        xmitEvent['lidarAxleCount'] =  eventL['axleCount']
+                        xmitEvent['lidarPcd'] =  eventL['pcd']
+
+                        xmitEvent['offsetLidar'] = sidraCore.timeOffsetMs(xmitEvent['date'], eventL['inDate'])
+
+                        eventL['used'] = True
+                        if eventL['usedReason'] == "":
+                            eventL['usedReason'] = USED_REASON_MATCH
+
+                        xmitEvent['lidar'] = True
+
+                        ################################################################
+                        #if calibration is turned on and we have a plate
+                        if CALIBRATE and not eventCF['resXpct'] == None and not eventCF['resYpct'] == None:
+
+                            #get a count of all CFs in the queue
+                            camFrontCount = 0
+                            for cFc in events:
+                                if cFc.get('type') == sidraCore.EVENT_CAM and cFc['facing'] == "front" and cFc.get('used') == False and cFc.get('usedReason', '') == "":
+                                    camFrontCount = camFrontCount +1
+
+                            if camFrontCount > 1:
+                                print("Calibrate: too many cars")
+                                continue
+
+                            lidarPos = eventL['inPos']
+
+                            #def calibrateCam(lidarPos, camX, camY, beginPos, endPos):
+                            #print(eventCF)
+                            newLeft, newRight = calibrateCam(lidarPos, eventCF['resXpct'], eventCF['resYpct'], eventCF['leftPos'], eventCF['rightPos'])
+
+                            laneKey = str(eventCF['lane'])
+                            if laneKey not in calibration:
+                                calibration[laneKey] = {
+                                    'leftSum': newLeft,
+                                    'rightSum': newRight,
+                                    'count': 1,
+                                    'left': newLeft,
+                                    'right': newRight,
+                                    'max': eventL['inPos'],
+                                    'min': eventL['inPos'],
+                                    'maxTop': 0,
+                                    'minTop': 99,
+                                    'maxMid': 0,
+                                    'minMid': 99,
+                                    'maxBottom': 0,
+                                    'minBottom': 99
+                                }
+                            else:
+                                calibration[laneKey]['leftSum'] += round(newLeft,4)
+                                calibration[laneKey]['rightSum'] += round(newRight,4)
+                                calibration[laneKey]['count']    += 1
+
+                                calibration[laneKey]['left'] = round(calibration[laneKey]['leftSum'] / calibration[laneKey]['count'], 2)
+                                calibration[laneKey]['right']   = round(calibration[laneKey]['rightSum']   / calibration[laneKey]['count'], 2)
+
+                                if  lidarPos > calibration[laneKey]['max']:
+                                    calibration[laneKey]['max'] = lidarPos
+                                if  lidarPos < calibration[laneKey]['min']:
+                                    calibration[laneKey]['min'] = lidarPos
+                                #top
+                                if eventCF['resYpct'] >= 66:
+                                    if lidarPos > calibration[laneKey]['maxTop']:
+                                        calibration[laneKey]['maxTop'] = lidarPos
+                                    if lidarPos < calibration[laneKey]['minTop']:
+                                        calibration[laneKey]['minTop'] = lidarPos
+                                #mid
+                                if eventCF['resYpct'] <66 and eventCF['resYpct'] >=33:
+                                    if lidarPos > calibration[laneKey]['maxMid']:
+                                        calibration[laneKey]['maxMid'] = lidarPos
+                                    if lidarPos < calibration[laneKey]['minMid']:
+                                        calibration[laneKey]['minMid'] = lidarPos
+                                #bottom
+                                if eventCF['resYpct'] <33:
+                                    if lidarPos > calibration[laneKey]['maxBottom']:
+                                        calibration[laneKey]['maxBottom'] = lidarPos
+                                    if lidarPos < calibration[laneKey]['minBottom']:
+                                        calibration[laneKey]['minBottom'] = lidarPos
+
+                            calibrateMsg = "\n### CALIBRATE\n"
+                            calibrateMsg = calibrateMsg + "lidar  ln: " + str(eventL['lane']) + "         pos: " + str(eventL['inPos']) + "\n"
+                            calibrateMsg = calibrateMsg + "cam    ln: " + str(eventCF['lane']) + "         pos: " + str(eventCF['pos']) + "\n"
+                            calibrateMsg = calibrateMsg + "     resX: " + str(eventCF['resXpct']) + "     resY: " + str(eventCF['resYpct']) + "\n"
+                            calibrateMsg = calibrateMsg + "    left: " + str(eventCF['leftPos']) + "    right: " + str(eventCF['rightPos']) + "\n"
+                            calibrateMsg = calibrateMsg + "newLeft: " + str(newLeft) + "  newRight: " + str(newRight) + "\n"
+                            print(calibrateMsg)
+
+                            #print("resYpct: " + str(eventCF['resYpct']))
+
+                            #print(calibration)
+                            laneLines = []
+                            laneMsg = ""
+                            for lane, vals in sorted(calibration.items(), key=lambda kv: int(kv[0])):
+                                laneLines.append(f"lane: {lane:<2}left:{vals['left']:>6.2f}      right:{vals['right']:>6.2f}\n")
+                                laneLines.append(f"         max:{vals['max']:>6.2f}        min:{vals['min']:>6.2f}\n")
+                                laneLines.append(f"      maxTop:{vals['maxTop']:>6.2f}     minTop:{vals['minTop']:>6.2f}\n")
+                                laneLines.append(f"      maxMid:{vals['maxMid']:>6.2f}     minMid:{vals['minMid']:>6.2f}\n")
+                                laneLines.append(f"   maxBottom:{vals['maxBottom']:>6.2f}  minBottom:{vals['minBottom']:>6.2f}\n")
+
+                            for line in laneLines:
+                                laneMsg += line
+
+                            print(laneMsg)
+
+                            #print(calibration)
+                            sidraCore.writeFile(CALIBRATION_FILE, json.dumps(calibration, indent=4))
+
+                        ################################################################
+
+                if not bFoundTarget:
+                    print("couldnt find target for " + str(eventCF['plate']))
+
+
+            ##############################
+            #rear cam
+            ##############################
+            crFound = False
+            for eventCR in events:
+
+                #find unused rear cams with matching plates
+                if eventCR['type'] == sidraCore.EVENT_CAM and eventCR['facing'] == "rear" and eventCR['plate'] == xmitEvent['plateFront'] and eventCR['used'] == False:
+
+                    #if it's a partial plate see if the fragment exists in a full plate on another cam
+                    partialPlate = str(eventCR['plate']).strip(' ')
+                    fullFound = False
+                    if len(partialPlate) < 7 and len(partialPlate) > 0:
+                        for eventFull in events:
+                            if eventFull["type"] == sidraCore.EVENT_CAM:
+                                if eventFull['facing'] == "rear":
+                                    fullPlate = str(eventFull['plate']).strip(' ')
+                                    if len(fullPlate) > len(partialPlate):
+                                        if fullPlate.startswith(partialPlate) or fullPlate.endswith(partialPlate):
+
+                                            if DEBUG_REPAIR:
+                                                msg = "<<< Partial: " + partialPlate + " Full: " + fullPlate
+                                                print(msg)
+                                                sidraCore.logMcp(msg)
+
+                                            eventCR['used'] = True
+                                            eventCR['usedReason'] = USED_REASON_PARTIAL
+                                            fullFound = True
+
+                    #if this was a partial and a full was found skip the rest of this loop
+                    if fullFound:
+                        continue
+
+                    #check minimum score
+                    if eventCR['plateScore'] < MINIMUM_IMAGE_SCORE:
+                        eventCR['used'] = True
+                        eventCR['usedReason'] = USED_REASON_LOW
+                        continue
+
+                    # check for other plates that are close but have a higher score
+                    candidates = []
+                    if eventCR['plateScore'] < SEARCH_IMAGE_SCORE:
+
+                        if DEBUG_REPAIR:
+                            msg = ">>> Low Rear score - searching for replacements: " + eventCR['plate'] + " score: " + str(eventCR['plateScore'])
+                            print(msg)
+                            sidraCore.logMcp(msg)
+
+                        for eventCandidate in events:
+                            if eventCandidate["type"] == sidraCore.EVENT_CAM:
+                                if eventCandidate['plateScore'] > eventCR['plateScore']:
+                                    #add to list of candidates
+                                    #candidates.append(eventCandidate['plate'])
+                                    candidates.append(eventCandidate)
+                        #hits = sidraCore.findObo(candidates, eventCR['plate'])
+                        hits = plateUtils.findMatches(candidates, eventCR)
+                        if len(hits) > 0:
+                            newPlate = ""
+                            newScore = 0
+                            highestScore = 0
+                            for hit in hits:
+                                for replacement in events:
+                                    if replacement["type"] == sidraCore.EVENT_CAM:
+                                        if replacement['plate'] == hit and replacement['plateScore'] > highestScore:
+                                            newPlate = replacement['plate']
+                                            newScore = replacement['plateScore']
+                                            highestScore = newScore
+                            eventCR['plate'] = newPlate
+                            eventCR['plateScore'] = newScore
+
+                            if DEBUG_REPAIR:
+                                msg = "<<< Replacement found: " + newPlate + " score: " + str(newScore)
+                                print(msg)
+                                sidraCore.logMcp(msg)
+
+
+                    # get timedelta from front
+                    #diff = eventCF['date'] - eventCR['date']
+                    #diffSec = abs(diff.total_seconds())
+                    diffMs = abs(sidraCore.timeOffsetMs(eventCF['date'], eventCR['date']))
+                    #print("camRear ms:" + str(diffMs))
+
+                    # if this is better than the current rear (if any) use it
+                    if eventCR['plateScore'] > xmitEvent['plateRearScore'] and diffMs < EVENT_MARGIN_MS:
+                        xmitEvent['plateRear'] = eventCR['plate']
+                        xmitEvent['plateRearScore'] = eventCR['plateScore']
+                        xmitEvent['speedRear'] = eventCR['speed']
+                        xmitEvent['imageRearCoordinates'] = eventCR['coordinates']
+                        xmitEvent['camRearPos'] = eventCR['pos']
+                        imgBinR = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + eventCR['imageFile'])
+                        xmitEvent['img_r'] = imgBinR
+                        imgBinRp = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + eventCR['imagePlateFile'])
+                        xmitEvent['img_rp'] = imgBinRp
+                        xmitEvent['cr'] = True
+                        xmitEvent['laneRear'] = eventCR['lane']
+                        xmitEvent['offsetRear'] = sidraCore.timeOffsetMs(xmitEvent['date'], eventCR['date'])
+
+                        eventCR['used'] = True
+                        eventCR['usedReason'] = USED_REASON_MATCH
+
+            # remove duplicate rear plates
+            for dupeventCR in events:
+                if dupeventCR['type'] == sidraCore.EVENT_CAM:
+                    if dupeventCR['facing'] == "rear" and dupeventCR['plate'] == xmitEvent['plateRear'] and dupeventCR['used'] == False:
+                        #print("############# CRD:" + dupeventCR['usedReason'] + " " + str(dupeventCR['used']))
+                        dupeventCR['used'] = True
+                        dupeventCR['usedReason'] = USED_REASON_DUPLICATE
+
+
+
+
+            ##############################
+            # rf
+            ##############################
+            bestRfId = ""
+            bestOffset = 999 #best_score = (float("inf"), 1)   # (time_ms, tie-breaker: 0 has TID, 1 no TID)
+
+            # If there's a pre-assigned RF by EPC, prefer it
+            lockedEpc = eventCF.get('lockedEpc') or ""
+            if lockedEpc:
+                for thisRf in events:
+                    if thisRf.get('type') == sidraCore.EVENT_RF and thisRf.get('epc') == lockedEpc:
+                        bestRfId = thisRf['id']
+                        #best_score = (-1, 0)   # force-pick locked EPC
+                        bestOffset = 0
+                        if DEBUG_LOCK:
+                            print(f" @ PREMATCH: {lockedEpc} - {thisRf['epc']} {eventCF['plate']}")
+                # If not found, we fall back to scoring below
+
+            else:
+                # Search all RF events and choose by time
+                bestRfOffset = 9999
+                for eventR in events:
+                    if eventR.get('type') != sidraCore.EVENT_RF:
+                        continue
+
+                    #if eventR.get('used') or eventR.get('usedReason'):
+                    if eventR.get('used'):
+                        continue
+
+                    # lane sanity (same or adjacent lane)
+                    possibleLanes = [eventR['lane'], eventR['lane'] - 1, eventR['lane'] + 1]
+                    if (xmitEvent['laneFront'] not in possibleLanes) and (xmitEvent['laneRear'] not in possibleLanes):
+                        continue
+
+                    #check time delta
+                    diffMs = abs(sidraCore.timeOffsetMs(eventCF['date'], eventR['date']))
+
+                    if diffMs > EVENT_MARGIN_MS:
+                        continue
+
+                    #don't asccept tags with more then 1000ms difference
+                    if diffMs > EVENT_MARGIN_RF_MS:
+                        continue
+
+                    # Absolute priority: tagPlate == plate
+                    if eventR.get('tagPlate') == eventCF['plate']:
+                        bestRfId = eventR['id']
+                        bestRfOffset = 0
+                        #best_score = (-1, 0)   # beats any other candidate
+                        if DEBUG_LOCK:
+                            print(f"   ^^^^^^^^^^^^^^^^ RF Locked: {eventR.get('tid')} diffMs: {diffMs}")
+                        break  # exact match found
+
+                    # tuple comparison means "closer time" always wins; TID breaks ties
+                    #cand = (diffMs, 0 if eventR.get('tid') else 1)
+                    #if cand < best_score:
+                    #    best_score = cand
+                    #    bestRfId = eventR['id']
+
+                    #if this is closer to the cam read and has a tid
+                    if diffMs < bestRfOffset:
+                        #if bestRfTid == "":
+                        bestRfOffset = diffMs
+                        bestRfId = eventR['id']
+                        #    bestRfTid = eventR['tid']
+
+            # If an RF event was found, attach it
+            if bestRfId:
+                bFoundTarget = False
+                for eventR in events:
+                    if eventR['id'] == bestRfId:
+                        bFoundTarget = True
+
+                        # add RF details to xmitEvent
+                        xmitEvent['rssi']    = eventR['rssi']
+                        xmitEvent['epc']     = eventR['epc']
+                        xmitEvent['tid']     = eventR['tid']
+                        xmitEvent['reader']  = eventR['reader']
+                        xmitEvent['antenna'] = eventR['antenna']
+                        xmitEvent['laneRf']  = eventR['lane']
+                        if 'userData' in xmitEvent:
+                            if xmitEvent['userData'] == "":
+                                xmitEvent['userData'] = eventR['userData']
+                        else:
+                            xmitEvent['userData'] = eventR['userData']
+
+                        if 'tagPlate' in xmitEvent:
+                            if xmitEvent['tagPlate'] == "":
+                                xmitEvent['tagPlate'] = eventR['tagPlate']
+                        else:
+                            xmitEvent['tagPlate'] = eventR['tagPlate']
+
+                        if 'tagClass' in xmitEvent:
+                            if xmitEvent['tagClass'] == "":
+                                xmitEvent['tagClass'] = eventR['tagClass']
+                        else:
+                            xmitEvent['tagClass'] = eventR['tagClass']
+
+                        if 'authentic' in xmitEvent:
+                            if xmitEvent["authentic"] == TAG_INAUTHENTIC:
+                                xmitEvent['authentic'] = eventR['authentic']
+                        else:
+                            xmitEvent['authentic'] = eventR['authentic']
+
+                        xmitEvent['offsetRf'] = sidraCore.timeOffsetMs(xmitEvent['date'], eventR['date'])
+
+                        eventR['used'] = True
+                        if eventR.get('usedReason', '') == "":
+                            eventR['usedReason'] = USED_REASON_MATCH
+
+                        xmitEvent['rf'] = True
+
+                if not bFoundTarget:
+                    print("couldnt find target for " + str(eventCF['plate']))
+
+                # mark matching EPCs as dups
+                for dupEventR in events:
+                    if dupEventR.get('type') == sidraCore.EVENT_RF and dupEventR.get('epc') == xmitEvent.get('epc') and not dupEventR.get('used'):
+                        dupEventR['used'] = True
+                        dupEventR['usedReason'] = USED_REASON_DUPLICATE
+
+            # check if xmitEvent is complete
+            if xmitEvent['cf'] and xmitEvent['cr'] and xmitEvent['rf'] and xmitEvent['lidar']:
+                xmitEvent['complete'] = True
+
+            ##################################################
+            #xmit to sidraApi
+
+            #format position delta
+            try:
+                lidarPos = xmitEvent['lidarInPos']
+                camPos = xmitEvent['camFrontPos']
+                posDelta = round(xmitEvent['camFrontPos'] - xmitEvent['lidarInPos'],2)
+                if abs(posDelta) <=2:
+                    sPosDelta = colorPad(posDelta, 5, "green")
+                    sLidarPos = colorPad(lidarPos, 5, "green")
+                    sCamPos = colorPad(camPos, 5, "green")
+                elif abs(posDelta) <= 3:
+                    sPosDelta = colorPad(posDelta, 5, "yellow")
+                    sLidarPos = colorPad(lidarPos, 5, "yellow")
+                    sCamPos = colorPad(camPos, 5, "yellow")
+                else:
+                    sPosDelta = colorPad(posDelta, 5, "red")
+                    sLidarPos = colorPad(lidarPos, 5, "red")
+                    sCamPos = colorPad(camPos, 5, "red")
+            except:
+                sPosDelta = colorPad(timeDelta,"na","red")
+            if xmitEvent["lidarInLane"] == 0:
+                sPosDelta = colorPad("na",5,"red")
+
+            #format time delta
+            try:
+                timeDelta = round(xmitEvent['offsetLidar'],2)
+            except:
+                timeDelta = -99
+            if abs(timeDelta) <=200:
+                sTimeDelta = colorPad(timeDelta,5,"green")
+            elif abs(timeDelta) <= 500:
+                sTimeDelta = colorPad(timeDelta,5,"yellow")
+            else:
+                sTimeDelta = colorPad(timeDelta,5,"red")
+            if xmitEvent["lidarInLane"] == 0:
+                sTimeDelta = colorPad("na",5,"red")
+
+            #highlight date
+            sDateHeader = colorPad(xmitEvent['date'],0,"magenta")
+
+            xmitEvent['op'] = "addEvent"
+
+            logMsg = ("\n== " + sDateHeader + " ======================================" + '\n')
+            logMsg = logMsg + " + class: " + str(xmitEvent['class']) + " score: " + str(xmitEvent['classScore']) + " " + str(xmitEvent['className']) + '\n'
+            #logMsg = logMsg + (" complete: " + str(xmitEvent['complete']) + '\n')
+            logMsg = logMsg + (" + CAM front lane: \033[34m" + str(xmitEvent['laneFront']) + "\033[0m speed: " + str(xmitEvent['speedFront']).rjust(5,' ') + " plate: " + str(xmitEvent['plateFront']).ljust(7, ' ') + " score: " + str(xmitEvent['plateFrontScore']).rjust(2, ' ') + '\n')
+            logMsg = logMsg + (" + CAM rear  lane: " + str(xmitEvent['laneRear']) + "  diff: " + str(xmitEvent['offsetRear']).rjust(5,' ') + " plate: " + str(xmitEvent['plateRear']).ljust(7, ' ')  + " score: " + str(xmitEvent['plateRearScore']).rjust(2, ' ') + '\n')
+            logMsg = logMsg + (" + RF        lane: " + str(xmitEvent['laneRf']) + "  diff: " + str(xmitEvent['offsetRf']).rjust(5,' ') + " plate: " + str(xmitEvent['tagPlate']).ljust(7, ' ')+    "   tid: " + str(xmitEvent['tid']) + '\n')
+            logMsg = logMsg + (" + LIDAR     lane: \033[34m" + str(xmitEvent['lidarInLane']) + "\033[0m  diff: " + str(sTimeDelta).rjust(9,' ') + " id: " + str(xmitEvent['lidarId']) + '\n')
+            logMsg = logMsg + (" + POSITIONS          diff: " + sPosDelta + " lidar: " + sLidarPos + " cam: " + sCamPos + '\n')
+            #logMsg = logMsg + ("---------------------------------------------------")
+            logMsg = logMsg + (".............................................................\n")
+
+            sidraCore.logMcp(stripColor(logMsg))
+
+            if DEBUG or DEBUG_EVENT:
+                #print('\n')
+                print(logMsg)
+
+            #print("QX")
+            sidraCore.queueXmit(json.dumps(xmitEvent, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_EVENT)
+            #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
+
+
+
+    ####################################################################################################
+    # purge old images and events
+
+    totalEvents = 0
+    purgedEvents = 0
+    newEvents = []
+    for purgeEvent in list(events):
+        totalEvents = totalEvents +1
+        diff = datetime.now() - purgeEvent['date']
+        diffSec = diff.total_seconds()
+
+        if diffSec > PURGE_SECONDS or purgeEvent['used'] == True:
+            purgedEvents = purgedEvents +1
+
+            #mark unused events as expired
+            if diffSec > PURGE_SECONDS and purgeEvent['usedReason'] == "":
+                purgeEvent['usedReason'] = USED_REASON_EXPIRED
+
+            #delete image files - moved to purgeImg
+            #if purgeEvent["type"] == sidraCore.EVENT_CAM:
+            #    sidraCore.deleteFile(sidraCore.IMG_DIR + "/" + purgeEvent['imageFile'])
+            #    sidraCore.deleteFile(sidraCore.IMG_DIR + "/" + purgeEvent['imagePlateFile'])
+
+            #debug output
+            purgeMsg = "ERROR"
+            purgeCode = "?"
+            usedReason = purgeEvent['usedReason']
+
+            if usedReason == "trigger":
+                purgeCode = "t"
+            if usedReason == "dup":
+                purgeCode = "d"
+            if usedReason == "match":
+                purgeCode = "m"
+            if usedReason == "matchpre":
+                purgeCode = "p"
+            if usedReason == "edge":
+                purgeCode = "e"
+            if usedReason == "low":
+                purgeCode = "l"
+            if usedReason == "partial":
+                purgeCode = "r"
+            if usedReason == "expired":
+                purgeCode = "X"
+
+            if purgeEvent["type"] == sidraCore.EVENT_CAM:
+                thisPlate = purgeEvent['plate']
+                thisPlate = thisPlate.ljust(7, ' ')
+                purgeMsg = "CAM " + purgeEvent['facing'].ljust(5, ' ') + " lane: " + str(purgeEvent['lane']) + " plate: " + thisPlate + " score: " + str(purgeEvent['plateScore']).rjust(2, ' ')
+            if purgeEvent["type"] == sidraCore.EVENT_RF:
+                purgeMsg = "RF        lane: " + str(purgeEvent['lane']) + "   tid: " + str(purgeEvent['tid'])
+            if purgeEvent["type"] == sidraCore.EVENT_LIDAR:
+                purgeMsg = "LIDAR     lane: " + str(purgeEvent['inLane']) + " pos: " + str(purgeEvent['inPos']) + " in: " + str(purgeEvent['inDate']) + "   id: " + str(purgeEvent['id'])
+                purgeMsg = colorPad(purgeMsg,0,"red")
+
+            logMsg = " - " + purgeCode  + " " + purgeMsg + " purge: " + str(purgeEvent['usedReason']).ljust(7, ' ') #+ " " + purgeMsg #+ '\n'
+
+            if DEBUG_PURGE:
+                sidraCore.logMcp(logMsg)
+                print(logMsg.strip('\n'))
+                #print('\n')
+            elif DEBUG_PURGE_EXPIRED and purgeEvent['usedReason'] == USED_REASON_EXPIRED:
+                sidraCore.logMcp(logMsg)
+                print(logMsg.strip('\n'))
+
+            #remove event
+            events.remove(purgeEvent)
+
+    if DEBUG_QUEUE:
+        print("QUEUE total:" + str(totalEvents) + " purged:" + str(purgedEvents))
+    #print("QUEUE total:" + str(totalEvents) + " ppurged:" + str(purgedEvents))
+
+    time.sleep(.5) # change to .01
+
+    #run = False

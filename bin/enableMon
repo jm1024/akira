@@ -1,0 +1,13 @@
+#!/bin/bash
+echo "enabling mon in cron"
+if crontab -l | grep --quiet "/var/sidra/bin/monCron"; then
+  echo " - cron already configured"
+else
+  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/monCron"; } | crontab -
+fi
+
+if crontab -l | grep --quiet "/var/sidra/bin/monUps"; then
+  echo " - cron already configured"
+else
+  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/monUps"; } | crontab -
+fi

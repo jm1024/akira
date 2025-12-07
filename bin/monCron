@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+import psutil
+import time
+import os
+import datetime
+from icmplib import ping
+import psutil
+import json
+
+import sidraCore
+import monCore
+
+ups = monCore.getUps()
+#print(ups)
+
+data = monCore.getAll(sidraCore.ipList)
+sidraCore.writeFile(monCore.MON_FILE, json.dumps(data, indent=2))

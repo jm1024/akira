@@ -1,0 +1,3 @@
+#!/bin/bash
+killall lidar
+./lidar -d

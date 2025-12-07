@@ -1,0 +1,5 @@
+#!/bin/bash
+rm /var/sidra/img/*
+rm /var/sidra/trn/*
+rm /var/sidra/trn/working/*
+rm /var/sidra/trn/done/*

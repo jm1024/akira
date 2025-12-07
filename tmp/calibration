@@ -1,0 +1,62 @@
+{
+    "1": {
+        "leftSum": 20801.66000000001,
+        "rightSum": 8970.620000000008,
+        "count": 1872,
+        "left": 11.11,
+        "right": 4.79,
+        "max": 9.91,
+        "min": 2.73,
+        "maxTop": 6.28,
+        "minTop": 2.73,
+        "maxMid": 9.91,
+        "minMid": 3.07,
+        "maxBottom": 8.88,
+        "minBottom": 3.45
+    },
+    "2": {
+        "leftSum": 24055.400000000005,
+        "rightSum": 13840.94,
+        "count": 2359,
+        "left": 10.2,
+        "right": 5.87,
+        "max": 11.26,
+        "min": 3.06,
+        "maxTop": 9.14,
+        "minTop": 3.45,
+        "maxMid": 10.32,
+        "minMid": 3.06,
+        "maxBottom": 11.26,
+        "minBottom": 5.13
+    },
+    "3": {
+        "leftSum": 17997.459999999985,
+        "rightSum": 12703.29999999999,
+        "count": 1368,
+        "left": 13.16,
+        "right": 9.29,
+        "max": 14.68,
+        "min": 4.69,
+        "maxTop": 12.84,
+        "minTop": 4.69,
+        "maxMid": 13.87,
+        "minMid": 5.24,
+        "maxBottom": 14.68,
+        "minBottom": 9.3
+    },
+    "4": {
+        "leftSum": 9011.729999999994,
+        "rightSum": 6060.209999999996,
+        "count": 688,
+        "left": 13.1,
+        "right": 8.81,
+        "max": 15.0,
+        "min": 7.15,
+        "maxTop": 14.31,
+        "minTop": 12.79,
+        "maxMid": 15.0,
+        "minMid": 7.15,
+        "maxBottom": 14.46,
+        "minBottom": 9.0
+    }
+}

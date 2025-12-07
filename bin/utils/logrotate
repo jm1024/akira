@@ -1,0 +1,27 @@
+/var/sidra/log/transactions.log {
+  daily
+  rotate 20
+  compress
+  notifempty
+}
+
+/var/sidra/log/sidra.log {
+  daily
+  rotate 20
+  compress
+  notifempty
+}
+
+/var/sidra/log/mcp.log {
+  daily
+  rotate 20
+  compress
+  notifempty
+}
+
+/var/sidra/log/errors.log {
+  daily
+  rotate 20
+  compress
+  notifempty
+}

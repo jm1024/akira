@@ -1,0 +1,6 @@
+#!/bin/bash
+killall cam
+killall reader
+killall lidar
+killall mcp
+killall xmit

@@ -1,0 +1,3 @@
+#!/bin/bash
+killall mcp
+./mcp -d

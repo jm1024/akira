@@ -1,0 +1,240 @@
+#!/usr/bin/python3
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime
+import json
+import base64
+
+import sidraCore
+
+#LOCAL_URL_PREFIX = "http://219.92.246.50:2080/"
+#LOCAL_URL_PREFIX = "http://10.2.10.10:2080/"
+
+#cam map
+cams = sidraCore.cams
+
+MIN_PLATE_SCORE = 0
+
+DEBUG = False
+
+#################################################
+def getPos(d):
+
+    thisCam = {}
+    for cam in cams:
+        if cam.get("name") == d["device"]["name"]:
+            thisCam = cam
+
+    #print(thisCam)
+    #print(d)
+
+    thisLane = thisCam.get("lane")
+    leftPos = thisCam.get("leftPos")
+    rightPos = thisCam.get("rightPos")
+    resX = thisCam.get("resX")
+    resY = thisCam.get("resY")
+    span = leftPos - rightPos
+
+    lane = d['device']['lane']
+    facing = d['device']['facing']
+
+    #get horizontal position
+    bbBegin = d['transit']['plate']['bounding_box']['top_left']['x']
+    bbEnd = d['transit']['plate']['bounding_box']['bottom_right']['x']
+    if bbBegin == 0:
+        print("NO PLATE lane: " + str(lane))
+        return (None, None, None, round(leftPos,2), round(rightPos,2))
+    bbMid = (bbBegin + bbEnd)/2
+    # find percent offset for middle of plate in image
+    resXpct = round((bbMid / resX) * 100,1)
+
+    #get vertical position
+    bbYBegin = d['transit']['plate']['bounding_box']['top_left']['y']
+    bbYEnd = d['transit']['plate']['bounding_box']['bottom_right']['y']
+    bbYMid = (bbYBegin + bbYEnd)/2
+    # find percent offset for middle of plate in image
+    resYpct = round((bbYMid / resY) * 100,1)
+
+    maxSkew = thisCam.get('skew')
+
+    #get this skew
+    skewOffset = round((resYpct / 100) * maxSkew,2)
+
+    #get the position offset in meters
+    posOffset = round((resXpct / 100) * span,2)
+
+    #get position on the road
+    posA = round(rightPos + posOffset,2)
+    pos = round(leftPos - posOffset,2)
+    skewPos = round(pos + skewOffset,2)
+
+    if facing == "front":
+        print("front plate:  " + str(d['transit']['plate']['text']) + " lane: " + str(lane) + " vertical: " + str(bbYMid)  + " vertPct: "+ str(resYpct))
+        print("    resXpct: " + str(resXpct) + " left: " + str(leftPos) + " right: " + str(rightPos))
+        print("       skew: " + str(skewOffset) + " pos: " + str(pos) + " posA: " + str(posA) + " skewPos: " + str(skewPos))
+        print("\n")
+
+    #if facing == "rear":
+    #    print(" rear plate:  " + str(d['transit']['plate']['text']) + " lane: " + str(lane) + " vertical: " + str(bbYMid)  + " vertPct: "+ str(resYpct))
+    #    print("       skew: " + str(skewOffset) + " originalPos: " + str(pos) + " skewPos: " + str(skewPos))
+
+    # comment to deactivate skew
+    pos = skewPos
+
+    #print("posA: " + str(posA) + " pos: " + str(pos) + )
+    #print(thisCam.get("name") + "  b:"  + str(beginPos) + " e:" + str(endPos) + " s:"  + str(span))
+    #print("lane:   " + str(thisLane))
+    #print("resX:   " + str(resX))
+    #print("bbMid:  " + str(bbMid))
+    #print("pct:    " + str(resXpct))
+    #print("posOff: " + str(posOffset))
+    #print("POS:    " + str(pos))
+
+    #print("l:" + str(thisLane) +  " p:" + str(pos))
+
+    return round(pos,2), resXpct, resYpct, round(leftPos,2), round(rightPos,2)
+
+##################################################################################################
+class handler(BaseHTTPRequestHandler):
+
+
+    #################################################
+    def log_message(self, format, *args):
+        return
+
+    #################################################
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+
+        message = "Err: 001"
+        self.wfile.write(bytes(message, "utf8"))
+
+    #################################################
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+
+        message = "POST response"
+        self.wfile.write(bytes(message, "utf8"))
+
+        clientIp = self.client_address[0]
+        print(" ------ CAM " + clientIp + " -----")
+
+        #get lane and direction
+        lane = ""
+        facing = ""
+        name = ""
+        for cam in cams:
+            if cam.get("ip") == clientIp:
+                name = cam.get("name")
+                lane = cam.get("lane")
+                facing = cam.get("facing")
+                break
+
+
+         # dump low confidence scores?
+
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        d = json.loads(post_data)
+
+        thisScore = d["transit"]["plate"]["score"]
+        if thisScore < MIN_PLATE_SCORE:
+            print("--- cam --- low plate score, discarding score:" + str(thisScore))
+            return
+        #print("--- cam --- low plate score, discarding score:" + str(thisScore))
+
+        #save image
+        imgString = d["transit"]["image"]
+        d["transit"]["image"] = d["transit"]["uuid"] + ".jpg"
+        imgdata = base64.b64decode(imgString)
+        fileName = d["transit"]["uuid"] + ".jpg"
+        with open(sidraCore.IMG_DIR + "/" +  fileName, 'wb') as f:
+            f.write(imgdata)
+
+        # plate
+        imgString = d["transit"]["image_plate"]
+        d["transit"]["image_plate"] = d["transit"]["uuid"] + "-p.jpg"
+        imgdata = base64.b64decode(imgString)
+        fileNamePlate = d["transit"]["uuid"] + "-p.jpg"
+        with open(sidraCore.IMG_DIR + "/" +  fileNamePlate, 'wb') as f:
+            f.write(imgdata)
+
+        # anpr
+        try:
+            imgString = d["transit"]["image_anpr"]
+            d["transit"]["image_anpr"] = d["transit"]["uuid"] + "-a.jpg"
+            imgdata = base64.b64decode(imgString)
+            fileNameAnpr = d["transit"]["uuid"] + "-a.jpg"
+            #with open(sidraCore.ANPR_DIR + "/" +  fileNameAnpr, 'wb') as f:
+            #    f.write(imgdata)
+        except Exception as ex:
+            print("missing anpr image: " + str(ex))
+            pass
+
+        d['device']['name'] = name
+        d['device']['lane'] = lane
+        d['device']['facing'] = facing
+
+        #position
+        pos, resXpct, resYpct, leftPos, rightPos = getPos(d)
+        d['transit']['pos'] = pos
+        d['transit']['resXpct'] = resXpct
+        d['transit']['resYpct'] = resYpct
+        d['transit']['leftPos'] = leftPos
+        d['transit']['rightPos'] = rightPos
+        #print(d)
+
+        sidraCore.logTrn("----------")
+        sidraCore.logTrn(json.dumps(d))
+        sidraCore.saveTransaction(sidraCore.trnPrefix() + d["transit"]["uuid"] + sidraCore.TRN_EXTENSION_CAM, json.dumps(d))
+
+        #2024-05-29_14:28:18.958
+        dtFormat = "%Y-%m-%d_%H:%M:%S"
+        sDate = d["transit"]["timestamps"]["image"]
+        #print(sDate)
+        #s2 = sDate.split('.')
+
+        #tDate = datetime.strptime(s2[0],dtFormat)
+        #milliseconds = int(s2[1])
+        #tDate = tDate.replace(microsecond=milliseconds * 1000)
+
+        tDate = sidraCore.camStrToDt(sDate)
+
+        output = str(tDate)
+        output = output + " CAM >"
+        output = output + " lane: " + str(lane)
+        # trn:" + d["transit"]["uuid"]
+        #output = output + " site:" + d["device"]["site"]["name"]
+        #output = output + " name:" + name
+        #output = output + " lane:" + str(lane)
+        output = output + " dir: " + facing.ljust(5, ' ')
+        output = output + " plate: " + str(d["transit"]["plate"]["text"]).ljust(7, ' ')
+        output = output + " score: " + str(d["transit"]["plate"]["score"]).ljust(2, ' ')
+        output = output + " speed: " + str(d["transit"]["speed"]).ljust(3, ' ')
+        output = output + " image: " + fileName
+        #output = output + " image: " + LOCAL_URL_PREFIX + fileName
+        #output = output + " date: " + LOCAL_URL_PREFIX + fileName
+        #output = output + " brand:" + d["transit"]["brand"]
+        #output = output + " model:" + d["transit"]["model"]
+        #output = output + " color:" + d["transit"]["color"]
+        #output = output + " plate:" + d["transit"]["plate"]["text"]
+        #output = output + " score:" + str(d["transit"]["plate"]["score"])
+        #output = output + " direction:" + d["transit"]["direction"]
+        #output = output + " speed:" + d["transit"]["speed"]
+
+        sidraCore.log(output)
+
+        if DEBUG:
+            print(output)
+        #print(post_data)
+
+####################################################
+
+sidraCore.log("Camera Server Starting")
+#print("Camera Server Starting")
+
+with HTTPServer(('', 8000), handler) as server:
+    server.serve_forever()
