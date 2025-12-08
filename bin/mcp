@@ -41,13 +41,14 @@ USED_REASON_ORPHAN = "orphan"
 USED_REASON_LOW = "low"
 USED_REASON_EDGE = "edge"
 USED_REASON_EXPIRED = "expired"
+USED_REASON_INVALID = "invalid"
 
 FACING_FRONT = "front"
 FACING_REAR = "rear"
 
 DEBUG = True
 DEBUG_EVENT = True
-DEBUG_PURGE = False
+DEBUG_PURGE = True
 DEBUG_PURGE_EXPIRED = True
 DEBUG_LOCK = False
 DEBUG_REPAIR = True
@@ -898,7 +899,7 @@ while run:
             closestOffset = 99999
             
             # lane sanity (same or adjacent lane) unless single lane then only this lane
-            if sidraCore.landMode == sidraCore.LANE_MODE_MULTI:
+            if sidraCore.laneMode == sidraCore.LANE_MODE_MULTI:
                 possibleLanes = [eventRF['lane'], eventRF['lane'] - 1, eventRF['lane'] + 1]
             else:
                 possibleLanes = [eventRF['lane']]
@@ -957,6 +958,8 @@ while run:
 
         if diffMs < 0:
             if eventCF["type"] == sidraCore.EVENT_CAM:
+                eventCF['used'] = True
+                eventCF['usedReason'] = USED_REASON_INVALID
                 print(" BAD TIME: cam " + str(eventCF['lane']) + " " + eventCF['facing'] + " " + str(diffMs) + " " + str(eventCF['date']))
             if eventCF["type"] == sidraCore.EVENT_RF:
                 print(" BAD TIME: reader lane " + str(eventCF['lane']) + " " + str(diffMs))
@@ -1323,7 +1326,7 @@ while run:
                         continue
 
                     # lane sanity (same or adjacent lane) unless single lane then only this lane
-                    if sidraCore.landMode == sidraCore.LANE_MODE_MULTI:
+                    if sidraCore.laneMode == sidraCore.LANE_MODE_MULTI:
                         possibleLanes = [eventR['lane'], eventR['lane'] - 1, eventR['lane'] + 1]
                     else:
                         possibleLanes = [eventR['lane']]

@@ -1,47 +1,53 @@
 #!/usr/bin/python3
+from datetime import datetime
+import json
 
 import sidraCore
 
 ######################
 def read(data):
 	
-	print(data)
+	#print(data)
 	
 	stream = False
 	
 	# get sensor name for this lane
 	thisLane = data['lane']
+	print("LANE:" + str(thisLane))
 	for mass in sidraCore.massSensors:
 		if mass['lane'] == thisLane:
 			massName = mass['name']
 	
 	occupied = sidraCore.massOccupied(massName)
 	
-	if side = "front":
+	if data['side'] == "front":
 		if not occupied:
 			stream = True
-	if side = "rear":
+	if data['side'] == "rear":
 		if occupied:
 			stream = True
 	
-	output = 
-		{
-		"header":
-		{
-		"command":"TagDetected",
-		"timestamp":dt
-		}
-		"body":{
-		"TxID":data['id'],
-		"TagID":data['tid'],
-		"PlazaID":sidraCore.plazaId,
-		"LaneID":data['lane'],
-		"DetectedTime":dt
-		}
-		"hmac":"XXXX"
-		}
+	dt = datetime.now().isoformat()
+			
+	contents = {
+		"header": {
+			"command": "TagDetected",
+			"timestamp": dt,
+		},
+		"body": {
+			"TxID": data['id'],
+			"TagID": data['tid'],
+			"PlazaID": sidraCore.plazaId,
+			"LaneID": data['lane'],
+			"DetectedTime": dt,
+		},
+		"hmac": "XXXX",
+	}
 	
-	writeFile(sidraCore.DIR_STREAM + "/" + data['id'] + ".rts", output)
+	print("=========================")
+	print(contents)
+	
+	sidraCore.writeFile(sidraCore.STREAM_DIR + "/" + data['id'] + ".rts", json.dumps(contents))
 	
 	"""
 	tData = {

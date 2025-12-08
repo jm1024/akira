@@ -5,6 +5,8 @@ import threading
 import time
 import traceback
 
+import sidraCore
+
 PORT = 2060
 STREAM_DIR = "/var/sidra/stream"
 SCAN_INTERVAL_SECONDS = 0.01
@@ -19,18 +21,46 @@ clientsLock = threading.Lock()
 def log(message):
 	if DEBUG:
 		print(message, flush=True)
-
-
-#############################
 def broadcastFile(filePath):
 	"""Read a file and send its contents to all connected clients."""
-	try:
-		with open(filePath, "rb") as f:
-			data = f.read()
-	except Exception as e:
-		log(f"Error reading file {filePath}: {e}")
-		traceback.print_exc()
+	
+	data = sidraCore.readFile(filePath)
+	
+	if not data:
+		log(f"File {filePath} is empty, skipping broadcast")
 		return
+	
+	# Ensure we always send bytes
+	if isinstance(data, str):
+		data_bytes = data.encode("utf-8")
+	else:
+		data_bytes = data  # assume it's already bytes
+	
+	log(f"Broadcasting file: {filePath} ({len(data_bytes)} bytes)")
+	
+	deadClients = []
+	
+	with clientsLock:
+		for clientSocket in clients:
+			try:
+				clientSocket.sendall(data_bytes)
+			except Exception as e:
+				log(f"Error sending to client {clientSocket}: {e}")
+				deadClients.append(clientSocket)
+	
+		for clientSocket in deadClients:
+			try:
+				clientSocket.close()
+			except Exception:
+				pass
+			clients.remove(clientSocket)
+			log(f"Removed dead client {clientSocket}")
+
+#############################
+def broadcastFile_X(filePath):
+	"""Read a file and send its contents to all connected clients."""
+
+	data = sidraCore.readFile(filePath)
 
 	if not data:
 		log(f"File {filePath} is empty, skipping broadcast")

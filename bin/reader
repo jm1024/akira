@@ -9,10 +9,13 @@ import sidraCore
 
 import importlib
 
-readDrivers = {}
-for driver in sidraCore.driversRead:
-    readDrivers[driver] = importlib.import_module(driver)
-    print("Loaded read driver: " + driver)
+#JM change to Dynamic
+import driverRts
+
+#readDrivers = {}
+#for driver in sidraCore.driversRead:
+#    readDrivers[driver] = importlib.import_module(driver)
+#    print("Loaded read driver: " + driver)
 
 #reader info
 readerName = ""
@@ -102,7 +105,7 @@ def parseEvent(event):
 
         arrival = {'dt':dt, 'rssi':rssi}
 
-        #make sure there's not alread an arrive event for this EPC
+        #make sure there's not already an arrive event for this EPC
         if not epc in arrivals:
             #print("adding: " + str(arrival))
             arrivals[epc] = arrival
@@ -159,6 +162,19 @@ def parseEvent(event):
         arrival = {'dt':dt, 'antenna':antenna, 'rssi':rssi, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
 
         arrivals[epc] = arrival
+        
+        #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
+        lane = 0
+        side = "unknown"
+        id = str(uuid.uuid4())
+        for thisAntenna in antennas:
+            if str(thisAntenna.get('number')) == str(antenna):
+                lane = thisAntenna.get('lane')
+                side = thisAntenna.get('side')
+        arrival['id'] = id
+        arrival['lane'] = lane
+        arrival['side'] = side
+        driverRts.read(arrival)
 
     #print(json.dumps(arrivals))
     #print(json.dumps(arrivals, indent=4))
@@ -223,9 +239,6 @@ def parseEvent(event):
         lane = 0
         side = "unknown"
         for thisAntenna in antennas:
-            #print(thisAntenna)
-            #print(thisAntenna.get('number'))
-            #print(antenna)
             if str(thisAntenna.get('number')) == str(antenna):
                 lane = thisAntenna.get('lane')
                 side = thisAntenna.get('side')
@@ -297,9 +310,11 @@ def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAu
         "pwAuthentic": pwAuthentic,
     }
     
-    for driver in readDrivers:
-        driver.read(tData)
-        
+    #print("RD: " + str(readDrivers))
+    #for driver in readDrivers:
+    #    print("DRIVER: " + driver)
+    #    driver.read(tData)
+    #driverRts.read(tData)
     
     sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
 

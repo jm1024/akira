@@ -14,7 +14,7 @@ cams = sidraCore.cams
 
 MIN_PLATE_SCORE = 0
 
-DEBUG = False
+DEBUG = True
 
 #################################################
 def getPos(d):
@@ -67,11 +67,11 @@ def getPos(d):
     pos = round(leftPos - posOffset,2)
     skewPos = round(pos + skewOffset,2)
 
-    if facing == "front":
-        print("front plate:  " + str(d['transit']['plate']['text']) + " lane: " + str(lane) + " vertical: " + str(bbYMid)  + " vertPct: "+ str(resYpct))
-        print("    resXpct: " + str(resXpct) + " left: " + str(leftPos) + " right: " + str(rightPos))
-        print("       skew: " + str(skewOffset) + " pos: " + str(pos) + " posA: " + str(posA) + " skewPos: " + str(skewPos))
-        print("\n")
+    #if facing == "front":
+    #    print("front plate:  " + str(d['transit']['plate']['text']) + " lane: " + str(lane) + " vertical: " + str(bbYMid)  + " vertPct: "+ str(resYpct))
+    #    print("    resXpct: " + str(resXpct) + " left: " + str(leftPos) + " right: " + str(rightPos))
+    #    print("       skew: " + str(skewOffset) + " pos: " + str(pos) + " posA: " + str(posA) + " skewPos: " + str(skewPos))
+    #    print("\n")
 
     #if facing == "rear":
     #    print(" rear plate:  " + str(d['transit']['plate']['text']) + " lane: " + str(lane) + " vertical: " + str(bbYMid)  + " vertPct: "+ str(resYpct))
@@ -163,6 +163,7 @@ class handler(BaseHTTPRequestHandler):
             f.write(imgdata)
 
         # anpr
+        fileNameAnpr = "n/a"
         try:
             imgString = d["transit"]["image_anpr"]
             d["transit"]["image_anpr"] = d["transit"]["uuid"] + "-a.jpg"
@@ -213,6 +214,7 @@ class handler(BaseHTTPRequestHandler):
         output = output + " score: " + str(d["transit"]["plate"]["score"]).ljust(2, ' ')
         output = output + " speed: " + str(d["transit"]["speed"]).ljust(3, ' ')
         output = output + " image: " + fileName
+        output = output + "  anpr:" + fileNameAnpr
         #output = output + " image: " + LOCAL_URL_PREFIX + fileName
         #output = output + " date: " + LOCAL_URL_PREFIX + fileName
         #output = output + " brand:" + d["transit"]["brand"]

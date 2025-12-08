@@ -132,7 +132,7 @@ def loadConfig():
 
     #drivers read
     if not cfg.get("driversRead") == None:
-        cams = cfg.get("driversRead")
+        driversRead = cfg.get("driversRead")
 
     #drivers server
     if not cfg.get("driversServer") == None:
@@ -155,7 +155,7 @@ def loadConfig():
         
     # lane mode
     if not cfg.get("laneMode") == None:
-        plazaId = cfg.get("laneMode")
+        laneMode = cfg.get("laneMode")
         
     #ipList
     if not cfg.get("ipList") == None:
@@ -371,7 +371,7 @@ def decodeUserData(userData):
 def massState(name):
 
     raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
-    ret = json.dumps(raw)
+    ret = json.loads(raw)
 
     return ret
     trip = ""
@@ -381,6 +381,7 @@ def massState(name):
 def massOccupied(name):
     
     state = massState(name)
+    print("ST: " + str(state))
     occupied = True
     
     for mass in massSensors:
@@ -388,7 +389,7 @@ def massOccupied(name):
             trip = mass['trip']
             main = mass['main']
             
-    if state.get(trip) == MASS_EMPTY and state.get(main) == STATE_EMPTY:
+    if state.get(trip) == MASS_EMPTY and state.get(main) == MASS_EMPTY:
         occupied = False
         
     return occupied
