@@ -10,12 +10,13 @@ import sidraCore
 import importlib
 
 #JM change to Dynamic
-import driverRts
+#import driverRts
 
-#readDrivers = {}
-#for driver in sidraCore.driversRead:
-#    readDrivers[driver] = importlib.import_module(driver)
-#    print("Loaded read driver: " + driver)
+#dynamically load all read drivers
+readDrivers = {}
+for driver in sidraCore.driversRead:
+    readDrivers[driver] = importlib.import_module(driver)
+    print("Loaded read driver: " + driver)
 
 #reader info
 readerName = ""
@@ -163,6 +164,7 @@ def parseEvent(event):
 
         arrivals[epc] = arrival
         
+        #driver for fast read transmits to other systems
         #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
         lane = 0
         side = "unknown"
@@ -174,7 +176,10 @@ def parseEvent(event):
         arrival['id'] = id
         arrival['lane'] = lane
         arrival['side'] = side
-        driverRts.read(arrival)
+        for driverName, driverModule in readDrivers.items():
+            print("running driver: " + str(driverName))
+            if hasattr(driverModule, "read"):
+                driverModule.read(arrival)
 
     #print(json.dumps(arrivals))
     #print(json.dumps(arrivals, indent=4))

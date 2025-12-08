@@ -33,6 +33,7 @@ readers = []
 massSensors = []
 lidar = []
 driversRead = []
+driversTrans = []
 driversServer = []
 driversXmit = []
 servers = []
@@ -107,6 +108,7 @@ def loadConfig():
     global plazaId
     global laneMode
     global driversRead
+    global driversTrans
     global driversXmit
     global driversServer
     global ipList
@@ -137,6 +139,10 @@ def loadConfig():
     #drivers server
     if not cfg.get("driversServer") == None:
         driversServer = cfg.get("driversServer")
+        
+    #drivers trans
+    if not cfg.get("driversTrans") == None:
+        driversServer = cfg.get("driversTrans")
         
     #drivers xmit
     if not cfg.get("driversXmit") == None:

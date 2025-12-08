@@ -11,6 +11,12 @@ import re
 import sidraCore
 import plateUtils
 
+#dynamically load all read drivers
+transDrivers = {}
+for driver in sidraCore.driversTrans:
+    transDrivers[driver] = importlib.import_module(driver)
+    print("Loaded trans driver: " + driver)
+
 #timing
 PURGE_SECONDS = 12            #should probably be 30
 EVENT_MARGIN_MS = 7000        #delay before processing any events - should be 5000?
@@ -1489,6 +1495,12 @@ while run:
             #print("QX")
             sidraCore.queueXmit(json.dumps(xmitEvent, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_EVENT)
             #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
+            
+            #trans drivers
+            for driverName, driverModule in transDrivers.items():
+            print("running driver: " + str(driverName))
+            if hasattr(driverModule, "trans"):
+                driverModule.trans(xmitEvent)
 
 
 

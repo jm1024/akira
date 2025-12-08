@@ -4,10 +4,13 @@ import json
 
 import sidraCore
 
+DATA_DIR = "/var/sidra/drv"
+
+EXT_READ = ".rts-r"
+EXT_TRANS = ".rts-t"
+
 ######################
 def read(data):
-	
-	#print(data)
 	
 	stream = False
 	
@@ -47,7 +50,7 @@ def read(data):
 	print("=========================")
 	print(contents)
 	
-	sidraCore.writeFile(sidraCore.STREAM_DIR + "/" + data['id'] + ".rts", json.dumps(contents))
+	sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_READ, json.dumps(contents))
 	
 	"""
 	tData = {
@@ -68,3 +71,10 @@ def read(data):
 		"pwAuthentic": pwAuthentic,
 	}
 	"""
+
+######################
+def trans(data):
+	
+	#JM reformat this to their spec
+	sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(contents))
+	

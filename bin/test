@@ -1,3 +1,0 @@
-#!/bin/bash
-cp /root/good-trn/* /var/sidra/trn
-chown james /var/sidra/trn/*

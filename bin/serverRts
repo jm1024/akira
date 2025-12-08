@@ -6,14 +6,14 @@ import time
 import traceback
 
 import sidraCore
+import driverRts
 
-PORT = 2060
-STREAM_DIR = "/var/sidra/stream"
+PORTS = [2060, 2061]
 SCAN_INTERVAL_SECONDS = 0.01
 BUFFER_SIZE = 4096
 DEBUG = True
 
-clients = set()
+clientsByPort = {port: set() for port in PORTS}
 clientsLock = threading.Lock()
 
 
@@ -21,94 +21,146 @@ clientsLock = threading.Lock()
 def log(message):
 	if DEBUG:
 		print(message, flush=True)
-def broadcastFile(filePath):
-	"""Read a file and send its contents to all connected clients."""
-	
+
+
+#############################
+def broadcastFile(filePath, targetPorts=None):
+	"""
+	Read a file and send its contents to all connected clients
+	on the given ports (or all ports if targetPorts is None).
+	"""
 	data = sidraCore.readFile(filePath)
-	
+
 	if not data:
 		log(f"File {filePath} is empty, skipping broadcast")
 		return
-	
+
 	# Ensure we always send bytes
 	if isinstance(data, str):
-		data_bytes = data.encode("utf-8")
+		dataBytes = data.encode("utf-8")
 	else:
-		data_bytes = data  # assume it's already bytes
-	
-	log(f"Broadcasting file: {filePath} ({len(data_bytes)} bytes)")
-	
-	deadClients = []
-	
-	with clientsLock:
-		for clientSocket in clients:
-			try:
-				clientSocket.sendall(data_bytes)
-			except Exception as e:
-				log(f"Error sending to client {clientSocket}: {e}")
-				deadClients.append(clientSocket)
-	
-		for clientSocket in deadClients:
-			try:
-				clientSocket.close()
-			except Exception:
-				pass
-			clients.remove(clientSocket)
-			log(f"Removed dead client {clientSocket}")
+		dataBytes = data  # assume it's already bytes
 
-#############################
-def broadcastFile_X(filePath):
-	"""Read a file and send its contents to all connected clients."""
+	if targetPorts is None:
+		targetPorts = PORTS
 
-	data = sidraCore.readFile(filePath)
-
-	if not data:
-		log(f"File {filePath} is empty, skipping broadcast")
-		return
-
-	log(f"Broadcasting file: {filePath} ({len(data)} bytes)")
+	log(f"Broadcasting file: {filePath} ({len(dataBytes)} bytes) to ports {targetPorts}")
 
 	deadClients = []
 
 	with clientsLock:
-		for clientSocket in clients:
-			try:
-				clientSocket.sendall(data)
-			except Exception as e:
-				log(f"Error sending to client {clientSocket}: {e}")
-				deadClients.append(clientSocket)
+		for port in targetPorts:
+			socketSet = clientsByPort.get(port, set())
+			for clientSocket in list(socketSet):
+				try:
+					clientSocket.sendall(dataBytes)
+				except Exception as e:
+					log(f"Error sending to client {clientSocket} on port {port}: {e}")
+					deadClients.append((port, clientSocket))
 
-		for clientSocket in deadClients:
+		for port, clientSocket in deadClients:
 			try:
 				clientSocket.close()
 			except Exception:
 				pass
-			clients.remove(clientSocket)
-			log(f"Removed dead client {clientSocket}")
+			if clientSocket in clientsByPort.get(port, set()):
+				clientsByPort[port].remove(clientSocket)
+			log(f"Removed dead client {clientSocket} from port {port}")
+
 
 #############################
-def watchStreamDir():
-	"""Poll STREAM_DIR for new files, broadcast them, then delete them."""
-	if not os.path.isdir(STREAM_DIR):
-		log(f"Stream directory {STREAM_DIR} does not exist, creating it")
+def handleClientMessage(clientSocket, clientAddr, port, data):
+	"""
+	Handle a single chunk of data received from a client.
+	Right now we just log it; you can add JSON parsing, commands, etc.
+	"""
+	try:
 		try:
-			os.makedirs(STREAM_DIR, exist_ok=True)
+			text = data.decode("utf-8", errors="replace")
+			log(f"From {clientAddr} on port {port}: {text!r}")
+		except Exception:
+			log(f"From {clientAddr} on port {port} (raw bytes): {data!r}")
+
+		# TODO: parse commands here if needed
+		# e.g. if text.startswith("PING"): ...
+	except Exception as e:
+		log(f"Error in handleClientMessage from {clientAddr} on port {port}: {e}")
+		traceback.print_exc()
+
+
+#############################
+def clientLoop(clientSocket, clientAddr, port):
+	"""
+	Per-client thread: receive data from this client until it disconnects.
+	"""
+	log(f"Client thread started for {clientAddr} on port {port}")
+
+	with clientsLock:
+		clientsByPort[port].add(clientSocket)
+
+	try:
+		while True:
+			data = clientSocket.recv(BUFFER_SIZE)
+			if not data:
+				log(f"Client {clientAddr} disconnected from port {port}")
+				break
+
+			handleClientMessage(clientSocket, clientAddr, port, data)
+
+	except Exception as e:
+		log(f"Error in clientLoop for {clientAddr} on port {port}: {e}")
+		traceback.print_exc()
+
+	finally:
+		with clientsLock:
+			if clientSocket in clientsByPort.get(port, set()):
+				try:
+					clientSocket.close()
+				except Exception:
+					pass
+				clientsByPort[port].remove(clientSocket)
+		log(f"Client thread exiting for {clientAddr} on port {port}")
+
+
+#############################
+def watchDir():
+	"""
+	Watch driverRts.DATA_DIR for new files and broadcast them:
+
+		*.rts-r  -> only to clients on port 2060
+		*.rts-t  -> only to clients on port 2061
+
+	Anything else is skipped (but logged).
+	"""
+	if not os.path.isdir(driverRts.DATA_DIR):
+		log(f"Stream directory {driverRts.DATA_DIR} does not exist, creating it")
+		try:
+			os.makedirs(driverRts.DATA_DIR, exist_ok=True)
 		except Exception as e:
-			log(f"Failed to create directory {STREAM_DIR}: {e}")
+			log(f"Failed to create directory {driverRts.DATA_DIR}: {e}")
 			return
 
-	log(f"Watching directory: {STREAM_DIR}")
+	log(f"Watching directory: {driverRts.DATA_DIR}")
 
 	while True:
 		try:
-			files = sorted(os.listdir(STREAM_DIR))
+			files = sorted(os.listdir(driverRts.DATA_DIR))
 
 			for fileName in files:
-				filePath = os.path.join(STREAM_DIR, fileName)
+				filePath = os.path.join(driverRts.DATA_DIR, fileName)
 				if not os.path.isfile(filePath):
 					continue
 
-				broadcastFile(filePath)
+				# Decide which port(s) to send to based on suffix
+				if fileName.endswith(".rts-r"):
+					targetPorts = [2060]
+				elif fileName.endswith(".rts-t"):
+					targetPorts = [2061]
+				else:
+					log(f"Skipping file with unknown RTS suffix: {fileName}")
+					continue
+
+				broadcastFile(filePath, targetPorts=targetPorts)
 
 				# delete the file immediately
 				try:
@@ -116,54 +168,8 @@ def watchStreamDir():
 					log(f"Deleted file: {filePath}")
 				except Exception as e:
 					log(f"Error deleting file {filePath}: {e}")
-
-		except Exception as e:
-			log(f"Error while watching directory: {e}")
-			traceback.print_exc()
-
-		time.sleep(SCAN_INTERVAL_SECONDS)
-		
-#############################
-def watchStreamDirX():
-	"""Poll STREAM_DIR for new files, broadcast once, then delete them."""
-	if not os.path.isdir(STREAM_DIR):
-		log(f"Stream directory {STREAM_DIR} does not exist, creating it")
-		try:
-			os.makedirs(STREAM_DIR, exist_ok=True)
-		except Exception as e:
-			log(f"Failed to create directory {STREAM_DIR}: {e}")
-			return
-
-	seenFiles = set()
-	log(f"Watching directory: {STREAM_DIR}")
-
-	while True:
-		try:
-			currentFiles = set(os.listdir(STREAM_DIR))
-			currentFiles = {
-				f for f in currentFiles
-				if os.path.isfile(os.path.join(STREAM_DIR, f))
-			}
-
-			newFiles = currentFiles - seenFiles
-
-			for fileName in sorted(newFiles):
-				filePath = os.path.join(STREAM_DIR, fileName)
-				broadcastFile(filePath)
-
-				# delete after transmission
-				try:
-					os.remove(filePath)
-					log(f"Deleted file: {filePath}")
-				except FileNotFoundError:
-					# someone else already removed it, ignore
-					pass
-				except Exception as e:
-					log(f"Error deleting file {filePath}: {e}")
 					traceback.print_exc()
 
-			seenFiles |= newFiles
-
 		except Exception as e:
 			log(f"Error while watching directory: {e}")
 			traceback.print_exc()
@@ -172,45 +178,70 @@ def watchStreamDirX():
 
 
 #############################
-def acceptConnections(serverSocket):
-	"""Accept incoming TCP connections and track them in the global client set."""
-	log(f"Server listening on port {PORT}")
+def acceptConnections(serverSocket, port):
+	"""Accept incoming TCP connections on a given socket and spawn a thread for each client."""
+	log(f"Server listening on port {port}")
 	while True:
 		clientSocket, clientAddr = serverSocket.accept()
-		log(f"New client connected from {clientAddr}")
+		log(f"New client connected from {clientAddr} on port {port}")
 		clientSocket.setblocking(True)
 
-		with clientsLock:
-			clients.add(clientSocket)
+		t = threading.Thread(
+			target=clientLoop,
+			args=(clientSocket, clientAddr, port),
+			daemon=True
+		)
+		t.start()
 
 
 #############################
 def main():
-	serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-	serverSocket.bind(("", PORT))
-	serverSocket.listen(5)
+	serverSockets = []
 
-	watcherThread = threading.Thread(target=watchStreamDir, daemon=True)
+	# create listeners for all ports
+	for port in PORTS:
+		serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		serverSocket.bind(("", port))
+		serverSocket.listen(5)
+		serverSockets.append((serverSocket, port))
+
+	# start directory watcher
+	watcherThread = threading.Thread(target=watchDir, daemon=True)
 	watcherThread.start()
 
+	# start accept loops for each port
+	for serverSocket, port in serverSockets:
+		t = threading.Thread(
+			target=acceptConnections,
+			args=(serverSocket, port),
+			daemon=True
+		)
+		t.start()
+
 	try:
-		acceptConnections(serverSocket)
+		# keep main thread alive to catch KeyboardInterrupt
+		while True:
+			time.sleep(1)
 	except KeyboardInterrupt:
 		log("KeyboardInterrupt received, shutting down...")
 	finally:
-		try:
-			serverSocket.close()
-		except Exception:
-			pass
+		# close listener sockets
+		for serverSocket, _ in serverSockets:
+			try:
+				serverSocket.close()
+			except Exception:
+				pass
 
+		# close client sockets per port
 		with clientsLock:
-			for clientSocket in clients:
-				try:
-					clientSocket.close()
-				except Exception:
-					pass
-			clients.clear()
+			for port, socketSet in clientsByPort.items():
+				for clientSocket in list(socketSet):
+					try:
+						clientSocket.close()
+					except Exception:
+						pass
+				socketSet.clear()
 
 		log("Server shut down cleanly")
 
