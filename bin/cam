@@ -201,6 +201,7 @@ class handler(BaseHTTPRequestHandler):
         #tDate = tDate.replace(microsecond=milliseconds * 1000)
 
         tDate = sidraCore.camStrToDt(sDate)
+        print("times cam: " + str(tDate) + " server: " + str(datetime.now()))
 
         output = str(tDate)
         output = output + " CAM >"

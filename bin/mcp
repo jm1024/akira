@@ -7,20 +7,22 @@ import os
 import uuid
 import sys
 import re
+import importlib
 
 import sidraCore
 import plateUtils
 
 #dynamically load all read drivers
+print("loading drivers:")
 transDrivers = {}
 for driver in sidraCore.driversTrans:
     transDrivers[driver] = importlib.import_module(driver)
     print("Loaded trans driver: " + driver)
 
 #timing
-PURGE_SECONDS = 12            #should probably be 30
-EVENT_MARGIN_MS = 7000        #delay before processing any events - should be 5000?
-EVENT_MARGIN_RF_MS = 1000     #max read delay between CF and RF to allow association
+PURGE_SECONDS = 10            #should probably be 30
+EVENT_MARGIN_MS = 10000        #delay before processing any events - should be 5000?
+EVENT_MARGIN_RF_MS = 2000     #max read delay between CF and RF to allow association
 
 #lidar stuff
 LIDAR_TIME_WINDOW_MS = 1000   # max time delta allowed
@@ -54,14 +56,14 @@ FACING_REAR = "rear"
 
 DEBUG = True
 DEBUG_EVENT = True
-DEBUG_PURGE = True
+DEBUG_PURGE = False
 DEBUG_PURGE_EXPIRED = True
-DEBUG_LOCK = False
+DEBUG_LOCK = True
 DEBUG_REPAIR = True
 DEBUG_DEDUP = True
 DEBUG_LOAD = False
 DEBUG_QUEUE = False
-DEBUG_LIDAR_MATCH = True
+DEBUG_LIDAR_MATCH = False
 
 CALIBRATE = False
 calibration = {}
@@ -825,11 +827,6 @@ while run:
 
         #get age
         diffMs = sidraCore.timeOffsetMs(eventQ['date'], datetime.now())
-        # WAS THIS --> diffMs = sidraCore.timeOffsetMs(datetime.now(), eventQ['date'])
-        #diff = datetime.now() - eventQ['date']
-        #diffSec = diff.total_seconds()
-        #if eventQ["type"] == sidraCore.EVENT_RF:
-        #    print("UR: " + str(eventQ['usedReason']) + " tp:" + str(eventQ['tagPlate']) + " epc:" + str(eventQ['epc']) + " diffMs: " + str(diffMs))
 
         #cleanup RF and pre-assign v3 tags
         if eventQ["type"] == sidraCore.EVENT_RF and eventQ['used'] == False and eventQ['usedReason'] == "" and diffMs > EVENT_MARGIN_RF_MS:
@@ -918,18 +915,19 @@ while run:
             for eventQCF in events:
                 if eventQCF["type"] == sidraCore.EVENT_CAM and eventQCF['used'] == False and eventQCF['lockedEpc'] == "" and eventQCF['facing'] ==  FACING_FRONT:
                     checked = checked +1
+                    print("cam: " + str(eventQCF['date']) + " rf: " + str(eventRF['date']))
                     if eventQCF['lane'] in possibleLanes:
                         thisOffset = abs(sidraCore.timeOffsetMs(eventQCF['date'], eventRF['date']))
                         if thisOffset < closestOffset and thisOffset < EVENT_MARGIN_RF_MS:
                             closestCFid = eventQCF['id']
                             closestOffset = thisOffset
-
-            #                else:
-            #                    print("NM: " + eventQCF['plate'] + " off:" + str(thisOffset) + " closest:" + str(closestOffset) + " margin:" + str(EVENT_MARGIN_RF_MS))
-            #            else:
-            #                print("NOT IN LANES")
-            #        else:
-            #            print("NOT FRONT")
+                        else:
+                            print("NO MATCH: " + eventQCF['plate'] + " off:" + str(thisOffset) + " closest:" + str(closestOffset) + " margin:" + str(EVENT_MARGIN_RF_MS))
+                    else:
+                        print("NOT IN LANES")
+                else:
+                    if eventQCF['type'] == sidraCore.EVENT_CAM:
+                        print("NOT FRONT " + str(eventQCF['type']))
 
             # if theres a cam assign it
             if not closestCFid == "":
@@ -942,7 +940,7 @@ while run:
                             print(" @ LOCK: " + str(eventLock['lockedEpc']) +  " lane:" + str(eventQ['lane'])+ " to " + eventLock['plate'] + " lane:" + str(eventLock['lane']))
             else:
                 if DEBUG_LOCK:
-                    print(" @ UNABLE TO MATCH " + eventQ['epc'] + " tried: " + str(checked))
+                    print(" @ UNABLE TO MATCH " + str(eventQ.get('epc')) + " tried: " + str(checked))
 
         #else:
         #    if eventQ["type"] == sidraCore.EVENT_RF:
@@ -980,6 +978,7 @@ while run:
 
             if DEBUG_LOCK:
                 msg = " @ LOCK STAT: " + str(eventCF['plate']) + "->" + str(eventCF['lockedEpc']) + " lane: " + str(eventCF['lane'])
+                
                 print(msg)
                 sidraCore.logMcp(msg)
 
@@ -1434,6 +1433,9 @@ while run:
             ##################################################
             #xmit to sidraApi
 
+            sLidarPos = ""
+            sCamPos = ""
+
             #format position delta
             try:
                 lidarPos = xmitEvent['lidarInPos']
@@ -1451,8 +1453,9 @@ while run:
                     sPosDelta = colorPad(posDelta, 5, "red")
                     sLidarPos = colorPad(lidarPos, 5, "red")
                     sCamPos = colorPad(camPos, 5, "red")
-            except:
-                sPosDelta = colorPad(timeDelta,"na","red")
+            except Exception as ex:
+                print("ERROR 1454 " + str(ex))
+                sPosDelta = colorPad("xx",5,"red")
             if xmitEvent["lidarInLane"] == 0:
                 sPosDelta = colorPad("na",5,"red")
 
@@ -1497,10 +1500,11 @@ while run:
             #sidraCore.xmitEvent(sidraCore.sidraApi, json.dumps(xmitEvent, default=sidraCore.jsonConverter))
             
             #trans drivers
+            print("CHECKING DRIVERS")
             for driverName, driverModule in transDrivers.items():
-            print("running driver: " + str(driverName))
-            if hasattr(driverModule, "trans"):
-                driverModule.trans(xmitEvent)
+                print("running driver: " + str(driverName))
+                if hasattr(driverModule, "trans"):
+                    driverModule.trans(xmitEvent)
 
 
 

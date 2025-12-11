@@ -47,6 +47,7 @@ LOG_DIR = "/var/sidra/log"
 ETC_DIR = "/var/sidra/etc"
 IMG_DIR = "/var/sidra/img"
 ANPR_DIR = "/var/sidra/anpr"
+TMP_DIR = "/var/sidra/tmp"
 TRN_DIR = "/var/sidra/trn"
 TRN_WORKING_DIR = "/var/sidra/trn/working"
 TRN_DONE_DIR = "/var/sidra/trn/done"
@@ -142,7 +143,7 @@ def loadConfig():
         
     #drivers trans
     if not cfg.get("driversTrans") == None:
-        driversServer = cfg.get("driversTrans")
+        driversTrans = cfg.get("driversTrans")
         
     #drivers xmit
     if not cfg.get("driversXmit") == None:
@@ -387,7 +388,7 @@ def massState(name):
 def massOccupied(name):
     
     state = massState(name)
-    print("ST: " + str(state))
+    #print("ST: " + str(state))
     occupied = True
     
     for mass in massSensors:
@@ -395,7 +396,8 @@ def massOccupied(name):
             trip = mass['trip']
             main = mass['main']
             
-    if state.get(trip) == MASS_EMPTY and state.get(main) == MASS_EMPTY:
+    #if state.get(trip) == MASS_EMPTY and state.get(main) == MASS_EMPTY:
+    if state.get(main) == MASS_EMPTY:
         occupied = False
         
     return occupied

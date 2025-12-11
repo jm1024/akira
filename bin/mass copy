@@ -14,7 +14,7 @@ PORT = 23
 USERNAME = "admin"
 PASSWORD = "admin"
 
-DEBUG = False
+DEBUG = True
 
 name = ""
 lane = ""
@@ -134,19 +134,22 @@ def monitorNotifications(tn):
             if not text:
                 continue
             state = parseGpio(text)
-            #print(state)
+            print(state)
             #print("EVENT RAW:", text)
     except Exception as ex:
         print("Exception in monitorNotification: " + str(ex))
 
 #############################
 def parseGpio(text):
+    """
+    Parse either:
+      - notify line: '# FFFF FEFF FFFF'
+      - readall result: 'FEFF', '>>FEFF', etc.
+    Returns dict: {'100':1, ..., '115':0} or None on failure.
+    """
     text = text.strip()
     if not text:
         return None
-
-    #if DEBUG:
-    #    print(text)
 
     parts = text.split()
     if not parts:
@@ -155,11 +158,9 @@ def parseGpio(text):
     hexChars = "0123456789ABCDEFabcdef"
     hexVal = None
 
-    # Case 1: notification line like '# FEFF FEFE FFFF'
-    # You believe the first hex after '#' is the current state,
-    # so use parts[1].
-    if parts[0] == "#" and len(parts) >= 2:
-        candidate = "".join(c for c in parts[1] if c in hexChars)
+    # Case 1: notification line like '# FFFF FEFF FFFF'
+    if parts[0] == "#" and len(parts) >= 3:
+        candidate = "".join(c for c in parts[2] if c in hexChars)
         if candidate:
             hexVal = candidate
 
@@ -190,11 +191,11 @@ def parseGpio(text):
     for i in range(16):
         pin = i + 100
         result[f"{pin}"] = int(bits[i])
-
+        
     updateMass(result)
 
     return result
-        
+    
 #############################
 def updateMass(current):
 
@@ -255,8 +256,7 @@ if __name__ == "__main__":
             name = mass["name"]
             lane = mass["lane"]
             ip = mass["ip"]
-            #if DEBUG:
-            #    print(mass)
+            print(mass)
 
     if DEBUG:
         print(f"Connecting to Numato GPIO @ {ip}:23")

@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import traceback
+import json
 
 import sidraCore
 import driverRts
@@ -70,19 +71,32 @@ def broadcastFile(filePath, targetPorts=None):
 
 #############################
 def handleClientMessage(clientSocket, clientAddr, port, data):
-	"""
-	Handle a single chunk of data received from a client.
-	Right now we just log it; you can add JSON parsing, commands, etc.
-	"""
+
 	try:
+		text = None
 		try:
 			text = data.decode("utf-8", errors="replace")
-			log(f"From {clientAddr} on port {port}: {text!r}")
+			log(f"serverRts from {clientAddr} on port {port}: {text!r}")
 		except Exception:
-			log(f"From {clientAddr} on port {port} (raw bytes): {data!r}")
+			log(f"serverRts from {clientAddr} on port {port} (raw bytes): {data!r}")
 
-		# TODO: parse commands here if needed
-		# e.g. if text.startswith("PING"): ...
+		try:
+			if not text:
+				return  # nothing usable to parse
+		
+			msg = json.loads(text)
+			command = msg.get('header', {}).get('command')
+		
+			if command == "AbortReader":
+				driverRts.setEnable(False)
+				log("driverRts disabled via AbortReader")
+			elif command == "InitializeReader":
+				driverRts.setEnable(True)
+				log("driverRts enabled via InitializeReader")
+			
+		except Exception as ex:
+			print("serverRts.handleClientMessage() " + str(ex))
+	
 	except Exception as e:
 		log(f"Error in handleClientMessage from {clientAddr} on port {port}: {e}")
 		traceback.print_exc()

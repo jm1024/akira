@@ -93,8 +93,8 @@ def parseEvent(event):
         for val in vals:
             d = val.split('=')
             if d[0] == "first":
-                dt = sidraCore.rfStrToDt(d[1].strip(','))
-                #dt = d[1].strip(',')
+                #dt = sidraCore.rfStrToDt(d[1].strip(','))
+                dt = d[1].strip(',')
             if d[0] == "tag_id":
                 epc = d[1][2:]
                 epc = epc.strip(',')
@@ -127,8 +127,8 @@ def parseEvent(event):
         for val in vals:
             d = val.split('=')
             if d[0] == "first":
-                dt = sidraCore.rfStrToDt(d[1].strip(','))
-                #dt = d[1].strip(',')
+                #dt = sidraCore.rfStrToDt(d[1].strip(','))
+                dt = d[1].strip(',')
             if d[0] == "tag_id":
                 epc = d[1][2:]
                 epc = epc.strip(',')
@@ -204,6 +204,7 @@ def parseEvent(event):
             d = val.split('=')
             if d[0] == "first":
                 dt = d[1].strip(',')
+            #if dt == ""
             if d[0] == "last":
                 dt = d[1].strip(',')
             if d[0] == "antenna":
@@ -250,11 +251,12 @@ def parseEvent(event):
 
         #get arrival data because.... star :(
         if epc in arrivals:
-            #print("FOUND ARRIVAL")
-            #print(arrivals[epc])
+            if DEBUG:
+                print("FOUND ARRIVAL")
+                print(arrivals[epc])
             rssi = arrivals[epc].get('rssi')
-            if dt == "":
-                dt = arrivals[epc].get('dt')
+            #if dt == "":
+            dt = arrivals[epc].get('dt')
             if pwAuthentic == "" or pwAuthentic == AUTH_INAUTHENTIC:
                 pwAuthentic = arrivals[epc].get('pwAuthentic')
             if tidAuthentic == "" or tidAuthentic == AUTH_INAUTHENTIC:
@@ -267,7 +269,10 @@ def parseEvent(event):
             arrivals = sidraCore.removeDictKey(arrivals, epc)
             #print(arrivals)
         else:
+            if DEBUG:
+                print("NO ARRIVAL DATA")
             sidraCore.log("NO ARRIVAL DATA: " + str(epc))
+            
 
         #print(epc)
         #print(tid)
@@ -275,9 +280,11 @@ def parseEvent(event):
 
         #if no arrival then use last because.... welp
         if dt == "":
+            print("NO ARRIVAL EVENT")
             dt = last
 
         #if id.startswith(TAG_FILTER):
+        print("times - reader: " + str(dt) + " server: " + str(datetime.now()))
         transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic)
 
 #######################
@@ -436,7 +443,7 @@ if CONFIGURE:
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
     ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
     #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
-    ret = xrCmd("tag.reporting.arrive_generation=no_wait")
+    ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
     ret = xrCmd("reader.profile.save(MalaysiaMLFF)")
     ret = xrCmd("setup.operating_mode=active")
 
