@@ -11,20 +11,22 @@ ENABLE_FILE = "akiraEnabled.rts"
 EXT_READ = ".rts-r"
 EXT_TRANS = ".rts-t"
 
+RESPONSE_FILE = "response.log"
+
 #############################
-setEnable(state = True)
-	sidracore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
+def setEnable(state = True):
+	sidraCore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
 	
 #############################
-getEnable()
+def getEnable():
 
 	ret = True
 	try:
-		result = sidracore.readFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE)
-		if result = "False":
+		result = sidraCore.readFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE)
+		if result == "False":
 			ret = False
 	except Exception as ex:
-		pprint("driverRts.getEnable() " + str(ex))
+		print("driverRts.getEnable() " + str(ex))
 		
 	return ret
 
@@ -69,7 +71,7 @@ def read(data):
 			xmit = False
 	
 	#dt = datetime.now().isoformat()
-	thisDtS = data['date']
+	thisDtS = data['dt']
 	thisDt = sidraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
 			
@@ -139,8 +141,8 @@ def trans(data):
 			'body':{
 			'TxID':data['id'],
 			'TagID':None,
-			'PlazaID”:data['plaza'],
-			'LaneID”:data['lane'],
+			'PlazaID':data['plaza'],
+			'LaneID':data['lane'],
 			'Result':"00",
 			'DetectedTime':None,
 			},
@@ -148,7 +150,7 @@ def trans(data):
 			}
 	
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + msgNTD['TxID'] + EXT_TRANS, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
 	
 	msg = ""
 	xmit = True
@@ -166,7 +168,7 @@ def trans(data):
 		'CapturedTime':data['date'].isoformat(),
 		'AnprID':data['id'],
 		'AnprResult':data['plate'],
-		'AnprImage':data['image_p']
+		'AnprImage':data['img_f']
 		},
 		'hmac':"XXXX"
 		}

@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import json
+from datetime import datetime, timedelta
 
 import sidraCore
 import driverRts
@@ -17,12 +18,128 @@ DEBUG = True
 clientsByPort = {port: set() for port in PORTS}
 clientsLock = threading.Lock()
 
-
 #############################
 def log(message):
 	if DEBUG:
 		print(message, flush=True)
 
+#############################
+def logResponse(msg):
+	
+	current = []
+	
+	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+	
+	if not sidraCore.fileExist(responseFile):
+		current = []
+	else:
+		current = json.loads(sidraCore.readFile(responseFile))
+		
+	current.append(msg)
+
+	sidraCore.writeFile(responseFile, json.dumps(current))
+
+#############################
+def replaceTransId(fileName):
+	
+	newTransId = ""
+	
+	try:
+		contents = json.loads(sidraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
+		
+		#if it's an ANPR
+		if contents['header']['command'] == "ANPRInfo":
+			print("FTID")
+			newTransId = findTransId(contents['body']['TagID'])
+			contents['body']['AnprID'] = newTransId
+		
+			sidraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
+			
+			c2 = contents
+			c2['body']['AnprImage'] = ""
+			print(c2)
+			
+	except Exception as ex:
+		print("Error serverRts.replaceTransId() " + str(ex))
+
+#############################
+def findTransId(tid):
+	
+	ret = ""
+	
+	responses = []
+	
+	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+	
+	if sidraCore.fileExist(responseFile):
+		responses = json.loads(sidraCore.readFile(responseFile))
+	
+	for msg in responses:
+		try:
+			if msg['header']['command'] == "TagResult":
+				if msg['body']['TagId'] == tid:
+					ret = msg['body']['AnprID']
+		except Exception as ex:
+			print("findTransId() " + str(ex))
+			pass
+				
+	return ret
+
+#############################
+def pruneResponses(maxAgeMinutes=10):
+	
+	"""
+	Remove response entries older than maxAgeMinutes based on header.timestamp.
+	Timestamp format expected: "YYYY-MM-DD HH:MM:SS[.ffffff]"
+	"""
+	try:
+		responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+
+		if not sidraCore.fileExist(responseFile):
+			return True  # nothing to prune
+
+		raw = sidraCore.readFile(responseFile)
+		if not raw:
+			return True  # empty file
+
+		responses = json.loads(raw)
+		if not isinstance(responses, list):
+			log(f"pruneResponses(): response file is not a list: {type(responses)}")
+			return False
+
+		cutoff = datetime.now() - timedelta(minutes=maxAgeMinutes)
+
+		kept = []
+		prunedCount = 0
+
+		for msg in responses:
+			try:
+				ts = msg.get("header", {}).get("timestamp")
+				if not ts:
+					kept.append(msg)
+					continue
+
+				# Accept both "...SS" and "...SS.ffffff"
+				# datetime.fromisoformat handles "YYYY-MM-DD HH:MM:SS.ffffff"
+				msgTime = datetime.fromisoformat(ts)
+
+				if msgTime >= cutoff:
+					kept.append(msg)
+				else:
+					prunedCount += 1
+			except Exception:
+				# If timestamp is malformed, keep the message (safer)
+				kept.append(msg)
+
+		if prunedCount:
+			sidraCore.writeFile(responseFile, json.dumps(kept))
+
+		log(f"pruneResponses(): pruned={prunedCount}, kept={len(kept)}")
+		return True
+
+	except Exception as ex:
+		print("Error serverRts.pruneResponses() " + str(ex))
+		return False
 
 #############################
 def broadcastFile(filePath, targetPorts=None):
@@ -85,6 +202,7 @@ def handleClientMessage(clientSocket, clientAddr, port, data):
 				return  # nothing usable to parse
 		
 			msg = json.loads(text)
+			logResponse(msg)
 			command = msg.get('header', {}).get('command')
 		
 			if command == "AbortReader":
@@ -170,6 +288,7 @@ def watchDir():
 					targetPorts = [2060]
 				elif fileName.endswith(".rts-t"):
 					targetPorts = [2061]
+					replaceTransId(fileName) #replace transaction id if possible with transId from previous responses
 				else:
 					log(f"Skipping file with unknown RTS suffix: {fileName}")
 					continue

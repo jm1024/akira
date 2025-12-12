@@ -81,6 +81,9 @@ def parseEvent(event):
 
     # tag arrive
     #event.tag.arrive tag_id=0x000000000000000000196358
+    print("-------------------------")
+    print(event)
+    print("-------------------------")
 
     vals = event.split(" ")
 

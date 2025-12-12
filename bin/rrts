@@ -1,3 +1,45 @@
-#!/bin/bash
-killall serverRts
-./serverRts
+#!/usr/bin/env python3
+import subprocess
+import time
+import sidraCore
+import os
+
+processes = ["serverRts"]
+BASE_DIR = "/var/sidra/bin"
+SLEEP_SECONDS = 0.5
+
+#############################
+def runPkill(signalOption):
+	for name in processes:
+		pattern = f"{BASE_DIR}/{name}"
+		try:
+			subprocess.run(
+				["pkill", signalOption, "-f", pattern],
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.DEVNULL,
+				check=False,
+			)
+		except Exception as e:
+			print(f"Error running pkill for {pattern}: {e}", flush=True)
+
+#############################
+def main():
+	# Try graceful shutdown first (SIGINT so mass can do gpio notify off)
+	runPkill("-INT")
+
+	# Give them a moment to handle signals and close sockets
+	time.sleep(SLEEP_SECONDS)
+
+	# Anything still alive gets a TERM
+	runPkill("-TERM")
+	
+	time.sleep(SLEEP_SECONDS)
+	
+	# Restart serverRts
+	server = f"{BASE_DIR}/serverRts"
+	os.execv(server, [server])
+
+
+#############################
+if __name__ == "__main__":
+	main()
