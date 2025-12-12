@@ -444,7 +444,10 @@ if CONFIGURE:
     ret = xrCmd("antennas.3.conducted_power=" + power)
     ret = xrCmd("antennas.4.conducted_power=" + power)
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
-    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
+    #Shah Alam Current
+    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
+    #try for SLFF
+    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
     #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
     ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
     ret = xrCmd("reader.profile.save(MalaysiaMLFF)")

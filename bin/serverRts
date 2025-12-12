@@ -42,6 +42,8 @@ def logResponse(msg):
 #############################
 def replaceTransId(fileName):
 	
+	pruneResponses(1)
+	
 	newTransId = ""
 	
 	try:
@@ -49,15 +51,16 @@ def replaceTransId(fileName):
 		
 		#if it's an ANPR
 		if contents['header']['command'] == "ANPRInfo":
-			print("FTID")
+			#print("FTID")
 			newTransId = findTransId(contents['body']['TagID'])
 			contents['body']['AnprID'] = newTransId
 		
 			sidraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
 			
-			c2 = contents
-			c2['body']['AnprImage'] = ""
-			print(c2)
+			if DEBUG:
+				c2 = contents
+				c2['body']['AnprImage'] = ""
+				print(c2)
 			
 	except Exception as ex:
 		print("Error serverRts.replaceTransId() " + str(ex))
