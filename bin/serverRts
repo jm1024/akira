@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import json
+import uuid
 from datetime import datetime, timedelta
 
 import sidraCore
@@ -38,6 +39,64 @@ def logResponse(msg):
 	current.append(msg)
 
 	sidraCore.writeFile(responseFile, json.dumps(current))
+
+#############################
+	def sendAckAlive():
+		
+		id = str(uuid.uuid4())
+		responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+		
+		ack = {
+			'header':{
+			'command':"IsAlive",
+			'timestamp':datetime.now().isoformat()
+			},
+			'body':{
+			'Result':"ACK",
+			'hmac':"XXXX"
+			}
+		}
+			
+		sidraCore.writeFile(responseFile, json.dumps(ack))
+
+#############################
+def sendAckInitialize():
+	
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+	
+	ack = {
+		'header':{
+		'command':"InitializeReader",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
+		}
+	}
+		
+	sidraCore.writeFile(responseFile, json.dumps(ack))
+
+#############################
+def sendAckAbort():
+	
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+	
+	ack = {
+		'header':{
+		'command':"AbortReader",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
+		}
+	}
+		
+	sidraCore.writeFile(responseFile, json.dumps(ack))
+	
 
 #############################
 def replaceTransId(fileName):
@@ -150,6 +209,8 @@ def broadcastFile(filePath, targetPorts=None):
 	Read a file and send its contents to all connected clients
 	on the given ports (or all ports if targetPorts is None).
 	"""
+	
+	ret = True
 	data = sidraCore.readFile(filePath)
 
 	if not data:
@@ -170,12 +231,16 @@ def broadcastFile(filePath, targetPorts=None):
 	deadClients = []
 
 	with clientsLock:
+		print(targetPorts)
 		for port in targetPorts:
 			socketSet = clientsByPort.get(port, set())
 			for clientSocket in list(socketSet):
 				try:
+					log(f"Sending to client {clientSocket} on port {port}")
 					clientSocket.sendall(dataBytes)
+					ret = True
 				except Exception as e:
+					ret = False
 					log(f"Error sending to client {clientSocket} on port {port}: {e}")
 					deadClients.append((port, clientSocket))
 
@@ -188,6 +253,7 @@ def broadcastFile(filePath, targetPorts=None):
 				clientsByPort[port].remove(clientSocket)
 			log(f"Removed dead client {clientSocket} from port {port}")
 
+	return ret
 
 #############################
 def handleClientMessage(clientSocket, clientAddr, port, data):
@@ -207,11 +273,15 @@ def handleClientMessage(clientSocket, clientAddr, port, data):
 			msg = json.loads(text)
 			logResponse(msg)
 			command = msg.get('header', {}).get('command')
-		
-			if command == "AbortReader":
+
+			if command == "IsAlive":
+				sendAckAlive()
+			elif command == "AbortReader":
+				sendAckAbort()
 				driverRts.setEnable(False)
 				log("driverRts disabled via AbortReader")
 			elif command == "InitializeReader":
+				sendAckInitialize()
 				driverRts.setEnable(True)
 				log("driverRts enabled via InitializeReader")
 			
@@ -293,18 +363,20 @@ def watchDir():
 					targetPorts = [2061]
 					replaceTransId(fileName) #replace transaction id if possible with transId from previous responses
 				else:
-					log(f"Skipping file with unknown RTS suffix: {fileName}")
+					#log(f"Skipping file with unknown RTS suffix: {fileName}")
 					continue
 
-				broadcastFile(filePath, targetPorts=targetPorts)
+				if broadcastFile(filePath, targetPorts=targetPorts):
 
-				# delete the file immediately
-				try:
-					os.remove(filePath)
-					log(f"Deleted file: {filePath}")
-				except Exception as e:
-					log(f"Error deleting file {filePath}: {e}")
-					traceback.print_exc()
+					# delete the file immediately
+					try:
+						os.remove(filePath)
+						log(f"Deleted file: {filePath}")
+					except Exception as e:
+						log(f"Error deleting file {filePath}: {e}")
+						traceback.print_exc()
+				else:
+					log("Error sending file")
 
 		except Exception as e:
 			log(f"Error while watching directory: {e}")
@@ -332,6 +404,10 @@ def acceptConnections(serverSocket, port):
 
 #############################
 def main():
+	
+	#sendAckInitialize()
+	#sendAckAbort()
+	
 	serverSockets = []
 
 	# create listeners for all ports
@@ -374,6 +450,7 @@ def main():
 			for port, socketSet in clientsByPort.items():
 				for clientSocket in list(socketSet):
 					try:
+						#print(str(clientSocket))
 						clientSocket.close()
 					except Exception:
 						pass

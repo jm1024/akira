@@ -27,11 +27,18 @@ READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
 TAG_FILTER = "000000"
-AUTH = True
 
+auth = True
+authWait = False
 power = "0"
 
 DEBUG = True
+DEBUG_RECV = False
+DEBUG_EVENTS = True
+DEBUG_ARRIVAL_MATCH = False
+DEBUG_TIMING = False
+DEBUG_DRIVER = False
+DEBUG_FINAL = True
 
 AUTH_AUTHENTIC = "AUTHENTIC"
 AUTH_INAUTHENTIC = "INAUTHENTIC"
@@ -69,7 +76,7 @@ def recvEvent():
 
     bResp = event_socket.recv(256)
 
-    if DEBUG:
+    if DEBUG_RECV:
         print(readerIp + " << " + bResp.decode().strip())
 
     return bResp.decode().strip()
@@ -81,9 +88,10 @@ def parseEvent(event):
 
     # tag arrive
     #event.tag.arrive tag_id=0x000000000000000000196358
-    print("-------------------------")
-    print(event)
-    print("-------------------------")
+    if DEBUG_EVENTS:
+        print("+++++++++++++++++++++++++")
+        print(event)
+        print("-------------------------")
 
     vals = event.split(" ")
 
@@ -180,7 +188,8 @@ def parseEvent(event):
         arrival['lane'] = lane
         arrival['side'] = side
         for driverName, driverModule in readDrivers.items():
-            print("running driver: " + str(driverName))
+            if DEBUG_DRIVER:
+                print("running driver: " + str(driverName))
             if hasattr(driverModule, "read"):
                 driverModule.read(arrival)
 
@@ -254,7 +263,7 @@ def parseEvent(event):
 
         #get arrival data because.... star :(
         if epc in arrivals:
-            if DEBUG:
+            if DEBUG_ARRIVAL_MATCH:
                 print("FOUND ARRIVAL")
                 print(arrivals[epc])
             rssi = arrivals[epc].get('rssi')
@@ -272,7 +281,8 @@ def parseEvent(event):
             arrivals = sidraCore.removeDictKey(arrivals, epc)
             #print(arrivals)
         else:
-            if DEBUG:
+            print("NO ARRIVAL DATA")
+            if DEBUG_ARRIVAL_MATCH:
                 print("NO ARRIVAL DATA")
             sidraCore.log("NO ARRIVAL DATA: " + str(epc))
             
@@ -287,7 +297,8 @@ def parseEvent(event):
             dt = last
 
         #if id.startswith(TAG_FILTER):
-        print("times - reader: " + str(dt) + " server: " + str(datetime.now()))
+        if DEBUG_TIMING:
+            print("times - reader: " + str(dt) + " server: " + str(datetime.now()))
         transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic)
 
 #######################
@@ -303,7 +314,8 @@ def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAu
     #print(" ------>DT " + str(dt))
     #print("RSSI trans: " + str(rssi))
     
-    print("tDate: " + str(tDate))
+    #if DEBUG_TIMING:
+    #   print("tDate: " + str(tDate))
 
     #sidraCore.log(str(tDate) + " trn:" + trn + " site:" + READER_NAME + " epc:" + str(epc) + " ant:" + str(antenna) + " rssi:" + str(rssi) + " dt:" + str(dt))
     tData = {
@@ -349,7 +361,7 @@ def transaction(dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAu
     #output = output + " date: " + str(dt)
 
     sidraCore.log(output)
-    if DEBUG:
+    if DEBUG_FINAL:
         print(output)
 
 ############################################################################################
@@ -367,6 +379,8 @@ for reader in sidraCore.readers:
         readerIp = reader['ip']
         antennas = reader['antennas']
         power = reader['power']
+        auth = reader.get("auth", True)
+        authWait = reader.get("authWait", True)
 
 if DEBUG:
         print("Reader " + readerName + " Starting")
@@ -432,25 +446,44 @@ if CONFIGURE:
     ret = xrCmd("modem.protocol.isoc.control.query_session=0")
     ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
     ret = xrCmd("modem.protocol.isoc.control.session_id=SESSION_1")
-    if AUTH:
+    
+    #authentication
+    if auth:
         ret = xrCmd("tag.security.password_authentication_enable=1")
         ret = xrCmd("tag.security.tid_authentication_enable=1")
     else:
         ret = xrCmd("tag.security.password_authentication_enable=0")
         ret = xrCmd("tag.security.tid_authentication_enable=0")
     ret = xrCmd("tag.security.tid_mask.enable=0")
-    ret = xrCmd("antennas.1.conducted_power=" + power)
-    ret = xrCmd("antennas.2.conducted_power=" + power)
-    ret = xrCmd("antennas.3.conducted_power=" + power)
-    ret = xrCmd("antennas.4.conducted_power=" + power)
+    
+    #antenna power config
+    thisAntenna = 0
+    for antenna in antennas:
+        thisAntenna = antenna['number']
+        thisPower = antenna.get('power',"")
+        if thisPower == "":
+            thisPower = power
+        thisCmd = "antennas." + str(thisAntenna) + ".conducted_power=" + thisPower
+        ret = xrCmd(thisCmd)
+        
+    #ret = xrCmd("antennas.1.conducted_power=" + power)
+    #ret = xrCmd("antennas.2.conducted_power=" + power)
+    #ret = xrCmd("antennas.3.conducted_power=" + power)
+    #ret = xrCmd("antennas.4.conducted_power=" + power)
+    
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
     #Shah Alam Current
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
+    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
     #try for SLFF
-    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
-    #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
-    ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
-    ret = xrCmd("reader.profile.save(MalaysiaMLFF)")
+    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
+    
+    #wait for auth on arrival
+    if authWait:
+        ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
+    else:
+        ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
+        
+    ret = xrCmd("reader.profile.save(MalaysiaSLFF)")
     ret = xrCmd("setup.operating_mode=active")
 
 #ret = xrCmd("reader.profile.show_running_config()")

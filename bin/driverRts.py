@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 from datetime import datetime
+import uuid
 import json
 
 import sidraCore
@@ -12,6 +13,8 @@ EXT_READ = ".rts-r"
 EXT_TRANS = ".rts-t"
 
 RESPONSE_FILE = "response.log"
+
+DEBUG = True
 
 #############################
 def setEnable(state = True):
@@ -55,6 +58,9 @@ def read(data):
 	occupied = sidraCore.massOccupied(massName)
 	side = data['side']
 	
+	if DEBUG:
+		print("driverRTS tid: " + data['tid'] + " antenna: " + str(side) + " rssi: " + str(data['rssi']))
+	
 	if data['side'] == "front":
 		if not occupied:
 			xmit = True
@@ -74,7 +80,15 @@ def read(data):
 	thisDtS = data['dt']
 	thisDt = sidraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
-			
+	
+	authentic = data['tidAuthentic']
+	authentic == "AUTHENTIC"
+	#print("AUTHENTIC? " + str(authentic))
+	
+	thisExt = EXT_READ
+	
+	#if authentic == "AUTHENTIC":
+	thisExt = EXT_READ
 	contents = {
 		"header": {
 			"command": "TagDetected",
@@ -90,12 +104,31 @@ def read(data):
 		},
 		"hmac": "XXXX",
 	}
+		
+	#else:
+	#	thisExt = EXT_TRANS
+	#	contents = {
+	#		"header": {
+	#			"command": "NoTagDetected",
+	#			"timestamp": dt,
+	#		},
+	#		"body": {
+	#			"TxID": data['id'],
+	#			"TagID": data['tid'],
+	#			"PlazaID": sidraCore.plazaId,
+	#			"LaneID": data['lane'],
+	#			"Result":"01",
+	#			"DetectedTime": dt,
+	#			"Antenna": side,
+	#		},
+	#		"hmac": "XXXX",
+	#	}
 	
 	#print("=========================")
 	#print(contents)
 
 	if xmit:	
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_READ, json.dumps(contents))
+		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
 	
 	"""
 	tData = {
