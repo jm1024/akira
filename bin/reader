@@ -26,16 +26,17 @@ antennas = []
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
-TAG_FILTER = "000000"
-
+tagFilter = ""
 auth = True
 authWait = False
-power = "0"
+tidWait = False
+power = "100"
+mode = "C1G2_MODE_640_MILLER2"
 
 DEBUG = True
 DEBUG_RECV = False
 DEBUG_EVENTS = True
-DEBUG_ARRIVAL_MATCH = False
+DEBUG_ARRIVAL_MATCH = True
 DEBUG_TIMING = False
 DEBUG_DRIVER = False
 DEBUG_FINAL = True
@@ -165,9 +166,9 @@ def parseEvent(event):
 
         try:
             if len(tid) > 24:
-                print("reader: trim: " +str(tid))
+                #print("reader: trim: " +str(tid))
                 tid = tid[:24]
-                print("reader: done: " +str(tid))
+                #print("reader: done: " +str(tid))
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
 
@@ -248,9 +249,9 @@ def parseEvent(event):
 
         try:
             if len(tid) > 24:
-                print("reader: trim: " +str(tid))
+                #print("reader: trim: " +str(tid))
                 tid = tid[:24]
-                print("reader: done: " +str(tid))
+                #print("reader: done: " +str(tid))
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
 
@@ -374,13 +375,16 @@ readerName = sys.argv[1]
 sidraCore.log("Reader " + readerName + " Starting")
 
 for reader in sidraCore.readers:
-    print(reader['name'])
+    #print(reader['name'])
     if reader['name'] == readerName:
         readerIp = reader['ip']
+        tagFilter = reader.get("tagFilter","")
         antennas = reader['antennas']
         power = reader['power']
         auth = reader.get("auth", True)
         authWait = reader.get("authWait", True)
+        tidWait = reader.get("tidWait", True)
+        mode = reader.get("mode", "C1G2_MODE_640_MILLER2")
 
 if DEBUG:
         print("Reader " + readerName + " Starting")
@@ -465,23 +469,19 @@ if CONFIGURE:
             thisPower = power
         thisCmd = "antennas." + str(thisAntenna) + ".conducted_power=" + thisPower
         ret = xrCmd(thisCmd)
-        
-    #ret = xrCmd("antennas.1.conducted_power=" + power)
-    #ret = xrCmd("antennas.2.conducted_power=" + power)
-    #ret = xrCmd("antennas.3.conducted_power=" + power)
-    #ret = xrCmd("antennas.4.conducted_power=" + power)
     
+    #mode
+    ret = xrCmd("modem.protocol.isoc.physical.mode=" + str(mode))
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
-    #Shah Alam Current
-    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
-    #try for SLFF
+    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
     
-    #wait for auth on arrival
+    #wait for auth/tid on arrival
     if authWait:
         ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
     else:
-        ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
+        if tidWait:
+            ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
         
     ret = xrCmd("reader.profile.save(MalaysiaSLFF)")
     ret = xrCmd("setup.operating_mode=active")

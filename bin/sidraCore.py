@@ -367,7 +367,7 @@ def decodeUserData(userData):
         tagPlate = tagPlate.strip('\0x00')
         #tagPlate = plateHex.decode("hex")
     except Exception as ex:
-        print("err " + str(ex))
+        print("sidraCore.decodeUserData err: " + str(ex))
         log("decudeUserData() error: " + str(ex) + " userData: " + str(userData))
 
     return tagPlate, tagClass
