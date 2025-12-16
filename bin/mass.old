@@ -6,7 +6,6 @@ import sys
 import os
 import json
 import signal
-from datetime import datetime, timedelta
 
 import sidraCore
 
@@ -15,110 +14,18 @@ PORT = 23
 USERNAME = "admin"
 PASSWORD = "admin"
 
-WINDOW_FAST_PRE = -1
-WINDOW_FAST_POST = 1
-UNLOCK_LOCKOUT = 2
-
-DELAY_FAST = 0.1
-
 DEBUG = False
-DEBUG_STATE = True
 
 name = ""
 lane = ""
 ip = ""
-pinTrip = ""
-pinMain = ""
 state = {}
-
-locked = False
-lastLock = datetime.now() + timedelta(seconds=10)
-
-stateTime = datetime.now()
-lastState = {}
-lastTime = datetime.now()
-previousState = {}
-previousTime = datetime.now()
 
 tnConn = None
 
 
 #############################
-def massRules(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime):
-
-    delay = 0
-    
-    #give the read time to finish
-    if tripState == 1 and mainState == 0:
-        print("sleeping fast " + str(DELAY_FAST))
-        time.sleep(DELAY_FAST)
-        
-    if tripState == 1 and lastTripState == 0 and previousTripState == 1:
-        diffMs = int((previousTime - stateTime).total_seconds() * 1000)
-        print("tailgate threshold: " + str(diffMs))
-    
-    return delay
-
-#############################
-def getStates(current):
-    
-    #print(current)
-    trip = current[pinTrip]
-    main = current[pinMain]
-    
-    return trip, main
-    
-#############################
-def monitorNotifications(tn):
-    
-    global state
-    global stateTime
-    #global lastState
-    #global lastTime
-    #global previousState
-    #global previousTime
-    
-    print("Monitoring GPIO")
-    print("--------------------")
-    try:
-        while True:
-            # read one line-ish at a time
-            data = tn.read_until(b"\n", timeout=1)
-            if not data:
-                continue
-            text = data.decode(errors="ignore").strip()
-            if not text:
-                continue
-            
-            #previousState = lastState
-            #previousTime = lastTime    
-            #lastState = state
-            #lastTime = stateTime
-            state = parseGpio(text)
-            #stateTime = datetime.now()
-            
-            #if not previousState == {}:
-            #    previousTripState, previousMainState = getStates(previousState)
-            #else:
-            #    previousTripState = ""
-            #    previousMainState = ""
-            #if not lastState == {}:
-            #    lastTripState, lastMainState = getStates(lastState)
-            #else:
-            #    lastTripState = ""
-            #    lastMainState = ""
-
-            
-            #massRules(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime)
-            updateMass(state)
-                
-                #print(state)
-                #print("EVENT RAW:", text)
-    except Exception as ex:
-        print("Exception in monitorNotification: " + str(ex))
-
-#############################
-def readUntil(tn, marker, timeout=.5):
+def readUntil(tn, marker, timeout=5):
     """Read until marker bytes are seen or timeout expires."""
     if DEBUG:
         print(f"readUntil({marker!r})")
@@ -203,7 +110,6 @@ def setAllInputsAndNotify(tn):
         parsed = parseGpio(text)
         if parsed is not None:
             state = parsed
-            updateMass(parsed)
             if DEBUG:
                 print(state)
 
@@ -211,6 +117,27 @@ def setAllInputsAndNotify(tn):
     sendLine(tn, "gpio notify on")
     time.sleep(0.1)
     tn.read_very_eager()
+
+#############################
+def monitorNotifications(tn):
+    
+    global state
+    
+    print("Monitoring GPIO")
+    try:
+        while True:
+            # read one line-ish at a time
+            data = tn.read_until(b"\n", timeout=1)
+            if not data:
+                continue
+            text = data.decode(errors="ignore").strip()
+            if not text:
+                continue
+            state = parseGpio(text)
+            #print(state)
+            #print("EVENT RAW:", text)
+    except Exception as ex:
+        print("Exception in monitorNotification: " + str(ex))
 
 #############################
 def parseGpio(text):
@@ -270,47 +197,8 @@ def parseGpio(text):
         
 #############################
 def updateMass(current):
-    
-    global locked
-    global lastLock
 
-    current["date"] = datetime.now()
-    tripState, massState = getStates(current)
-    
-    if DEBUG_STATE:
-        print(str(current['date']) + " trip: " + str(tripState) + "  mass: " + str(massState))
-        
-    window = {}
-    
-    unlockLockout = False
-    if not locked:
-        #not locked, should it be?
-        if tripState == 1 or massState == 1:
-            locked = True
-            lastLock = datetime.now()
-    else:
-        if tripState == 0 and massState == 0:
-            #check for lockout
-            
-            unlockAt = lastLock + timedelta(seconds=UNLOCK_LOCKOUT)
-            print("cur: " + str(current['date']) + " ua: " + str(unlockAt))
-            if current['date'] < unlockAt:
-                unlockLockout = True
-                print("LOCKED too recently - not unlocking")
-            else:
-                locked = False
-
-    #if the lane was locked recently dont update the unlock
-    if not unlockLockout:
-        window['locked'] = locked
-        window['begin'] = current['date'] + timedelta(seconds=WINDOW_FAST_PRE)
-        window['end'] = current['date'] + timedelta(seconds=WINDOW_FAST_POST)
-        windowOutput = json.dumps(window, default=sidraCore.jsonConverter)
-        print(windowOutput)
-        fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS_LOCK
-        sidraCore.writeFile(fileName, windowOutput)
-
-    output = json.dumps(current, default=sidraCore.jsonConverter)
+    output = json.dumps(current)
     fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
     sidraCore.writeFile(fileName, output)
 
@@ -367,9 +255,6 @@ if __name__ == "__main__":
             name = mass["name"]
             lane = mass["lane"]
             ip = mass["ip"]
-            pinTrip = mass['trip']
-            pinMain = mass['main']
-            #print("PT:" + str(pinTrip))
             #if DEBUG:
             #    print(mass)
 

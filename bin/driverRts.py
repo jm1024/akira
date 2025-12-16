@@ -45,6 +45,8 @@ def read(data):
 	
 	# get sensor name for this lane
 	thisLane = data['lane']
+	thisDtS = data['dt']
+	thisDt = sidraCore.rfStrToDt(thisDtS)
 	massName = ""
 	#print("LANE:" + str(thisLane))
 	for mass in sidraCore.massSensors:
@@ -55,25 +57,33 @@ def read(data):
 		print(f"driverRTS: no mass sensor configured for lane {thisLane}")
 		#return
 	
-	occupied = sidraCore.massOccupied(massName)
+	#state = sidraCore.getMass(massName)
+	lockState = sidraCore.massLock(massName)
+	print(str(lockState))
+	
 	side = data['side']
-	
+
 	if DEBUG:
-		print("driverRTS tid: " + data['tid'] + " antenna: " + str(side) + " rssi: " + str(data['rssi']))
-	
+		print("driverRTS: tid: " + data['tid'] + " antenna: " + str(side) + " rssi: " + str(data['rssi']))
+		
 	if data['side'] == "front":
-		if not occupied:
+		if not lockState['locked'] == True:
 			xmit = True
-			print("driverRTS: unoccupied - sending FAST read")
+			print("driverRTS: unlocked - sending FAST read dt: " + str(thisDt))
 		else:
-			xmit = False
-			print("driverRTS: OCCUPIED - NOT sending FAST read")
+			if thisDt < lockState['end'] and thisDt > lockState['begin']:
+				print("driverRTS: window - sending FAST read dt: " + str(thisDt))
+				xmit = True
+			else:
+				xmit = False
+				print("driverRTS: locked - NOT sending FAST read dt: " + str(thisDt))
+			
 	if data['side'] == "back":
-		if occupied:
-			print("driverRTS: occupied sending SLOW read")
+		if lockState['locked'] == True:
+			print("driverRTS: locked sending SLOW read")
 			xmit = True
 		else:
-			print("driverRTS: unoccupied - NOT sending SLOW read")
+			print("driverRTS: unlocked - NOT sending SLOW read")
 			xmit = False
 	
 	#dt = datetime.now().isoformat()
@@ -82,6 +92,7 @@ def read(data):
 	dt = thisDt.isoformat()
 	
 	authentic = data['tidAuthentic']
+	#JM hardwire authentic for now
 	authentic == "AUTHENTIC"
 	#print("AUTHENTIC? " + str(authentic))
 	

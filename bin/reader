@@ -35,11 +35,14 @@ mode = "C1G2_MODE_640_MILLER2"
 
 DEBUG = True
 DEBUG_RECV = False
-DEBUG_EVENTS = True
-DEBUG_ARRIVAL_MATCH = True
+DEBUG_EVENTS = False
+DEBUG_RAW_ARRIVE = False
+DEBUG_ARRIVE = True
+DEBUG_DEPART = False
+DEBUG_ARRIVAL_MATCH = False
 DEBUG_TIMING = False
 DEBUG_DRIVER = False
-DEBUG_FINAL = True
+DEBUG_FINAL = False
 
 AUTH_AUTHENTIC = "AUTHENTIC"
 AUTH_INAUTHENTIC = "INAUTHENTIC"
@@ -127,6 +130,11 @@ def parseEvent(event):
 
     #full arrive event
     if vals[0] == "event.tag.arrive":
+        if DEBUG_ARRIVE:
+            print("+++++++++++++++++++++++++")
+            print(event)
+            print("-------------------------")
+
         dt = ""
         epc = ""
         antenna = ""
@@ -497,6 +505,7 @@ ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.raw_arrive)")
 #ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.report)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.depart)")
+print("----------------------------------------")
 
 while True:
     parseEvent(recvEvent())

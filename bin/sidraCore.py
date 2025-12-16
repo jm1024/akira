@@ -61,7 +61,8 @@ TRN_LOG_FILE = "transactions.log"
 MCP_LOG_FILE = "mcp.log"
 CONFIG_FILE = "sidra.cfg"
 
-STATE_EXTENSION_MASS = ".sm"
+STATE_EXTENSION_MASS = ".ms"
+STATE_EXTENSION_MASS_LOCK = ".ml"
 
 TRN_EXTENSION_CAM = ".tc"
 TRN_EXTENSION_READER = ".tr"
@@ -367,23 +368,33 @@ def decodeUserData(userData):
         tagPlate = tagPlate.strip('\0x00')
         #tagPlate = plateHex.decode("hex")
     except Exception as ex:
-        print("sidraCore.decodeUserData err: " + str(ex))
+        #print("sidraCore.decodeUserData err: " + str(ex))
         log("decudeUserData() error: " + str(ex) + " userData: " + str(userData))
 
     return tagPlate, tagClass
 
 ####################################################
-# get state for a mass sensor
+# mass sensors
 ####################################################
+
+
+def massLock(name):
+
+    raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS_LOCK)
+    ret = json.loads(raw)
+    
+    ret['begin'] = datetime.fromisoformat(ret["begin"])
+    ret['end'] = datetime.fromisoformat(ret["end"])
+
+    return ret
+
 def massState(name):
 
     raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
     ret = json.loads(raw)
 
     return ret
-    trip = ""
-    main = ""
-    
+
 ###########################
 def massOccupied(name):
     
