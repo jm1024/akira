@@ -377,17 +377,33 @@ def decodeUserData(userData):
 # mass sensors
 ####################################################
 
-
+###########################
 def massLock(name):
 
     raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS_LOCK)
     ret = json.loads(raw)
-    
-    ret['begin'] = datetime.fromisoformat(ret["begin"])
-    ret['end'] = datetime.fromisoformat(ret["end"])
+    if not ret['begin'] == "":
+        ret['begin'] = datetime.fromisoformat(ret["begin"])
+    if not ret['end'] == "":
+        ret['end'] = datetime.fromisoformat(ret["end"])
 
     return ret
 
+###########################
+def massLockSet(name, value):
+    
+    ret = True
+    
+    output = json.dumps(value, default=jsonConverter)
+    
+    fileName = MASS_DIR + "/" + name + STATE_EXTENSION_MASS_LOCK
+    writeFile(fileName, output)
+    
+    #print("MLS: " + str(output))
+    
+    return ret
+
+###########################
 def massState(name):
 
     raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)

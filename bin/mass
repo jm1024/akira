@@ -6,6 +6,7 @@ import sys
 import os
 import json
 import signal
+import traceback
 from datetime import datetime, timedelta
 
 import sidraCore
@@ -16,8 +17,8 @@ USERNAME = "admin"
 PASSWORD = "admin"
 
 WINDOW_FAST_PRE = -1
-WINDOW_FAST_POST = 1
-UNLOCK_LOCKOUT = 2
+WINDOW_FAST_POST = 1 #.5 # set to 1?
+UNLOCK_LOCKOUT = 1.5
 
 DELAY_FAST = 0.1
 
@@ -37,8 +38,14 @@ lastLock = datetime.now() + timedelta(seconds=10)
 stateTime = datetime.now()
 lastState = {}
 lastTime = datetime.now()
-previousState = {}
-previousTime = datetime.now()
+#previousState = {}
+#previousTime = datetime.now()
+
+lastBegin = datetime.now()
+lastEnd = datetime.now()
+
+lastTripState = 0
+lastMassState = 0
 
 tnConn = None
 
@@ -95,19 +102,6 @@ def monitorNotifications(tn):
             #lastState = state
             #lastTime = stateTime
             state = parseGpio(text)
-            #stateTime = datetime.now()
-            
-            #if not previousState == {}:
-            #    previousTripState, previousMainState = getStates(previousState)
-            #else:
-            #    previousTripState = ""
-            #    previousMainState = ""
-            #if not lastState == {}:
-            #    lastTripState, lastMainState = getStates(lastState)
-            #else:
-            #    lastTripState = ""
-            #    lastMainState = ""
-
             
             #massRules(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime)
             updateMass(state)
@@ -116,6 +110,7 @@ def monitorNotifications(tn):
                 #print("EVENT RAW:", text)
     except Exception as ex:
         print("Exception in monitorNotification: " + str(ex))
+        traceback.print_exc()
 
 #############################
 def readUntil(tn, marker, timeout=.5):
@@ -203,7 +198,7 @@ def setAllInputsAndNotify(tn):
         parsed = parseGpio(text)
         if parsed is not None:
             state = parsed
-            updateMass(parsed)
+            #updateMass(parsed)
             if DEBUG:
                 print(state)
 
@@ -264,7 +259,7 @@ def parseGpio(text):
         pin = i + 100
         result[f"{pin}"] = int(bits[i])
 
-    updateMass(result)
+    #updateMass(result)
 
     return result
         
@@ -273,43 +268,93 @@ def updateMass(current):
     
     global locked
     global lastLock
+    global lastLockState
+    global lastBegin
+    global lastEnd
+    global lastTripState
+    global lastMassState
+    
+    tripState = -1
+    massState = -1
 
     current["date"] = datetime.now()
     tripState, massState = getStates(current)
+    lastLockState = sidraCore.massLock(name)
     
-    if DEBUG_STATE:
-        print(str(current['date']) + " trip: " + str(tripState) + "  mass: " + str(massState))
+    
+    #if DEBUG_STATE:
+    #    print(str(current['date']) + " trip: " + str(tripState) + "  mass: " + str(massState))
         
-    window = {}
+    newLock = {}
+    newLock['locked'] = "ERR"
+    newLock['begin'] = ""
+    newLock['end'] = ""
+    newLock['count'] = lastLockState['count']
+    
+    
+    if tripState == 1 and lastTripState == 0:
+        newLock['count'] = lastLockState['count'] + 1
+        
+    lastTripState = tripState
+    lastMassState = massState
     
     unlockLockout = False
+    updateLock = False
     if not locked:
         #not locked, should it be?
         if tripState == 1 or massState == 1:
             locked = True
             lastLock = datetime.now()
+            updateLock = True
     else:
         if tripState == 0 and massState == 0:
             #check for lockout
             
             unlockAt = lastLock + timedelta(seconds=UNLOCK_LOCKOUT)
-            print("cur: " + str(current['date']) + " ua: " + str(unlockAt))
+            #print("cur: " + str(current['date']) + " ua: " + str(unlockAt))
             if current['date'] < unlockAt:
                 unlockLockout = True
                 print("LOCKED too recently - not unlocking")
             else:
                 locked = False
+                updateLock = True
+                newLock['count'] = 0
 
     #if the lane was locked recently dont update the unlock
     if not unlockLockout:
-        window['locked'] = locked
-        window['begin'] = current['date'] + timedelta(seconds=WINDOW_FAST_PRE)
-        window['end'] = current['date'] + timedelta(seconds=WINDOW_FAST_POST)
-        windowOutput = json.dumps(window, default=sidraCore.jsonConverter)
-        print(windowOutput)
-        fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS_LOCK
-        sidraCore.writeFile(fileName, windowOutput)
+        newLock['locked'] = locked
+        
+        #if this was a lock triggered by trip set the window
+        if locked == True and tripState == 1:
+            updateLock = True
+            #if mass state has been hit too preserve the last begin and end
+            if massState == 1:
+                newLock['begin'] = lastLockState['begin'] #lastBegin
+                newLock['end'] = lastLockState['end'] #lastEnd
+            else:
+                newLock['begin'] = current['date'] + timedelta(seconds=WINDOW_FAST_PRE)
+                newLock['end'] = current['date'] + timedelta(seconds=WINDOW_FAST_POST)
+                lastBegin = newLock['begin']
+                lastEnd = newLock['end']
+                
+        #see if the lane is already locked by something else - dont set window
+        fileMass = sidraCore.massLock(name)
+        if  fileMass['locked']:
+            print("override lock set") 
+            newLock['end'] = ""
+            newLock['begin'] = ""
+            #updateLock = False
 
+    if updateLock:
+        sidraCore.massLockSet(name, newLock)
+        debugMsg = "updateMass " + str(datetime.now()) + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
+        debugMsg = "updateMass " + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
+                
+        if not newLock['end'] == "" and locked == True:
+            debugMsg = debugMsg + " window:" + str(newLock['end'])
+        print(debugMsg)
+        
+        
     output = json.dumps(current, default=sidraCore.jsonConverter)
     fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
     sidraCore.writeFile(fileName, output)

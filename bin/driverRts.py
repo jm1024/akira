@@ -14,7 +14,10 @@ EXT_TRANS = ".rts-t"
 
 RESPONSE_FILE = "response.log"
 
-DEBUG = True
+OVERRIDE_AUTH = False
+
+DEBUG = False
+DEBUG_XMIT = True
 
 #############################
 def setEnable(state = True):
@@ -45,55 +48,93 @@ def read(data):
 	
 	# get sensor name for this lane
 	thisLane = data['lane']
-	thisDtS = data['dt']
+	thisDtS = data['date']
 	thisDt = sidraCore.rfStrToDt(thisDtS)
+	thisTID = data['tid']
+	shortTID = thisTID[-5:]
+	shortTime = thisDt.time()
+	thisRSSI = data['rssi']
 	massName = ""
+	
+	debugInfo = str(shortTID) + " " + str(thisRSSI) + " " + str(shortTime)
+	
 	#print("LANE:" + str(thisLane))
 	for mass in sidraCore.massSensors:
 		if mass['lane'] == thisLane:
 			massName = mass['name']
 	
 	if massName == "":
-		print(f"driverRTS: no mass sensor configured for lane {thisLane}")
+		print(f"driverRTS no mass sensor configured for lane {thisLane}")
 		#return
+		
+	#print("READS:" + str(data['reads']))
 	
 	#state = sidraCore.getMass(massName)
 	lockState = sidraCore.massLock(massName)
-	print(str(lockState))
+	if DEBUG:
+		print("driverRTS lock: " + str(lockState['locked']) + " end: " + str(lockState['end']))
 	
 	side = data['side']
+	
+	xmitDebug = ""
 
 	if DEBUG:
-		print("driverRTS: tid: " + data['tid'] + " antenna: " + str(side) + " rssi: " + str(data['rssi']))
+		print("driverRTS read: " + str(thisDt) + " tid: " + str(data['tid']) + " antenna: " + str(side) + " rssi: " + str(data['rssi']))
 		
-	if data['side'] == "front":
+	if data['side'] == "fast":
 		if not lockState['locked'] == True:
 			xmit = True
-			print("driverRTS: unlocked - sending FAST read dt: " + str(thisDt))
+			
+			#lock the lane
+			# lockState['end'] = ""
+			# lockState['begin'] = ""
+			# sidraCore.massLockSet(massName, lockState)
+			
+			if DEBUG_XMIT:
+				xmitDebug = "driverRTS: FAST unl SND " + debugInfo
 		else:
-			if thisDt < lockState['end'] and thisDt > lockState['begin']:
-				print("driverRTS: window - sending FAST read dt: " + str(thisDt))
-				xmit = True
+			if not lockState['end'] == "" and not lockState['begin'] == "":
+				if thisDt < lockState['end'] and thisDt > lockState['begin']:
+					if DEBUG_XMIT:
+						xmitDebug = "driverRTS: FAST win SND " + debugInfo
+					#print("driverRTS: closed window")
+					lockState['lockked'] = True
+					lockState['end'] = ""
+					lockState['begin'] = ""
+					sidraCore.massLockSet(massName, lockState)
+					xmit = True
+				else:
+					xmit = False
+					if DEBUG_XMIT:
+						xmitDebug = "driverRTS: FAST lck  -  " + debugInfo
 			else:
 				xmit = False
-				print("driverRTS: locked - NOT sending FAST read dt: " + str(thisDt))
+				if DEBUG_XMIT:
+					xmitDebug = "driverRTS: FAST nwn  -  " + debugInfo
 			
-	if data['side'] == "back":
+	if data['side'] == "slow":
 		if lockState['locked'] == True:
-			print("driverRTS: locked sending SLOW read")
+			if DEBUG_XMIT:
+				xmitDebug = "driverRTS: SLOW lck SND " + debugInfo
 			xmit = True
 		else:
-			print("driverRTS: unlocked - NOT sending SLOW read")
+			if DEBUG_XMIT:
+				xmitDebug = "driverRTS: SLOW unl  -  " + debugInfo
 			xmit = False
 	
+	if DEBUG_XMIT:
+		print(xmitDebug)
+		sidraCore.appendFile("/var/sidra/log/rtsDebug.log", xmitDebug + "\n")
+	
 	#dt = datetime.now().isoformat()
-	thisDtS = data['dt']
+	thisDtS = data['date']
 	thisDt = sidraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
 	
 	authentic = data['tidAuthentic']
 	#JM hardwire authentic for now
-	authentic == "AUTHENTIC"
+	if OVERRIDE_AUTH:
+		authentic == "AUTHENTIC"
 	#print("AUTHENTIC? " + str(authentic))
 	
 	thisExt = EXT_READ
@@ -116,31 +157,11 @@ def read(data):
 		"hmac": "XXXX",
 	}
 		
-	#else:
-	#	thisExt = EXT_TRANS
-	#	contents = {
-	#		"header": {
-	#			"command": "NoTagDetected",
-	#			"timestamp": dt,
-	#		},
-	#		"body": {
-	#			"TxID": data['id'],
-	#			"TagID": data['tid'],
-	#			"PlazaID": sidraCore.plazaId,
-	#			"LaneID": data['lane'],
-	#			"Result":"01",
-	#			"DetectedTime": dt,
-	#			"Antenna": side,
-	#		},
-	#		"hmac": "XXXX",
-	#	}
-	
-	#print("=========================")
-	#print(contents)
 
 	if xmit:	
 		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
-	
+		if DEBUG:
+			print("driverRTS sent: " + str(datetime.now()))
 	"""
 	tData = {
 		'date': str(dt),
