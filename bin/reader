@@ -28,12 +28,14 @@ for driver in sidraCore.driversRead:
 #read window settings
 WINDOW_FAST_PRE = -500
 WINDOW_FAST_POST = 250
-WINDOW_SLOW_PRE = 1000
+WINDOW_SLOW_PRE = 600
 WINDOW_SLOW_POST = 30000
-UNLOCK_LOCKOUT = 1500
+UNLOCK_LOCKOUT = 1500 # <----------- JM USE THIS
 
 #minimum number of report reads to accept as valid
-MIN_READS = 10
+MIN_READS = 5
+#max age in seconds for reports before they get flushed
+MAX_REPORT_AGE = 5
 
 #lane
 lane = ""
@@ -45,8 +47,6 @@ antennas = []
 
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
-
-MAX_REPORT_AGE = 5
 
 tagFilter = ""
 auth = True
@@ -960,8 +960,8 @@ def laneThread(stop_event):
     lastMassMain = -1
     lastMassDate = datetime.now()
     
-    fastWindow = resetWindow("fast") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
-    slowWindow = resetWindow("slow") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
+    fastWindow = resetWindow("fast - initial") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
+    slowWindow = resetWindow("slow - initial") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
     print(fastWindow)
     print(slowWindow)
     
@@ -1017,8 +1017,8 @@ def laneThread(stop_event):
             
             #if clear unlock and reset windows
             if massMain == 0 and massTrip == 0:
-                fastWindow = resetWindow("fast")
-                slowWindow = resetWindow("slow")
+                fastWindow = resetWindow("fast - lane clear")
+                slowWindow = resetWindow("slow - lane clear")
             
             #if theres a change in trip and slow is not locked
             if massTrip == 1 and not massTrip == lastMassTrip:
@@ -1027,7 +1027,7 @@ def laneThread(stop_event):
                     begin = massDate + timedelta(milliseconds=WINDOW_FAST_PRE)
                     end   = massDate + timedelta(milliseconds=WINDOW_FAST_POST)
                     #print("SET fastRead")
-                    fastWindow = readWindow(fastWindow, begin, end, "fast")
+                    fastWindow = readWindow(fastWindow, begin, end, "fast - trip sensor")
                 #else:
                     #print(f"NOT set fastRead - SLOWLOCK  slowLock:{slowWindow['locked']} trip:{massTrip}")
             #else:
@@ -1037,8 +1037,8 @@ def laneThread(stop_event):
             if massMain == 1 and lastMassMain == 0:
                 begin = massDate + timedelta(milliseconds=WINDOW_SLOW_PRE)
                 end   = massDate + timedelta(milliseconds=WINDOW_SLOW_POST)
-                fastWindow = lockWindow("fast a")
-                slowWindow = readWindow(slowWindow, begin, end, "slow")
+                #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
+                slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor")
             
             #save current state to last
             lastMassTrip = massTrip
@@ -1084,14 +1084,14 @@ def laneThread(stop_event):
         read = checkReads(fastWindow, ANTENNA_FAST)
         if not read == None:
             #print(read)
-            fastWindow = lockWindow("fast read")
+            fastWindow = lockWindow("fast - read")
             flushReports(ANTENNA_FAST)
             
         #check slow zone
         read = checkReads(slowWindow, ANTENNA_SLOW)
         if not read == None:
             #print(read)
-            slowWindow = lockWindow("slow read")
+            slowWindow = lockWindow("slow - read")
             flushReports(ANTENNA_SLOW)
             
         #print(".")
@@ -1101,6 +1101,7 @@ def laneThread(stop_event):
         #print(len(reports))
         #clean old rf events
         cleanOldRf()
+        #print(len(reports))
 
 #######################
 def checkReads(window, side):
