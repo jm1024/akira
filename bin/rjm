@@ -1,0 +1,5 @@
+#!/bin/bash
+pkill -f mass
+pkill -f reader
+echo "------------ start rjm -----------"
+./reader e8.r1
