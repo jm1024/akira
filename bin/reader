@@ -63,7 +63,7 @@ power = "100"
 mode = "C1G2_MODE_640_MILLER2"
 region = "" # JM implement from .cfg
 
-DEBUG = False
+DEBUG = True
 DEBUG_READER_RECV = False
 DEBUG_READER_COMM = False
 DEBUG_EVENTS = False
@@ -77,10 +77,14 @@ DEBUG_TIMING = False
 DEBUG_DRIVER = False
 DEBUG_FINAL = False
 DEBUG_WINDOW = False
-DEBUG_READ_MONITOR = True
+DEBUG_READ_MONITOR = False
+DEBUG_READ_SEEK = False
 
 DEBUG_MASS = True
 DEBUG_MASS_DETAIL = False
+
+LOG_STATS = True
+LOG_STATS_FILE = "/var/sidra/log/stats.log"
 
 AUTH_AUTHENTIC = "AUTHENTIC"
 AUTH_INAUTHENTIC = "INAUTHENTIC"
@@ -659,8 +663,12 @@ def parseEvent(event):
             if d[0] == "time":
                 sDate = d[1].strip(',')
             if d[0] == "tag_id":
-                epc = d[1][2:]
-                epc = epc.strip(',')
+                try:
+                    epc = d[1][2:]
+                    epc = epc.strip(',')
+                except:
+                    print("BAD TID")
+                    return
             if d[0] == "antenna":
                 antenna = d[1].strip(',')
             if d[0] == "rssi":
@@ -689,7 +697,8 @@ def parseEvent(event):
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
             
-        date = sidraCore.rfStrToDt(sDate)
+        #date = sidraCore.rfStrToDt(sDate)
+        date = datetime.now() # <--- JM GO BACK TO TITAN TIME
     
         report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
         
@@ -974,7 +983,7 @@ def massThread(stop_event):
 #######################
 def laneThread(stop_event):
     
-    print("LANE THREAD START " + str(lane))
+    print("LANE THREAD START " + str(lane) + '\n')
     
     massTrip = 0
     massMain = 0
@@ -1116,14 +1125,17 @@ def laneThread(stop_event):
                     out = out + "-"
                     
                 fc, sc = countReports()
-                out = out + " " + str(fc).rjust(3) + " " + str(sc).rjust(3)                   
+                out = out + " " + str(fc).rjust(3) + " " + str(sc).rjust(3) + " " + str(datetime.now().time())                
                 print(out)
+                
+                if LOG_STATS:
+                    sidraCore.appendFile(LOG_STATS_FILE,out + '\n')
                 
                 if massTrip == 0 and massMain == 0:
                     print('')
 
         #check fast zone
-        read = checkReads(fastWindow, ANTENNA_FAST)
+        read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
         if not read == None:
             #print(read)
             fastWindow = lockWindow("fast - read")
@@ -1131,7 +1143,7 @@ def laneThread(stop_event):
             flushReports(ANTENNA_FAST)
             
         #check slow zone
-        read = checkReads(slowWindow, ANTENNA_SLOW)
+        read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
         if not read == None:
             #print(read)
             slowWindow = lockWindow("slow - read")
@@ -1139,17 +1151,24 @@ def laneThread(stop_event):
             flushReports(ANTENNA_SLOW)
             
         #clean old rf events
-        cleanOldRf()
+        cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
+        cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
         
+        #debug read stats
+        fc, sc = countReports()
+        fcs = str(fc).rjust(4)
+        scs = str(sc).rjust(4)
+        #print("",f"fast: {fcs} slow: {scs}", end="\r", flush=True)
+            
         if DEBUG_READ_MONITOR:
-            fc, sc = countReports()
-            fcs = str(fc).rjust(4)
-            scs = str(sc).rjust(4)
-            #print("",f"fast: {fcs} slow: {scs}", end="\r", flush=True)
+            print(f"{fcs}{scs} {datetime.now().time()}")
+                
+        if LOG_STATS:
             if not lastSc == sc or not lastFc == fc :
-                print(f"fast: {fcs} slow: {scs}")
-                lastFc = fc
-                lastSc = sc
+                    
+                sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs} {datetime.now().time()}\n")
+        lastFc = fc
+        lastSc = sc
 
 #######################
 def sendRead(read):
@@ -1166,7 +1185,7 @@ def sendRead(read):
             
 
 #######################
-def checkReads(window, side):
+def checkReads(window, side, minReads):
         
     ret = None
     
@@ -1271,7 +1290,7 @@ def checkReads(window, side):
         for candidate in candidates.values():
             candidateCount = candidateCount +1
             thisCount = candidate.get('count')
-            if thisCount > highestCount and candidate.get('tidAuthentic','') == AUTH_AUTHENTIC:
+            if thisCount > highestCount: #and candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: <--- JM to enable auth
                 highestCount = thisCount
                 potential = candidate
             #print(f"tc:{thisCount}")
@@ -1286,12 +1305,13 @@ def checkReads(window, side):
         if not accepted == None:
             accepted['id'] = str(uuid.uuid4())
             if DEBUG:
-                print(f"{side}: {accepted['tid']} count: {accepted['count']}") 
+                print(f"{side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}") 
             ret = accepted
-        
-    if ret == None and candidateCount > 0:
-        print("CR: ",f"{side} {candidateCount} {highestCount}", end="\r", flush=True)
-        #print(f"cr {side} {candidateCount} {highestCount}") 
+    
+    if DEBUG_READ_SEEK:
+        if ret == None and candidateCount > 0:
+            print("CR: ",f"{side} {candidateCount} {highestCount}", end="\r", flush=True)
+            #print(f"cr {side} {candidateCount} {highestCount}") 
     
     #if not ret == None:
     #    print('\n')
@@ -1363,16 +1383,19 @@ def countReports():
     return fc, sc
 
 #######################
-def cleanOldRf():
+def cleanOldRf(side, maxAge):
     
     global reports
 
-    now = datetime.now()
-    cutoff = now - timedelta(milliseconds=maxReportAge)
-
+    cutoff = datetime.now() - timedelta(milliseconds=maxAge)
+    
     reports[:] = [
         r for r in reports
-        if r['date'] >= cutoff
+        if not (
+            r.get("side") == side and
+            isinstance(r.get("date"), datetime) and
+            r["date"] < cutoff
+        )
     ]
 
 ############################################
@@ -1433,8 +1456,10 @@ for reader in sidraCore.readers:
         tidWait = reader.get("tidWait", True)
         mode = reader.get("mode", "C1G2_MODE_640_MILLER2")
         lane = reader.get("lane","")
-        maxReportAge = int(reader.get("maxReportAge","5000"))
-        minReads = int(reader.get("minReads","5"))
+        fastMaxReportAge = int(reader.get("fastMaxReportAge","5000"))
+        fastMinReads = int(reader.get("fastMinReads","5"))
+        slowMaxReportAge = int(reader.get("slowMaxReportAge","5000"))
+        slowMinReads = int(reader.get("slowMinReads","5"))
         fastPre = int(reader.get("fastPre","0"))
         fastPost = int(reader.get("fastPost","0"))
         slowPre = int(reader.get("slowPre","0"))
@@ -1515,6 +1540,10 @@ if CONFIGURE:
         ret = xrCmd("tag.security.password_authentication_enable=0")
         ret = xrCmd("tag.security.tid_authentication_enable=0")
     ret = xrCmd("tag.security.tid_mask.enable=0")
+    
+    #force occasional re read of tid/userData
+    ret = xrCmd("setup.advanced.do_opspecs_once=0")
+    
     
     #antenna power config
     thisAntenna = 0

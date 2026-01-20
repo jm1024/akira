@@ -562,8 +562,12 @@ def rfStrToDt(dts):
             dtFormat = "%Y-%m-%dT%H:%M:%S"
             ret = datetime.strptime(dts, dtFormat)
         except:
-            dtFormat = "%Y-%m-%d %H:%M:%S.%f"
-            ret = datetime.strptime(dts, dtFormat)
+            try:
+                dtFormat = "%Y-%m-%d %H:%M:%S.%f"
+                ret = datetime.strptime(dts, dtFormat)
+            except:
+                dtFormat = "%Y-%m-%d %H:%M:%S"
+                ret = datetime.strptime(dts, dtFormat)
 
     return ret
 
