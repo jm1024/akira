@@ -126,7 +126,67 @@ def read(data):
 	"""
 
 ######################
-def trans(data):
+def transX(data):
+	
+	#check wether RTS wants akira data
+	if not getEnable():
+		print("driverRts.read() akira is disabled, aborting")
+		return
+	
+	#data['img_f'] = ""
+	#data['img_fp'] = ""
+	
+	msgNTD = ""
+	xmit = False
+	#No tag detected message
+	if data['tid'] == "":
+		xmit = True
+		msgNTD = {
+			'header':{
+			'command':"NoTagDetected",
+			'timestamp':data['date'].isoformat()
+			},
+			'body':{
+			'TxID':data['id'],
+			'TagID':None,
+			'PlazaID':data['plaza'],
+			'LaneID':data['lane'],
+			'Result':"00",
+			'DetectedTime':None,
+			},
+			'hmac':"XXXX"
+			}
+	
+	if xmit:
+		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+	
+	msg = ""
+	xmit = True
+	
+	msg = {
+		"header":{
+		'command':"ANPRInfo",
+		'timestamp':data['date'].isoformat()
+		},
+		'body':{
+		'TxID':data['id'],
+		'TagID':data['tid'],
+		'PlazaID':data['plaza'],
+		'LaneID':data['lane'],
+		'CapturedTime':data['date'].isoformat(),
+		'AnprID':data['id'],
+		'AnprResult':data['plate'],
+		'AnprImage':data['img_f']
+		},
+		'hmac':"XXXX"
+		}
+	
+	if xmit:
+		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
+	
+
+######################
+def trans_OLD(data):
 	
 	#check wether RTS wants akira data
 	if not getEnable():
@@ -222,3 +282,83 @@ def trans(data):
 	“hmac”:”XXXX”
 	}
 	"""
+
+######################
+def cam(data):
+	
+	#check wether RTS wants akira data
+	if not getEnable():
+		print("driverRts.read() akira is disabled, aborting")
+		return
+	
+	msg = ""
+	xmit = True
+	
+	print(data)
+	
+		
+	dt = sidraCore.camStrToDt(data['transit']['timestamps']['start'])
+	#dt = thisDt.isoformat()
+	id = str(uuid.uuid4())
+	
+	# get dateTime
+	try:
+		thisDtS = data['transit']['timestamps']["image"]
+		thisDt = sidraCore.camStrToDt(thisDtS)
+	except:
+		thisDt = datetime.now()
+	
+	dev    = data.get('device', {})
+	device = dev.get('name', 'UNKNOWN')
+	lane   = dev.get('lane', 0)
+	
+	#get plate
+	try:
+		plate = data['transit']['plate']['text']
+	except:
+		plate = DATA_UNKNOWN
+	
+	#get plate score
+	try:
+		plateScore = sidraCore.scoreToInt(data['transit']['plate']['score'])
+	except:
+		plateScore = 0
+	
+	#get images
+	imageFile = data['transit']['image']
+	
+	imagePlateFile = ""
+	try:
+		imagePlateFile = data['transit']['image_plate']
+		#print("IPF: " + str(imagePlateFile))
+	except Exception as ex:
+		print("error getting plate image")
+	
+	imageBin = ""
+	try:
+		imageBin = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + imageFile)
+	except Exception as ex:
+		sidraCore.log("ERROR: mcp loading main image " + imageFile + " " + str(ex), True)
+		
+	
+	msg = {
+		"header":{
+		'command':"ANPRInfo",
+		'timestamp':dt.isoformat()
+		},
+		'body':{
+		'TxID':id,
+		'TagID':'',
+		'PlazaID':sidraCore.plazaId,
+		'LaneID':lane,
+		'CapturedTime':dt.isoformat(),
+		'AnprID':id,
+		'AnprResult':plate, #data['plate'],
+		'AnprImage':imageBin
+		},
+		'hmac':"XXXX"
+		}
+	
+	if xmit:
+		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
+	

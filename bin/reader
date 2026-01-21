@@ -55,6 +55,9 @@ antennas = []
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
+#time to squelch reads that have been sent
+SQUELCH_TIME = 10000
+
 tagFilter = ""
 auth = True
 authWait = False
@@ -78,7 +81,10 @@ DEBUG_DRIVER = False
 DEBUG_FINAL = False
 DEBUG_WINDOW = False
 DEBUG_READ_MONITOR = False
+DEBUG_INAUTHENTIC = False
 DEBUG_READ_SEEK = False
+
+DEBUG_SQUELCH = False
 
 DEBUG_MASS = True
 DEBUG_MASS_DETAIL = False
@@ -95,6 +101,9 @@ ANTENNA_SLOW = "slow"
 
 arrivals = {}
 reports = []
+squelch = []
+
+lastMass = {"trip":-1, "main":-1, "lastUnlocked":datetime.now() ,"updated":datetime.now(), "unlockLockout":False}
 
 rfQ = queue.Queue(maxsize=5000)
 massQ = queue.Queue(maxsize=5000)
@@ -355,121 +364,6 @@ def parseGpio(text):
 
     return result
         
-#############################
-def updateMass_DEPRECATED(current):
-    
-    global massName
-    global locked
-    global lastLock
-    global lastLockState
-    global lastBegin
-    global lastEnd
-    global lastTripState
-    global lastMassState
-    
-    tripState = -1
-    massState = -1
-
-    current["date"] = datetime.now()
-    tripState, massState = getMassStates(current)
-    lastLockState = sidraCore.massLock(massName)
-    
-    
-    #if DEBUG_STATE:
-    #    print(str(current['date']) + " trip: " + str(tripState) + "  mass: " + str(massState))
-        
-    newLock = {}
-    newLock['locked'] = "ERR"
-    newLock['begin'] = ""
-    newLock['end'] = ""
-    newLock['count'] = lastLockState['count']
-    
-    
-    if tripState == 1 and lastTripState == 0:
-        newLock['count'] = lastLockState['count'] + 1
-        
-    lastTripState = tripState
-    lastMassState = massState
-    
-    unlockLockout = False
-    updateLock = False
-    if not locked:
-        #not locked, should it be?
-        if tripState == 1 or massState == 1:
-            locked = True
-            lastLock = datetime.now()
-            updateLock = True
-    else:
-        if tripState == 0 and massState == 0:
-            #check for lockout
-            
-            unlockAt = lastLock + timedelta(seconds=UNLOCK_LOCKOUT)
-            #print("cur: " + str(current['date']) + " ua: " + str(unlockAt))
-            if current['date'] < unlockAt:
-                unlockLockout = True
-                print("LOCKED too recently - not unlocking")
-            else:
-                locked = False
-                updateLock = True
-                newLock['count'] = 0
-
-    #if the lane was locked recently dont update the unlock
-    if not unlockLockout:
-        newLock['locked'] = locked
-        
-        #if this was a lock Triped by trip set the window
-        if locked == True and tripState == 1:
-            updateLock = True
-            #if mass state has been hit too preserve the last begin and end
-            if massState == 1:
-                newLock['begin'] = lastLockState['begin'] #lastBegin
-                newLock['end'] = lastLockState['end'] #lastEnd
-            else:
-                newLock['begin'] = current['date'] + timedelta(seconds=fastPre)
-                newLock['end'] = current['date'] + timedelta(seconds=fastPost)
-                lastBegin = newLock['begin']
-                lastEnd = newLock['end']
-                
-        #see if the lane is already locked by something else - dont set window
-        fileMass = sidraCore.massLock(massName)
-        if  fileMass['locked']:
-            print("override lock set") 
-            newLock['end'] = ""
-            newLock['begin'] = ""
-            #updateLock = False
-
-    if updateLock:
-        sidraCore.massLockSet(massName, newLock)
-        debugMsg = "updateMass " + str(datetime.now()) + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
-        debugMsg = "updateMass " + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
-                
-        if not newLock['end'] == "" and locked == True:
-            debugMsg = debugMsg + " window:" + str(newLock['end'])
-        print(debugMsg)
-        
-    #put in the queue for laneThread
-    massQ.put(current)
-    
-    #update mass file
-    output = json.dumps(current, default=sidraCore.jsonConverter)
-    fileName = sidraCore.MASS_DIR + "/" + massName + sidraCore.STATE_EXTENSION_MASS 
-    sidraCore.writeFile(fileName, output)
-
-#############################
-def massRules_DEPRECATED(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime):
-
-    delay = 0
-    
-    #give the read time to finish
-    if tripState == 1 and mainState == 0:
-        print("sleeping fast " + str(DELAY_FAST))
-        time.sleep(DELAY_FAST)
-        
-    if tripState == 1 and lastTripState == 0 and previousTripState == 1:
-        diffMs = int((previousTime - stateTime).total_seconds() * 1000)
-        print("tailgate threshold: " + str(diffMs))
-    
-    return delay
 
 #############################
 def getMassStates(current):
@@ -637,8 +531,15 @@ def parseEvent(event):
         report['lane'] = lane
         report['side'] = side
         
-        #add to appropriate list
-        reports.append(report)    
+        # if squelched don't add
+        if isSquelched(tid, side):
+            if DEBUG_SQUELCH:
+                print(f" is squelched {tid} {side}")
+        else:
+            #add to appropriate list
+            
+            #print(f"addArrive {report['tid']} {report['side']}")
+            reports.append(report)    
 
     ##################################################################
     # report event
@@ -720,8 +621,14 @@ def parseEvent(event):
         report['lane'] = lane
         report['side'] = side
         
-        #add to appropriate list
-        reports.append(report)    
+        # if squelched don't add
+        if isSquelched(report['tid'], report['side']):
+            if DEBUG_SQUELCH:
+                print(f" is squelched {report['tid']} {report['side']}")
+        else:
+            #add to appropriate list
+            #print(f"addReport {report['tid']} - {report['epc']}")
+            reports.append(report)    
         
     ##################################################################
     #depart events
@@ -983,6 +890,8 @@ def massThread(stop_event):
 #######################
 def laneThread(stop_event):
     
+    global lastMass
+    
     print("LANE THREAD START " + str(lane) + '\n')
     
     massTrip = 0
@@ -995,6 +904,7 @@ def laneThread(stop_event):
     
     lastFc = -1
     lastSc = -1
+    lastSquelchCount = -1
     
     fastWindow = resetWindow("fast - initial") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
     slowWindow = resetWindow("slow - initial") #{'locked':False,'reading':False,'begin':datetime.now(),'end':datetime.now(),'updated':datetime.now()}
@@ -1049,17 +959,22 @@ def laneThread(stop_event):
             massTrip = massEvent.get("trip",-1)
             massMain = massEvent.get("main",-1)
             massRear = massEvent.get("rear",-1)
-            massDate = massEvent.get("date")
+            #massDate = massEvent.get("date")
+            massDate = datetime.now()
+            
+            lastMass = {"trip":massTrip, "main":massMain, "massRear":massRear, "lastUnlocked": massDate, "updated":massDate, "unlockLockout": False}
             
             #if clear - unlock and reset windows
             if massMain == 0 and massTrip == 0:
-                if not datetime.now() - fastWindow['updated'] < timedelta(milliseconds=UNLOCK_LOCKOUT):
+                if datetime.now() > lastMass['updated'] + timedelta(milliseconds=UNLOCK_LOCKOUT):
                     fastWindow = resetWindow("fast - lane clear")
                     slowWindow = resetWindow("slow - lane clear")
+                    lastMass["lastUnlocked"] = datetime.now()
                     #flush slow reads
-                    flushReports(ANTENNA_SLOW)
+                    #flushReports(ANTENNA_SLOW)
                 else:
-                    print("unlock lockout")
+                    lastMass['unlockLockout'] = True
+                #    print("unlock lockout")
             
             #if theres a change in trip and slow is not locked
             if massTrip == 1 and not massTrip == lastMassTrip:
@@ -1089,50 +1004,7 @@ def laneThread(stop_event):
             lastMassDate = massDate
             
             if DEBUG_MASS:
-                fastBegin = fastWindow['begin'].time()
-                fastEnd = fastWindow['end'].time()
-                fastUpdated = fastWindow['updated'].time()
-                slowBegin = slowWindow['begin'].time()
-                slowEnd = slowWindow['end'].time()
-                slowUpdated = slowWindow['updated'].time()
-                #print(f"FAST b:{fastBegin} e:{fastEnd} u:{fastUpdated} l:{fastWindow['locked']} r:{fastWindow['reading']}")
-                #print(f"SLOW b:{slowBegin} e:{slowEnd} u:{slowUpdated} l:{slowWindow['locked']} r:{slowWindow['reading']}")
-                
-                out = str(massTrip) + " " + str(massMain) + " "
-                if fastWindow['reading']:
-                    #print(f"{fastWindow['end']} {datetime.now()}")
-                    if fastWindow['end'] > datetime.now():
-                        out = out + "R"
-                    else:
-                        out = out + "x"
-                else:
-                    out = out + "-"
-                if fastWindow['locked']:
-                    out = out + "L"
-                else:
-                    out = out + "-"
-                out = out + " "
-                if slowWindow['reading']:
-                    if slowWindow['end'] > datetime.now():
-                        out = out + "R"
-                    else:
-                        out = out + "x"
-                else:
-                    out = out + "-"
-                if slowWindow['locked']:
-                    out = out + "L"
-                else:
-                    out = out + "-"
-                    
-                fc, sc = countReports()
-                out = out + " " + str(fc).rjust(3) + " " + str(sc).rjust(3) + " " + str(datetime.now().time())                
-                print(out)
-                
-                if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,out + '\n')
-                
-                if massTrip == 0 and massMain == 0:
-                    print('')
+                debugMass(massTrip, massMain, fastWindow, slowWindow)
 
         #check fast zone
         read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
@@ -1140,20 +1012,52 @@ def laneThread(stop_event):
             #print(read)
             fastWindow = lockWindow("fast - read")
             sendRead(read)
-            flushReports(ANTENNA_FAST)
+            
+            #squelch
+            addSquelch(read['tid'], read['side'], SQUELCH_TIME)
+            
+            #flushReports(ANTENNA_FAST)
+            if LOG_STATS:
+                sidraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
             
         #check slow zone
         read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
         if not read == None:
             #print(read)
-            slowWindow = lockWindow("slow - read")
+            #slowWindow = lockWindow("slow - read")
+            
+            
+            #reset read window until lane clear
+            thisDate = datetime.now()
+            begin = thisDate + timedelta(milliseconds=slowPre)
+            end   = thisDate + timedelta(milliseconds=slowPost)
+            #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
+            slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor")
             sendRead(read)
-            flushReports(ANTENNA_SLOW)
+            
+            #squelch
+            addSquelch(read['tid'], read['side'], SQUELCH_TIME)
+            
+            #flushReports(ANTENNA_SLOW)
+            if LOG_STATS:
+                sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
             
         #clean old rf events
         cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
         cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
         
+        #clean squelch list
+        if DEBUG_SQUELCH:
+            squelchCount = len(squelch)
+            if not squelchCount == lastSquelchCount:
+                print(f"squelchCount: {squelchCount}")
+            lastSquelchCount = squelchCount
+        cleanSquelch()
+            
+        lockoutChanged, fastWindow, slowWindow = lockoutBreak(fastWindow, slowWindow)
+        if lockoutChanged:
+            debugMass(massTrip, massMain, fastWindow, slowWindow)
+    
         #debug read stats
         fc, sc = countReports()
         fcs = str(fc).rjust(4)
@@ -1165,11 +1069,68 @@ def laneThread(stop_event):
                 
         if LOG_STATS:
             if not lastSc == sc or not lastFc == fc :
-                    
-                sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs} {datetime.now().time()}\n")
+                if fcs == "   0":
+                    fcs = "   -"
+                if scs == "   0":
+                    scs = "   -"
+                sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
         lastFc = fc
         lastSc = sc
 
+#######################
+def addSquelch(tid, side, duration):
+    
+    global squelch
+    
+    if not isSquelched(tid, side):
+    
+        end = datetime.now() + timedelta(milliseconds=duration)
+        
+        newSquelch = {'tid':tid, 'side':side, 'end':end}
+        
+        squelch.append(newSquelch)
+        
+        #clean reports of this tag on this side
+        removeReports(tid, side)
+        
+        if LOG_STATS and DEBUG_SQUELCH:
+            sidraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
+        
+        
+        if DEBUG_SQUELCH:
+            print(f"squelched: {tid} {side} {end} {datetime.now()}")
+
+#######################
+def removeReports(tid, side):
+    global reports
+    reports[:] = [
+        r for r in reports
+        if not (r.get("tid") == tid and r.get("side") == side)
+    ]
+            
+#######################
+def cleanSquelch():
+    global squelch
+    
+    now = datetime.now()
+    
+    squelch[:] = [
+        s for s in squelch
+        if s.get("end") >= now
+    ]
+
+#######################
+def isSquelched(tid, side):
+    #now = datetime.now()
+    for s in squelch:
+        if (
+            s.get("tid") == tid and
+            s.get("side") == side #and
+            #s.get("end", now) > now
+        ):
+            return True
+    return False
+    
 #######################
 def sendRead(read):
     
@@ -1290,9 +1251,13 @@ def checkReads(window, side, minReads):
         for candidate in candidates.values():
             candidateCount = candidateCount +1
             thisCount = candidate.get('count')
-            if thisCount > highestCount: #and candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: <--- JM to enable auth
-                highestCount = thisCount
-                potential = candidate
+            if thisCount > highestCount:
+                if not candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: # <--- JM to enable auth
+                    if DEBUG_INAUTHENTIC:
+                        print("INAUTHENTIC TAG: " + candidate.get('tid','x'))
+                else:
+                    highestCount = thisCount
+                    potential = candidate
             #print(f"tc:{thisCount}")
             #print(f"candidte late:{candidate}")
 
@@ -1382,6 +1347,58 @@ def countReports():
             
     return fc, sc
 
+#######################    
+def debugMass(massTrip, massMain, fastWindow, slowWindow):
+    
+    fc = 0
+    sc = 0
+
+    fastBegin = fastWindow['begin'].time()
+    fastEnd = fastWindow['end'].time()
+    fastUpdated = fastWindow['updated'].time()
+    slowBegin = slowWindow['begin'].time()
+    slowEnd = slowWindow['end'].time()
+    slowUpdated = slowWindow['updated'].time()
+    #print(f"FAST b:{fastBegin} e:{fastEnd} u:{fastUpdated} l:{fastWindow['locked']} r:{fastWindow['reading']}")
+    #print(f"SLOW b:{slowBegin} e:{slowEnd} u:{slowUpdated} l:{slowWindow['locked']} r:{slowWindow['reading']}")
+    
+    out = str(massTrip) + " " + str(massMain) + " "
+    if fastWindow['reading']:
+        #print(f"{fastWindow['end']} {datetime.now()}")
+        if fastWindow['end'] > datetime.now():
+            out = out + "R"
+        else:
+            out = out + "x"
+    else:
+        out = out + "-"
+    if fastWindow['locked']:
+        out = out + "L"
+    else:
+        out = out + "-"
+    out = out + " "
+    if slowWindow['reading']:
+        if slowWindow['end'] > datetime.now():
+            out = out + "R"
+        else:
+            out = out + "x"
+    else:
+        out = out + "-"
+    if slowWindow['locked']:
+        out = out + "L"
+    else:
+        out = out + "-"
+        
+    fc, sc = countReports()
+    out = out + " " + str(fc).rjust(3) + " " + str(sc).rjust(3) + " " + str(datetime.now().time()) 
+    out = out + f" ({fastBegin}-{fastEnd} {slowBegin}-{slowEnd})"               
+    print(out)
+    
+    if LOG_STATS:
+        sidraCore.appendFile(LOG_STATS_FILE,out + '\n')
+    
+    if massTrip == 0 and massMain == 0:
+        print('')
+
 #######################
 def cleanOldRf(side, maxAge):
     
@@ -1397,6 +1414,33 @@ def cleanOldRf(side, maxAge):
             r["date"] < cutoff
         )
     ]
+
+#######################
+def lockoutBreak(fastWindow, slowWindow):
+    
+    global lastMass
+    
+    #global fastWindow
+    #global slowWindow
+    
+    changed = False
+    
+    #print(f"{lastMass['trip']} {lastMass['main']}")
+    if int(lastMass['trip']) == 0 and int(lastMass['main']) == 0 and lastMass['unlockLockout'] == True:
+    
+        unlockAt = lastMass['lastUnlocked'] + timedelta(milliseconds=UNLOCK_LOCKOUT)
+        #print(f"{lastMass['lastUnlocked']} {unlockAt}")
+        if datetime.now() > unlockAt:
+            #print(fastWindow)
+            #print(slowWindow)
+            fastWindow = resetWindow("fast - lane clear")
+            slowWindow = resetWindow("slow - lane clear")
+            lastMass['unlockLockout'] = False
+            lastMass["lastUnlocked"] = datetime.now()
+            #print("lock break")
+            changed = True
+            
+    return changed, fastWindow, slowWindow
 
 ############################################
 # thread control
@@ -1542,7 +1586,7 @@ if CONFIGURE:
     ret = xrCmd("tag.security.tid_mask.enable=0")
     
     #force occasional re read of tid/userData
-    ret = xrCmd("setup.advanced.do_opspecs_once=0")
+    ret = xrCmd("setup.advanced.do_opspecs_once=1")
     
     
     #antenna power config

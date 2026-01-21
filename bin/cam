@@ -3,8 +3,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 import json
 import base64
+import importlib
 
 import sidraCore
+
+#dynamically load all read drivers
+camDrivers = {}
+for driver in sidraCore.driversCam:
+    camDrivers[driver] = importlib.import_module(driver)
+    print("Loaded cam driver: " + driver)
 
 #LOCAL_URL_PREFIX = "http://219.92.246.50:2080/"
 #LOCAL_URL_PREFIX = "http://10.2.10.10:2080/"
@@ -15,6 +22,7 @@ cams = sidraCore.cams
 MIN_PLATE_SCORE = 0
 
 DEBUG = True
+DEBUG_DRIVER = True
 
 #################################################
 def getPos(d):
@@ -187,7 +195,15 @@ class handler(BaseHTTPRequestHandler):
         d['transit']['leftPos'] = leftPos
         d['transit']['rightPos'] = rightPos
         #print(d)
-
+        
+        #drivers
+        for driverName, driverModule in camDrivers.items():
+            if DEBUG_DRIVER:
+                print("running driver: " + str(driverName))
+            if hasattr(driverModule, "cam"):
+                driverModule.cam(d)
+            
+        #save transaction
         sidraCore.logTrn("----------")
         sidraCore.logTrn(json.dumps(d))
         sidraCore.saveTransaction(sidraCore.trnPrefix() + d["transit"]["uuid"] + sidraCore.TRN_EXTENSION_CAM, json.dumps(d))
