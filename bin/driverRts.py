@@ -2,6 +2,7 @@
 from datetime import datetime
 import uuid
 import json
+import os
 
 import sidraCore
 
@@ -11,6 +12,7 @@ ENABLE_FILE = "akiraEnabled.rts"
 
 EXT_READ = ".rts-r"
 EXT_TRANS = ".rts-t"
+EXT_RESPONSE = ".rts-resp"
 
 RESPONSE_FILE = "response.log"
 
@@ -35,6 +37,85 @@ def getEnable():
 		print("driverRts.getEnable() " + str(ex))
 		
 	return ret
+
+#############################
+def getResponses():
+
+	responses = []
+
+	try:
+		for fname in os.listdir(DATA_DIR):
+
+			# only response files
+			if not fname.endswith(EXT_RESPONSE):
+				continue
+
+			fullPath = os.path.join(DATA_DIR, fname)
+
+			try:
+				# read contents
+				data = sidraCore.readFile(fullPath)
+
+				# oJSON-decode
+				data = json.loads(data)
+
+				responses.append(data)
+
+				# delete after successful read
+				sidraCore.deleteFile(fullPath)
+
+			except Exception as ex:
+				sidraCore.log(
+					"driverRts.getResponses() error processing "
+					+ fname + " : " + str(ex)
+				)
+
+	except Exception as ex:
+		sidraCore.log("driverRts.getResponses() error listing dir: " + str(ex))
+		
+	parsed = []
+	try:
+		parsed = parseResponses(responses)
+		#ignore last tag detected
+		#if parsed.get('resultCode','') == "07":
+		#	parsed = []
+		
+	except Exception as ex:
+		err = "driverRts.getResponses() error parsing " + str(ex)
+		sidraCore.log(err)
+		print(err)
+		
+	return parsed
+
+######################
+def parseResponses(responses):
+
+	parsed = []
+
+	for response in responses:
+		if response["header"]["command"] == "TagResult":
+			
+			valid = False
+			if response["body"]["Result"] == "00":
+				valid = True
+				
+			#ignore last tag sent messages
+			if response["body"]["Result"] == "07":
+				continue
+			
+			new = {
+				"type":"tagResult",
+				"tid":response["body"]["TagID"],
+				"date":response["header"]["timestamp"],
+				"valid":valid,
+				"resultCode":response["body"]["Result"],
+				"plaza":response["body"]["PlazaID"],
+				"lane":response["body"]["LaneID"],
+				"plate":response["body"]["RegPlateNum"]
+			}
+			parsed.append(new)
+
+	return parsed
 
 ######################
 def read(data):
@@ -126,7 +207,7 @@ def read(data):
 	"""
 
 ######################
-def transX(data):
+def trans(data):
 	
 	#check wether RTS wants akira data
 	if not getEnable():
@@ -362,3 +443,40 @@ def cam(data):
 	if xmit:
 		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
 	
+######################
+def genFakeTagResponse_X(tid):
+	
+	#00 = good
+	#01 = zero balance
+	ret = {}
+	
+	ret = {
+	  "header": {
+		"command": "TagResult",
+		"timestamp": datetime.now().isoformat()
+	  },
+	  "body": {
+		"TxID": "d29c4ff1-a6b4-4089-b26f-a94ef1a55aba",
+		"TagID": tid,
+		"PlazaID": "PRO_PLZ",
+		"LaneID": "08ME",
+		"Result": "00",
+		"AnprID": "LI_PRO_PLZ08ME202601121021311458",
+		"RegPlateNum": "VCG4791",
+		"RegVehClass": "C1",
+		"TagStatus": "A",
+		"AcctType": "P",
+		"FareAmt": 2.13,
+		"AcctBal": 105.68
+	  },
+	  "hmac": "4V1h0iwzIg6H+0qpAEIlpqn5C2jW9nVuODgOeNiNPTM="
+	}
+	
+	writeResponse(ret)
+	
+#############################
+def writeResponse(msg):
+		
+	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + EXT_RESPONSE
+	responseFile = DATA_DIR + "/" + fileName
+	sidraCore.writeFile(responseFile, json.dumps(msg))

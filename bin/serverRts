@@ -39,25 +39,32 @@ def logResponse(msg):
 	current.append(msg)
 
 	sidraCore.writeFile(responseFile, json.dumps(current))
+	
+#############################
+def writeResponse(msg):
+		
+	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + driverRts.EXT_RESPONSE
+	responseFile = driverRts.DATA_DIR + "/" + fileName
+	sidraCore.writeFile(responseFile, json.dumps(msg))
 
 #############################
-	def sendAckAlive():
-		
-		id = str(uuid.uuid4())
-		responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-		
-		ack = {
-			'header':{
-			'command':"IsAlive",
-			'timestamp':datetime.now().isoformat()
-			},
-			'body':{
-			'Result':"ACK",
-			'hmac':"XXXX"
-			}
+def sendAckAlive():
+	
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+	
+	ack = {
+		'header':{
+		'command':"IsAlive",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
 		}
-			
-		sidraCore.writeFile(responseFile, json.dumps(ack))
+	}
+		
+	sidraCore.writeFile(responseFile, json.dumps(ack))
 
 #############################
 def sendAckInitialize():
@@ -277,6 +284,7 @@ def handleClientMessage(clientSocket, clientAddr, port, data):
 		
 			msg = json.loads(text)
 			logResponse(msg)
+			writeResponse(msg)
 			command = msg.get('header', {}).get('command')
 
 			if command == "IsAlive":
