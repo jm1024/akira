@@ -1,4 +1,5 @@
 #!/bin/bash
+clear
 pkill -f mass
 pkill -f reader
 echo "------------ start rjm -----------"

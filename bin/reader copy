@@ -67,10 +67,14 @@ tidWait = False
 power = "100"
 mode = "C1G2_MODE_640_MILLER2"
 region = "" # JM implement from .cfg
+#frequency 918.25 MHz - non MY
+frequency = "setup.advanced.preferred_frequencies=918250"
+#frequency 919.25 - MY
+#frequency = "setup.advanced.preferred_frequencies=919250"
 
 DEBUG = True
 DEBUG_READER_RECV = False
-DEBUG_READER_COMM = False
+DEBUG_READER_COMM = True
 DEBUG_EVENTS = False
 DEBUG_RAW_ARRIVE = False
 DEBUG_ARRIVE = False
@@ -80,11 +84,11 @@ DEBUG_DEPART = False
 DEBUG_ARRIVAL_MATCH = False
 DEBUG_TIMING = False
 DEBUG_DRIVER = False
-DEBUG_DRIVER_RESPONSES = True
+DEBUG_DRIVER_RESPONSES = False
 DEBUG_FINAL = False
 DEBUG_WINDOW = False
 DEBUG_READ_MONITOR = False
-DEBUG_INAUTHENTIC = False
+DEBUG_INAUTHENTIC = True
 DEBUG_READ_SEEK = False
 
 DEBUG_SQUELCH = False
@@ -438,6 +442,7 @@ def parseEvent(event):
             d = val.split('=')
             if d[0] == "first":
                 date = d[1].strip(',')
+                #date = datetime.now()
             if d[0] == "tag_id":
                 epc = d[1][2:]
                 epc = epc.strip(',')
@@ -468,12 +473,14 @@ def parseEvent(event):
                 #print("reader: done: " +str(tid))
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
+            
+        date = datetime.now()
     
         arrival = {'date':date, 'antenna':antenna, 'rssi':rssi, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
     
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(arrival) + '\n')
+            sidraCore.appendFile(LOG_READS_FILE, json.dumps(arrival, default=sidraCore.jsonConverter) + '\n')
     
         if DEBUG_ARRIVE:
             output = "==============================================="
@@ -502,9 +509,10 @@ def parseEvent(event):
         arrival['lane'] = lane
         arrival['side'] = side
         
-        dtDate = sidraCore.rfStrToDt(date)
+        #dtDate = sidraCore.rfStrToDt(date)
         
-        report = {'date':dtDate, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
+        
+        report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
         
         #driver for fast read transmits to other systems
         #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
@@ -522,15 +530,14 @@ def parseEvent(event):
         if LOG_READS:
             sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
         
-        # if squelched don't add
-        if isSquelched(tid, side):
-            if DEBUG_SQUELCH:
-                print(f" is squelched {tid} {side}")
-        else:
+        # if not squelched add
+        if not isSquelched(tid, side):
             #add to appropriate list
-            
             #print(f"addArrive {report['tid']} {report['side']}")
-            reports.append(report)    
+            reports.append(report) 
+        #else:
+        #    if DEBUG_SQUELCH:
+        #        print(f" is squelched {tid} {side}")               
 
     ##################################################################
     # report event
@@ -554,6 +561,7 @@ def parseEvent(event):
             d = val.split('=')
             if d[0] == "time":
                 sDate = d[1].strip(',')
+                #print(f"report: {sDate} now:{datetime.now()}")
             if d[0] == "tag_id":
                 try:
                     epc = d[1][2:]
@@ -615,12 +623,12 @@ def parseEvent(event):
         if LOG_READS:
             sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
         
-        # if squelched don't add
-        if isSquelched(report['tid'], report['side']):
-            if DEBUG_SQUELCH:
-                print(f" is squelched {report['tid']} {report['side']}")
-        else:
-            reports.append(report)    
+        # if not squelched add
+        if not isSquelched(report['tid'], report['side']):
+            reports.append(report) 
+        #else:
+        #    if DEBUG_SQUELCH:
+        #        print(f" is squelched {report['tid']} {report['side']}")               
         
     ##################################################################
     #depart events
@@ -983,64 +991,59 @@ def laneThread(stop_event):
             massTrip = int(massEvent.get("trip",-1))
             massMain = int(massEvent.get("main",-1))
             massRear = int(massEvent.get("rear",-1)) # massEvent.get("rear",-1) <- JM CHANGE WHEN REAR IS ENABLED
-            #massDate = massEvent.get("date")
             massDate = datetime.now()
                         
-            #if clear - unlock and reset windows
+            #################
+            #all sensors clear
             if massMain == 0 and massTrip == 0 and massRear == 0:
                 if datetime.now() > lastMass['tripLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT) and datetime.now() > lastMass['mainLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT):
-                    fastWindow = resetWindow("fast - lane clear")
-                    slowWindow = resetWindow("slow - lane clear")
+                    fastWindow = resetWindow(f"fast - lane clear {massTrip}{massMain}{massRear}")
+                    slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
                     lastMass["lastUnlocked"] = datetime.now()
-                    #flush slow reads
-                    #flushReports(ANTENNA_SLOW)
                 else:
                     lastMass['unlockLockout'] = True
                     print(f"unlock lockout {massTrip} {massMain} {massRear}")
             
-            #if theres a change in trip and slow is not locked
+            #################
+            #if theres a change in trip
             if massTrip == 1 and not massTrip == lastMass['trip']:
-                #if previous fast was good
-                print(f"LFG: {lastFastTid} {lastFastGood} {lastFastValid}")
+                
+                #print(f"LFG: {lastFastTid} {lastFastGood} {lastFastValid}")
+                
+                #check for Fast Flow - if previous fast was good
                 if lastFastGood and lastFastValid:
                     begin = massDate + timedelta(milliseconds=fastPre)
                     end   = massDate + timedelta(milliseconds=fastPost)
-                    print(f" -= FAST MAINTAIN FLOW {slowWindow['locked']} =-")
-                    fastWindow = readWindow(fastWindow, begin, end, "fast - trip sensor")
+                    print(f" -= FAST FLOW ON =-")
+                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
                     lastFastGood = False
                     lastFastTid = "NONE"
                     lastFastValid = False
+                elif massMain == 0 and massRear == 0:
+                #if slow and rear are clear
+                    print(f" READING - NO FAST FLOW -lfv:{lastFastValid}")                   
+                    begin = massDate + timedelta(milliseconds=fastPre)
+                    end   = massDate + timedelta(milliseconds=fastPost)
+                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
                 else:
-                    if slowWindow['locked'] == False:
-                        begin = massDate + timedelta(milliseconds=fastPre)
-                        end   = massDate + timedelta(milliseconds=fastPost)
-                        fastWindow = readWindow(fastWindow, begin, end, "fast - trip sensor")
-                    #else:
-                        #print(f"NOT set fastRead - SLOWLOCK  slowLock:{slowWindow['locked']} trip:{massTrip}")
-            #else:
-            #    print(f"NOT set fastRead - NOCHANGE current:{massTrip} last:{lastMassTrip}")
-                
-            #if theres a change in main lock fast, read slow
-            #print(slowTrigger)
-            if slowTrigger == "main":
-                if massMain == 1 and lastMass['main'] == 0:
-                    begin = massDate + timedelta(milliseconds=slowPre)
-                    end   = massDate + timedelta(milliseconds=slowPost)
-                    #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                    ##slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor")
-                    print("LOCK SLOW")
-                    slowWindow = lockWindow("slow - main sensor")
+                    print(f" NOT READING FAST {massTrip}{massTrip}{massRear}")  
+
+            #################
+            #if theres a change in main 
+            #if massMain == 1 and lastMass['main'] == 0:
+                #print("LOCK SLOW")
+            #    slowWindow = lockWindow(f"slow - main sensor {massTrip}{massMain}{massRear}")
                     
-                    
+            #################
             #if theres a change in rear
-            if slowTrigger == "rear":
-                if massRear == 1 and lastMass['rear'] == 0:
-                    begin = massDate + timedelta(milliseconds=slowPre)
-                    end   = massDate + timedelta(milliseconds=slowPost)
-                    #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                    slowWindow = readWindow(slowWindow, begin, end, "slow - rear sensor")
+            if massRear == 1 and lastMass['rear'] == 0:
+                begin = massDate + timedelta(milliseconds=slowPre)
+                end   = massDate + timedelta(milliseconds=slowPost)
+                #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
+                slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
             
 
+            # save current state as last state
             lastMass["trip"] = massTrip
             lastMass["main"] = massMain
             lastMass["rear"] = massRear
@@ -1052,26 +1055,22 @@ def laneThread(stop_event):
                 lastMass['mainLast'] = datetime.now()
             if not lastMass['rear'] == massRear:
                 lastMass['rearLast'] = datetime.now()
-            #lastMassTrip = massTrip
-            #lastMassMain = massMain
-            #lastMassRear = massRear
-            #lastMassDate = massDate
+
             
             if DEBUG_MASS:
                 debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
 
+        #################
         #check fast zone
         read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
         if not read == None:
             
             #re-open fast antenna
-            fastWindow = resetWindow()
+            fastWindow = resetWindow(f"fast - read accepted  {massTrip}{massMain}{massRear}")
             lastFastGood = True
             lastFastTid = read['tid']
             lastFastValid = False
-            
-            #use this to go back to lockout mode
-            #fastWindow = lockWindow("fast - read")
+
             sendRead(read)
             
             #squelch
@@ -1088,7 +1087,8 @@ def laneThread(stop_event):
                         print("running driver: " + str(driverName))
                     if hasattr(driverModule, "genFakeTagResponse"):
                         responses = driverModule.genFakeTagResponse(read['tid'])
-            
+        
+        #################    
         #check slow zone
         read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
         if not read == None:
@@ -1099,7 +1099,7 @@ def laneThread(stop_event):
             end   = thisDate + timedelta(milliseconds=slowPost)
             #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
             #slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor") # JM MAYBE we want tis istead of reset???
-            slowWindow = resetWindow("slow - main sensor")
+            slowWindow = resetWindow(f"slow - read accepted {massTrip}{massMain}{massRear}")
             sendRead(read)
             
             #squelch
@@ -1109,9 +1109,10 @@ def laneThread(stop_event):
             if LOG_STATS:
                 sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
             
-        #clean old rf events
+        #clean old RF events
         cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
         cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
+        #print(slowMaxReportAge)
         
         #clean squelch list
         if DEBUG_SQUELCH:
@@ -1121,98 +1122,29 @@ def laneThread(stop_event):
             lastSquelchCount = squelchCount
         cleanSquelch()
             
+        #see if you need to break lockout
         lockoutChanged, fastWindow, slowWindow = lockoutBreak(fastWindow, slowWindow, lastMass)
         if lockoutChanged:
             debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
     
         #debug read stats
-        fc, sc = countReports()
-        fcs = str(fc).rjust(4)
-        scs = str(sc).rjust(4)
-        #print("",f"fast: {fcs} slow: {scs}", end="\r", flush=True)
-            
-        if DEBUG_READ_MONITOR:
-            print(f"{fcs}{scs} {datetime.now().time()}")
+        if DEBUG_READ_MONITOR or LOG_STATS:
+            fc, sc = countReports()
+            fcs = str(fc).rjust(4)
+            scs = str(sc).rjust(4)
                 
-        if LOG_STATS:
-            if not lastSc == sc or not lastFc == fc :
-                if fcs == "   0":
-                    fcs = "   -"
-                if scs == "   0":
-                    scs = "   -"
-                sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
-        lastFc = fc
-        lastSc = sc
-
-
-#######################
-def removeReports(tid, side):
-    global reports
-    reports[:] = [
-        r for r in reports
-        if not (r.get("tid") == tid and r.get("side") == side)
-    ]
-            
-#######################
-def addSquelch(tid, side, duration):
-    
-    global squelch
-    
-    if not isSquelched(tid, side):
-    
-        end = datetime.now() + timedelta(milliseconds=duration)
-        
-        newSquelch = {'tid':tid, 'side':side, 'end':end}
-        
-        squelch.append(newSquelch)
-        
-        #clean reports of this tag on this side
-        removeReports(tid, side)
-        
-        if LOG_STATS and DEBUG_SQUELCH:
-            sidraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
-        
-        
-        if DEBUG_SQUELCH:
-            print(f"squelched: {tid} {side} {end} {datetime.now()}")
-
-            
-#######################
-def cleanSquelch():
-    global squelch
-    
-    now = datetime.now()
-    
-    squelch[:] = [
-        s for s in squelch
-        if s.get("end") >= now
-    ]
-
-#######################
-def isSquelched(tid, side):
-    #now = datetime.now()
-    for s in squelch:
-        if (
-            s.get("tid") == tid and
-            s.get("side") == side #and
-            #s.get("end", now) > now
-        ):
-            return True
-    return False
-    
-#######################
-def sendRead(read):
-    
-    #drivers and transaction
-    for driverName, driverModule in readDrivers.items():
-        if DEBUG_DRIVER:
-            print("running driver: " + str(driverName))
-        if hasattr(driverModule, "read"):
-            driverModule.read(read)
-        
-    #trans
-    transaction(read['date'], read['reader'], read['lane'], read['side'], read['antenna'], read['rssi'], read['reads'], read['epc'], read['tid'], read['userData'], read['tidAuthentic'], read['pwAuthentic'])
-            
+            if DEBUG_READ_MONITOR:
+                print(f"{fcs}{scs} {datetime.now().time()}")
+                    
+            if LOG_STATS:
+                if not lastSc == sc or not lastFc == fc :
+                    if fcs == "   0":
+                        fcs = "   -"
+                    if scs == "   0":
+                        scs = "   -"
+                    sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
+            lastFc = fc
+            lastSc = sc
 
 #######################
 def checkReads(window, side, minReads):
@@ -1230,34 +1162,35 @@ def checkReads(window, side, minReads):
     
     #print("CR")
     
+    totalCount = 0
     goodCount = 0
     badCount = 0
+    badCountPre = 0
+    badCountPost = 0
+    badCountSide = 0
+    blankTidCount = 0
     
     #if not window['reading']:
     #    print("-")
     #else:
     #    print(len(reports))
         #print("-")
-    if window['reading']:
-        fc = 0
-        sc = 0
-        for r in reports:
-            if r['side'] == ANTENNA_FAST:
-                fc = fc +1
-            if r['side'] == ANTENNA_SLOW:
-                sc = sc + 1
-        #print(f"{fc} - {sc}")
+    #if window['reading']:
+    #    fc, sc = countReports()
+    #    print(f"{fc} - {sc}")
         
     if window['reading']:
         #print(len(reports))
         for read in reports:
-            #print(read)
+            totalCount = totalCount +1
             #print(f"{read['date']} b:{fast['begin']} e:{fast['end']}")
             if read['date'] > window['begin'] and read['date'] < window['end'] and read['side'] == side:
                 goodCount = goodCount +1
                 #print(f"cand:{read['tid']}")
                 tid = read.get("tid", "")
                 if not tid:
+                    #print(f"checkReads() blank tid {datetime.now()}")
+                    blankTidCount = blankTidCount + 1
                     continue  # ignore blank tids
                 
                 rssi = int(read.get("rssi", "-999999"))  # rssi comes in as string like "-538"
@@ -1299,8 +1232,17 @@ def checkReads(window, side, minReads):
                     if read.get('tidAuthentic','') == AUTH_AUTHENTIC:
                         update['tidAuthentic'] = AUTH_AUTHENTIC
             else:
+                if read['date'] < window['begin']:
+                    badCountPre = badCountPre +1
+                if  read['date'] > window['end']:
+                    badCountPost = badCountPost +1
+                if not read['side'] == side:
+                    badCountSide = badCountSide +1
                 badCount = badCount +1
                 #print(f"read not in scope {read['antenna']} t:{read['date']}")
+                
+        #if blankTidCount > 0:    
+        #    print(f"blank Tid count:{blankTidCount}")
             
         # find best candidate
         candidateCount = 0
@@ -1317,13 +1259,16 @@ def checkReads(window, side, minReads):
                 print(f"{tid} {poolCount}")
             print("******************************")
 
+        #check candidates to see if any are > minReads and if they are authentic
+        highestCandidate = ""
         for candidate in candidates.values():
+            #print(f"{side} t:{candidate.get('tid')} c:{candidate.get('count')} t:{totalCount} g:{goodCount} b:{badCount} bPre:{badCountPre} bPost:{badCountPost} bSide:{badCountSide} - {datetime.now()}")
             candidateCount = candidateCount +1
             thisCount = candidate.get('count')
             if thisCount > highestCount:
                 if not candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: # <--- JM to enable auth
                     if DEBUG_INAUTHENTIC:
-                        print("INAUTHENTIC TAG: " + candidate.get('tid','x'))
+                        print("INAUTHENTIC TAG: " + candidate.get('tid','none'))
                 else:
                     highestCount = thisCount
                     potential = candidate
@@ -1333,7 +1278,7 @@ def checkReads(window, side, minReads):
         #if you have a potential does it have enough reads?
         if not potential == None:
             if potential['count'] >= minReads:
-                accepted = candidate
+                accepted = potential
             
         #if you've accepted a candidate
         if not accepted == None:
@@ -1349,7 +1294,7 @@ def checkReads(window, side, minReads):
                             addSquelch(tid, ANTENNA_FAST, SQUELCH_TIME)
                             addSquelch(tid, ANTENNA_SLOW, SQUELCH_TIME)
             if DEBUG:
-                out = f"{side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}"
+                out = f"<<< {side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}"
                 if LOG_EVENTS:
                     sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
                 print(out) 
@@ -1366,6 +1311,75 @@ def checkReads(window, side, minReads):
     # return
     return ret
 
+#######################
+def sendRead(read):
+    
+    #drivers and transaction
+    for driverName, driverModule in readDrivers.items():
+        if DEBUG_DRIVER:
+            print("running driver: " + str(driverName))
+        if hasattr(driverModule, "read"):
+            driverModule.read(read)
+        
+    #trans
+    transaction(read['date'], read['reader'], read['lane'], read['side'], read['antenna'], read['rssi'], read['reads'], read['epc'], read['tid'], read['userData'], read['tidAuthentic'], read['pwAuthentic'])
+            
+
+#######################
+def removeReports(tid, side):
+    global reports
+    reports[:] = [
+        r for r in reports
+        if not (r.get("tid") == tid and r.get("side") == side)
+    ]
+            
+#######################
+def addSquelch(tid, side, duration):
+    
+    global squelch
+    
+    if not isSquelched(tid, side):
+    
+        end = datetime.now() + timedelta(milliseconds=duration)
+        
+        newSquelch = {'tid':tid, 'side':side, 'end':end}
+        
+        squelch.append(newSquelch)
+        
+        #clean reports of this tag on this side
+        removeReports(tid, side)
+        
+        if LOG_STATS and DEBUG_SQUELCH:
+            sidraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
+        
+        if DEBUG_SQUELCH:
+            print(f"squelched: {tid} {side} {end} {datetime.now()}")
+
+            
+#######################
+def cleanSquelch():
+    global squelch
+    
+    now = datetime.now()
+    
+    squelch[:] = [
+        s for s in squelch
+        if s.get("end") >= now
+    ]
+
+#######################
+def isSquelched(tid, side):
+    
+    #now = datetime.now()
+    for s in squelch:
+        if (
+            s.get("tid") == tid and
+            s.get("side") == side #and
+            #s.get("end", now) > now
+        ):
+            return True
+    return False
+
 #######################   
 def flushReports(side):
     
@@ -1380,7 +1394,7 @@ def flushReports(side):
 def readWindow(window, begin, end, name = ""):
     
     if DEBUG_WINDOW:
-        print(f"READ WINDOW: {name}")
+        print(f"window read: {name} {datetime.now()}")
     window['locked'] = True
     window['reading'] = True
     window['begin'] = begin
@@ -1395,7 +1409,7 @@ def readWindow(window, begin, end, name = ""):
 def lockWindow(name = ""):
     
     if DEBUG_WINDOW:
-        print(f"LOCK WINDOW: {name}")
+        print(f"window lock: {name} {datetime.now()}")
     window = {}
     window['locked'] = True
     window['reading'] = False
@@ -1411,7 +1425,7 @@ def lockWindow(name = ""):
 def resetWindow(name = ""):
     
     if DEBUG_WINDOW:
-        print(f"RESET WINDOW: {name}")
+        print(f"window reset: {name} {datetime.now()}")
     window = {}
     window['locked'] = False
     window['reading'] = False
@@ -1676,8 +1690,14 @@ if CONFIGURE:
         ret = xrCmd("tag.security.tid_authentication_enable=0")
     ret = xrCmd("tag.security.tid_mask.enable=0")
     
+    #frequency
+    ret = xrCmd(frequency)
+    
     #force occasional re read of tid/userData
     ret = xrCmd("setup.advanced.do_opspecs_once=1")
+    
+    #HOPPING MODE config
+    #ret = xrCmd("modem.control.cognitive.lbt_max_hops=8")
     
     
     #antenna power config
