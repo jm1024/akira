@@ -56,6 +56,9 @@ antennas = []
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
+#reader killswitch
+READER_ENABLED = True
+
 #time to squelch reads that have been sent
 MULTI_POOL_SQUELCH = True
 SQUELCH_TIME = 5000
@@ -67,10 +70,11 @@ tidWait = False
 power = "100"
 mode = "C1G2_MODE_640_MILLER2"
 region = "" # JM implement from .cfg
+
 #frequency 918.25 MHz - non MY
-#frequency = "setup.advanced.preferred_frequencies=918250"
+#frequency = "918250"
 #frequency 919.25 - MY
-frequency = "setup.advanced.preferred_frequencies=919250"
+frequency = "919250" # loaded from sidra.cfg
 
 DEBUG = True
 DEBUG_READER_RECV = False
@@ -1002,6 +1006,12 @@ def laneThread(stop_event):
                     fastWindow = resetWindow(f"fast - lane clear {massTrip}{massMain}{massRear}")
                     slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
                     lastMass["lastUnlocked"] = datetime.now()
+                    #laneClear messages
+                    for driverName, driverModule in readDrivers.items():
+                        if DEBUG_DRIVER:
+                            print("running driver: " + str(driverName))
+                        if hasattr(driverModule, "laneClear"):
+                            driverModule.laneClear(lane)
                 else:
                     lastMass['unlockLockout'] = True
                     print(f"unlock lockout {massTrip} {massMain} {massRear}")
@@ -1110,6 +1120,29 @@ def laneThread(stop_event):
             #flushReports(ANTENNA_SLOW)
             if LOG_STATS:
                 sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
+
+        #################
+        #check for expired windows
+        fastExpired = windowExpired(fastWindow)
+        slowExpired = windowExpired(slowWindow)
+        if fastExpired:
+            print(f"fastExpired used: {fastWindow['used']} - end: {fastWindow['end'].time()} {datetime.now().time()}")
+            fastWindow = resetWindow("fast - expired")
+            #noTag messages
+            for driverName, driverModule in readDrivers.items():
+                if DEBUG_DRIVER:
+                    print("running driver: " + str(driverName))
+                if hasattr(driverModule, "noTag"):
+                    driverModule.noTag(lane)
+        if fastExpired:
+            print(f"slowExpired used: {slowWindow['used']} - end: {slowWindow['end'].time()} {datetime.now().time()}")
+            slowWindow = resetWindow("slow - expired")
+            #noTag messages
+            for driverName, driverModule in readDrivers.items():
+                if DEBUG_DRIVER:
+                    print("running driver: " + str(driverName))
+                if hasattr(driverModule, "noTag"):
+                    driverModule.noTag(lane)
 
         #clean old RF events
         cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
@@ -1268,14 +1301,13 @@ def checkReads(window, side, minReads):
             candidateCount = candidateCount +1
             thisCount = candidate.get('count')
             if thisCount > highestCount:
-                if not candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: # <--- JM to enable auth
-                    if DEBUG_INAUTHENTIC:
-                        print("INAUTHENTIC TAG: " + candidate.get('tid','none'))
-                else:
-                    highestCount = thisCount
-                    potential = candidate
-            #print(f"tc:{thisCount}")
-            #print(f"candidte late:{candidate}")
+                #if not candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: # <--- JM to enable auth
+                #    if DEBUG_INAUTHENTIC:
+                #        print("INAUTHENTIC TAG: " + candidate.get('tid','none'))
+                #else:
+                # - for now include inauthentic tags
+                highestCount = thisCount
+                potential = candidate
 
         #if you have a potential does it have enough reads?
         if not potential == None:
@@ -1301,6 +1333,8 @@ def checkReads(window, side, minReads):
                     sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
                 print(out)
             ret = accepted
+
+            window['used'] = True
 
     if DEBUG_READ_SEEK:
         if ret == None and candidateCount > 0:
@@ -1391,6 +1425,17 @@ def flushReports(side):
     #end = len(reports)
 
     #print(f"flushReports: {start} -> {end}")
+
+#######################
+def windowExpired(window):
+
+    ret = False
+
+    if window['reading']:
+        if datetime.now() > window['end']:
+            ret = True
+
+    return ret
 
 #######################
 def readWindow(window, begin, end, name = ""):
@@ -1601,6 +1646,7 @@ for reader in sidraCore.readers:
         tagFilter = reader.get("tagFilter","")
         antennas = reader['antennas']
         power = reader['power']
+        frequency = reader['frequency']
         auth = reader.get("auth", True)
         authWait = reader.get("authWait", True)
         tidWait = reader.get("tidWait", True)
@@ -1693,7 +1739,7 @@ if CONFIGURE:
     ret = xrCmd("tag.security.tid_mask.enable=0")
 
     #frequency
-    ret = xrCmd(frequency)
+    ret = xrCmd("setup.advanced.preferred_frequencies=" + str(frequency))
 
     #force occasional re read of tid/userData
     ret = xrCmd("setup.advanced.do_opspecs_once=1")
@@ -1728,7 +1774,8 @@ if CONFIGURE:
     ret = xrCmd("reader.profile.save(MalaysiaSLFF)")
 
     #killswitch
-    #ret = xrCmd("setup.operating_mode=active")
+    if READER_ENABLED:
+        ret = xrCmd("setup.operating_mode=active")
 
 #ret = xrCmd("reader.profile.show_running_config()")
 

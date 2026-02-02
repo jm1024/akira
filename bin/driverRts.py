@@ -21,10 +21,12 @@ OVERRIDE_AUTH = False
 DEBUG = False
 DEBUG_XMIT = False
 
+TAG_AUTHENTIC = "AUTHENTIC"
+
 #############################
 def setEnable(state = True):
 	sidraCore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
-	
+
 #############################
 def getEnable():
 
@@ -35,7 +37,7 @@ def getEnable():
 			ret = False
 	except Exception as ex:
 		print("driverRts.getEnable() " + str(ex))
-		
+
 	return ret
 
 #############################
@@ -72,19 +74,19 @@ def getResponses():
 
 	except Exception as ex:
 		sidraCore.log("driverRts.getResponses() error listing dir: " + str(ex))
-		
+
 	parsed = []
 	try:
 		parsed = parseResponses(responses)
 		#ignore last tag detected
 		#if parsed.get('resultCode','') == "07":
 		#	parsed = []
-		
+
 	except Exception as ex:
 		err = "driverRts.getResponses() error parsing " + str(ex)
 		sidraCore.log(err)
 		print(err)
-		
+
 	return parsed
 
 ######################
@@ -94,15 +96,15 @@ def parseResponses(responses):
 
 	for response in responses:
 		if response["header"]["command"] == "TagResult":
-			
+
 			valid = False
 			if response["body"]["Result"] == "00":
 				valid = True
-				
+
 			#ignore last tag sent messages
 			if response["body"]["Result"] == "07":
 				continue
-			
+
 			new = {
 				"type":"tagResult",
 				"tid":response["body"]["TagID"],
@@ -117,17 +119,20 @@ def parseResponses(responses):
 
 	return parsed
 
+##################################################################
+# driver functions
+
 ######################
 def read(data):
-	
+
 	#check wether RTS wants akira data
 	if not getEnable():
 		if DEBUG:
 			print("driverRts.read() akira is disabled, aborting")
 		return
-	
+
 	xmit = True
-	
+
 	# get sensor name for this lane
 	thisLane = data['lane']
 	thisDt = data['date']
@@ -144,48 +149,72 @@ def read(data):
 
 	if DEBUG:
 		print(debugInfo)
-		
-	
+
+
 	if DEBUG_XMIT:
 		print(xmitDebug)
 		sidraCore.appendFile("/var/sidra/log/rtsDebug.log", xmitDebug + "\n")
-	
+
 	#dt = datetime.now().isoformat()
 	#thisDtS = data['date']
 	#thisDt = sidraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
-	
+
 	authentic = data['tidAuthentic']
 	#JM hardwire authentic for now
 	if OVERRIDE_AUTH:
 		authentic == "AUTHENTIC"
 	#print("AUTHENTIC? " + str(authentic))
-	
-	thisExt = EXT_READ
-	
-	#if authentic == "AUTHENTIC":
-	thisExt = EXT_READ
-	contents = {
-		"header": {
-			"command": "TagDetected",
-			"timestamp": dt,
-		},
-		"body": {
-			"TxID": data['id'],
-			"TagID": data['tid'],
-			"PlazaID": sidraCore.plazaId,
-			"LaneID": data['lane'],
-			"DetectedTime": dt,
-			"Antenna": side,
-		},
-		"hmac": "XXXX",
-	}
-		
 
-	if xmit:	
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
-		if DEBUG_XMIT:
-			print("driverRTS sent: " + str(datetime.now()))
+	thisExt = EXT_READ
+
+	if authentic == TAG_AUTHENTIC:
+		thisExt = EXT_READ
+		contents = {
+			"header": {
+				"command": "TagDetected",
+				"timestamp": dt,
+			},
+			"body": {
+				"TxID": data['id'],
+				"TagID": data['tid'],
+				"PlazaID": sidraCore.plazaId,
+				"LaneID": data['lane'],
+				"DetectedTime": dt,
+				"Antenna": side,
+			},
+			"hmac": "XXXX",
+		}
+
+		if xmit:
+			sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			if DEBUG_XMIT:
+				print("driverRTS sent: " + str(datetime.now()))
+
+	else:
+		thisExt = EXT_TRANS
+		contents = {
+			"header": {
+				"command": "NoTagDetected",
+				"timestamp": dt,
+			},
+			"body": {
+				"TxID": data['id'],
+				"TagID": data['tid'],
+				"PlazaID": sidraCore.plazaId,
+				"LaneID": data['lane'],
+				"DetectedTime": dt,
+				"Result":"01",
+				"Antenna": side,
+			},
+			"hmac": "XXXX",
+		}
+
+		if xmit:
+			sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			if DEBUG_XMIT:
+				print("driverRTS sent: " + str(datetime.now()))
+
 	"""
 	tData = {
 		'date': str(dt),
@@ -207,16 +236,16 @@ def read(data):
 	"""
 
 ######################
-def trans(data):
-	
+def trans_DISABLED(data):
+
 	#check wether RTS wants akira data
 	if not getEnable():
-		print("driverRts.read() akira is disabled, aborting")
+		print("driverRts.trans() akira is disabled, aborting")
 		return
-	
+
 	#data['img_f'] = ""
 	#data['img_fp'] = ""
-	
+
 	msgNTD = ""
 	xmit = False
 	#No tag detected message
@@ -237,13 +266,13 @@ def trans(data):
 			},
 			'hmac':"XXXX"
 			}
-	
+
 	if xmit:
 		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
-	
+
 	msg = ""
 	xmit = True
-	
+
 	msg = {
 		"header":{
 		'command':"ANPRInfo",
@@ -261,167 +290,132 @@ def trans(data):
 		},
 		'hmac':"XXXX"
 		}
-	
+
 	if xmit:
 		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
-	
+
 
 ######################
-def trans_OLD(data):
-	
+def noTag(lane):
+
 	#check wether RTS wants akira data
 	if not getEnable():
-		print("driverRts.read() akira is disabled, aborting")
+		print("driverRts.noTag() akira is disabled, aborting")
 		return
-	
-	#data['img_f'] = ""
-	#data['img_fp'] = ""
-	
+
 	msgNTD = ""
-	xmit = False
-	#No tag detected message
-	if data['tid'] == "":
-		xmit = True
-		msgNTD = {
-			'header':{
-			'command':"NoTagDetected",
-			'timestamp':data['date'].isoformat()
-			},
-			'body':{
-			'TxID':data['id'],
-			'TagID':None,
-			'PlazaID':data['plaza'],
-			'LaneID':data['lane'],
-			'Result':"00",
-			'DetectedTime':None,
-			},
-			'hmac':"XXXX"
-			}
-	
-	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
-	
-	msg = ""
+	transId = str(uuid.uuid4())
+
 	xmit = True
-	
-	msg = {
-		"header":{
-		'command':"ANPRInfo",
-		'timestamp':data['date'].isoformat()
+	msgNTD = {
+		'header':{
+		'command':"NoTagDetected",
+		'timestamp':datetime.now().isoformat()
 		},
 		'body':{
-		'TxID':data['id'],
-		'TagID':data['tid'],
-		'PlazaID':data['plaza'],
-		'LaneID':data['lane'],
-		'CapturedTime':data['date'].isoformat(),
-		'AnprID':data['id'],
-		'AnprResult':data['plate'],
-		'AnprImage':data['img_f']
+		'TxID':transId,
+		'TagID':None,
+		'PlazaID':str(sidraCore.plazaId),
+		'LaneID':str(lane),
+		'Result':"00",
+		'DetectedTime':None,
 		},
 		'hmac':"XXXX"
 		}
-	
+
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
-	
-	"""
-	{
-	"header":{
-	“command":"ANPRInfo",
-	“timestamp":"2025-11-15 12:21:38.431“
-	}
-	"body":{
-	“TxID”:”08ME20251115122138431”,
-	“TagID”:”E20034120139FB000D158E5D”,
-	“PlazaID”:”PRO_PLZ”,
-	“LaneID”:”08ME”,
-	“CapturedTime”:”2025-11-15 12:21:39.014”,
-	“AnprID”:”LI_PRO_PLZ08ME202511151010852928”,
-	“AnprResult”:”WAB1234”,
-	“AnprImage”:”
-	IkhlbGxvLCB3b3JsZC4gSGVsbG8sIHdvcmxkLiBIZWxsbywgd29ybGQuIg………
-	”
-	}
-	“hmac”:”XXXX”
-	}
-	
-	No Tag Detected:
-	{
-	"header":{
-	“command":"NoTagDetected",
-	“timestamp":"2025-11-15 12:21:38.431“
-	}
-	"body":{
-	“TxID”:”08ME20251115122138431”,
-	“TagID”:null,
-	“PlazaID”:”PRO_PLZ”,
-	“LaneID”:”08ME”,
-	“Result”:”00”,
-	“DetectedTime”:null,
-	}
-	“hmac”:”XXXX”
-	}
-	"""
+		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+
+######################
+def laneClear(lane):
+
+	#check wether RTS wants akira data
+	if not getEnable():
+		print("driverRts.laneClear() akira is disabled, aborting")
+		return
+
+	msgNTD = ""
+
+	transId = str(uuid.uuid4())
+
+	xmit = True
+	msgNTD = {
+		'header':{
+		'command':"LaneClear",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'TxID':transId,
+		'TagID':None,
+		'PlazaID':str(sidraCore.plazaId),
+		'LaneID':str(lane),
+		'Result':"00",
+		'DetectedTime':None,
+		},
+		'hmac':"XXXX"
+		}
+
+	if xmit:
+		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=sidraCore.jsonConverter))
 
 ######################
 def cam(data):
-	
+
 	#check wether RTS wants akira data
 	if not getEnable():
-		print("driverRts.read() akira is disabled, aborting")
+		print("driverRts.cam() akira is disabled, aborting")
 		return
-	
+
 	msg = ""
 	xmit = True
-	
+
 	print(data)
-	
-		
+
+
 	dt = sidraCore.camStrToDt(data['transit']['timestamps']['start'])
 	#dt = thisDt.isoformat()
 	id = str(uuid.uuid4())
-	
+
 	# get dateTime
 	try:
 		thisDtS = data['transit']['timestamps']["image"]
 		thisDt = sidraCore.camStrToDt(thisDtS)
 	except:
 		thisDt = datetime.now()
-	
+
 	dev    = data.get('device', {})
 	device = dev.get('name', 'UNKNOWN')
 	lane   = dev.get('lane', 0)
-	
+
 	#get plate
 	try:
 		plate = data['transit']['plate']['text']
 	except:
 		plate = DATA_UNKNOWN
-	
+
 	#get plate score
 	try:
 		plateScore = sidraCore.scoreToInt(data['transit']['plate']['score'])
 	except:
 		plateScore = 0
-	
+
 	#get images
 	imageFile = data['transit']['image']
-	
+
 	imagePlateFile = ""
 	try:
 		imagePlateFile = data['transit']['image_plate']
 		#print("IPF: " + str(imagePlateFile))
 	except Exception as ex:
 		print("error getting plate image")
-	
+
 	imageBin = ""
 	try:
 		imageBin = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + imageFile)
 	except Exception as ex:
 		sidraCore.log("ERROR: mcp loading main image " + imageFile + " " + str(ex), True)
-		
-	
+
+
 	msg = {
 		"header":{
 		'command':"ANPRInfo",
@@ -439,17 +433,17 @@ def cam(data):
 		},
 		'hmac':"XXXX"
 		}
-	
+
 	if xmit:
 		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
-	
+
 ######################
 def genFakeTagResponse_X(tid):
-	
+
 	#00 = good
 	#01 = zero balance
 	ret = {}
-	
+
 	ret = {
 	  "header": {
 		"command": "TagResult",
@@ -471,12 +465,12 @@ def genFakeTagResponse_X(tid):
 	  },
 	  "hmac": "4V1h0iwzIg6H+0qpAEIlpqn5C2jW9nVuODgOeNiNPTM="
 	}
-	
+
 	writeResponse(ret)
-	
+
 #############################
 def writeResponse(msg):
-		
+
 	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + EXT_RESPONSE
 	responseFile = DATA_DIR + "/" + fileName
 	sidraCore.writeFile(responseFile, json.dumps(msg))
