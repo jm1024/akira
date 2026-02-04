@@ -37,7 +37,7 @@ if not sidraCore.isRunning("mcp"):
 if not sidraCore.isRunning("xmit"):
     sidraCore.log("watchdog: xmit down")
     bOk = False
-    
+
 #check drivers
 for driverXmit in sidraCore.driversXmit:
     if not sidraCore.isRunning(driverXmit):
@@ -61,6 +61,14 @@ if not sidraCore.isRunning("http.server"):
     cmd = sidraCore.BIN_DIR + "/localImageServer"
     subprocess.call([cmd])
     #ps = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+
+#mon active
+if not sidraCore.isRunning(sidraCore.BIN_DIR + "/mon"):
+    sidraCore.log("watchdog: mon down")
+    #print("Restarting localImageServer")
+    sidraCore.log("watchdog: Restarting mon")
+    cmd = sidraCore.BIN_DIR + "/mon"
+    subprocess.call([cmd])
 
 #mon
 data = monCore.getAll(sidraCore.ipList)

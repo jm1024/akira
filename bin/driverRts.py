@@ -63,14 +63,11 @@ def getResponses():
 
 				responses.append(data)
 
-				# delete after successful read
-				sidraCore.deleteFile(fullPath)
-
 			except Exception as ex:
-				sidraCore.log(
-					"driverRts.getResponses() error processing "
-					+ fname + " : " + str(ex)
-				)
+				sidraCore.log("driverRts.getResponses() error processing " + fname + " : " + str(ex))
+
+			# delete file
+			sidraCore.deleteFile(fullPath)
 
 	except Exception as ex:
 		sidraCore.log("driverRts.getResponses() error listing dir: " + str(ex))
@@ -192,6 +189,7 @@ def read(data):
 				print("driverRTS sent: " + str(datetime.now()))
 
 	else:
+		print("driverRts.read() INAUTHENTIC TAG")
 		thisExt = EXT_TRANS
 		contents = {
 			"header": {
@@ -346,11 +344,10 @@ def laneClear(lane):
 		},
 		'body':{
 		'TxID':transId,
-		'TagID':None,
 		'PlazaID':str(sidraCore.plazaId),
 		'LaneID':str(lane),
 		'Result':"00",
-		'DetectedTime':None,
+		'ClearedTime':datetime.now().isoformat(),
 		},
 		'hmac':"XXXX"
 		}

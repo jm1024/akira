@@ -108,11 +108,11 @@ LOG_EVENTS = True
 LOG_EVENTS_FILE = "/var/sidra/log/events.log"
 
 #detailed log # of reads etc
-LOG_STATS = True
+LOG_STATS = False
 LOG_STATS_FILE = "/var/sidra/log/stats.log"
 
 #log all reads
-LOG_READS = True
+LOG_READS = False
 LOG_READS_FILE = "/var/sidra/log/reads.log"
 
 
@@ -179,6 +179,7 @@ def monitorNotifications(tn, stop_event):
             tripState, mainState, rearState = getMassStates(state)
 
             massEvent = {
+                "lane": lane,
                 "date": datetime.now(),
                 "trip": tripState,
                 "main": mainState,
@@ -193,6 +194,16 @@ def monitorNotifications(tn, stop_event):
 
             if LOG_READS:
                 sidraCore.appendFile(LOG_READS_FILE, json.dumps(massEvent, default=sidraCore.jsonConverter) + '\n')
+
+            try:
+                massFile = sidraCore.MASS_DIR + "/" + str(lane) + sidraCore.STATE_EXTENSION_MASS
+                #print(massFile)
+                sidraCore.writeFile(massFile, json.dumps(massEvent, default=sidraCore.jsonConverter))
+            except Exception as ex:
+                msg  = f"reader.monitorNotifications error writing mass file {lane} {str(ex)}"
+                print(msg)
+
+
 
     except Exception as ex:
         print("Exception in mass monitorNotifications:", ex)

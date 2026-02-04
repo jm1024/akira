@@ -8,6 +8,7 @@ import psutil
 import json
 import glob
 import subprocess
+import shutil
 
 import sidraCore
 
@@ -24,7 +25,7 @@ intervals = (
 
 ##########################################
 def ping(host, timeoutMs=500):
-    
+
     try:
         result = subprocess.run(
             ["fping", "-c1", f"-t{timeoutMs}", host],
@@ -32,21 +33,21 @@ def ping(host, timeoutMs=500):
             stderr=subprocess.PIPE,
             text=True
         )
-    
+
         # fping prints results to stderr
         line = result.stderr.strip()
-    
+
         if result.returncode != 0:
             return 0
-    
+
         # Extract avg latency from: "min/avg/max = A/B/C"
         if "min/avg/max" in line:
             stats = line.split("min/avg/max = ")[1]
             avgLatency = stats.split("/")[1]
             return float(avgLatency)
-    
+
         return 0
-    
+
     except Exception:
         return 0
 
@@ -136,6 +137,13 @@ def getCpu():
     return str(psutil.cpu_percent(.3)) + "%"
 
 ##########################################
+def getDiskFree():
+
+    bytes = shutil.disk_usage("/").free
+    megs = bytes / (1024 * 1024)
+    return round(megs)
+
+##########################################
 def clear():
 
         _ = os.system('clear')
@@ -201,9 +209,17 @@ def getAll(ipList):
     mcpQ = countFiles("/var/sidra/trn")
     img = countFiles("/var/sidra/img")
     du = getDirSize("/var/sidra/img")
+    df = getDiskFree()
     cpu = getCpu()
     epm, eph = getEventCounts()
     ups = getUps()
+
+    #mass sensor states
+    massSensors = []
+    for mass in sidraCore.massSensors:
+        print(mass.get("lane"))
+        thisState = sidraCore.massState(mass.get("lane"))
+        massSensors.append(thisState)
 
     data = {
         "pings": ipList,
@@ -215,9 +231,11 @@ def getAll(ipList):
         "xmitQ": xmitQ,
         "img": img,
         "du": du,
+        "df": df,
         "cpu": cpu,
         "epm": epm,
         "eph": eph,
+        "mass": massSensors,
         "ups": ups
     }
 

@@ -6,6 +6,7 @@ import datetime
 from icmplib import ping
 import psutil
 import json
+import uuid
 
 import sidraCore
 import monCore
@@ -15,3 +16,8 @@ ups = monCore.getUps()
 
 data = monCore.getAll(sidraCore.ipList)
 sidraCore.writeFile(monCore.MON_FILE, json.dumps(data, indent=2))
+
+#data['id'] = str(uuid.uuid4())
+#data['plaza'] = sidraCore.plazaId
+#data['op'] = "addMon"
+#sidraCore.queueXmit(json.dumps(data, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_MON)

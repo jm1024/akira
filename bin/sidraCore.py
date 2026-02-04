@@ -26,7 +26,8 @@ eventMargin = 8     #time margin for accepting events as together
 #raw config json
 config = {}
 
-#list of associated IPs
+#lists
+lanes = []
 ipList = []
 cams = []
 readers = []
@@ -73,6 +74,7 @@ QUEUE_EXTENSION_CAM = ".qc"
 QUEUE_EXTENSION_READER = ".qr"
 QUEUE_EXTENSION_LIDAR = ".ql"
 QUEUE_EXTENSION_EVENT = ".qe"
+QUEUE_EXTENSION_MON = ".qm"
 
 DEVICE_READER = "r"
 DEVICE_CAM_FRONT = "cf"
@@ -115,6 +117,7 @@ def loadConfig():
     global driversCam
     global driversXmit
     global driversServer
+    global lanes
     global ipList
     global cams
     global readers
@@ -143,19 +146,19 @@ def loadConfig():
     #drivers server
     if not cfg.get("driversServer") == None:
         driversServer = cfg.get("driversServer")
-        
+
     #drivers trans
     if not cfg.get("driversTrans") == None:
         driversTrans = cfg.get("driversTrans")
-        
+
     #drivers cam
     if not cfg.get("driversCam") == None:
         driversCam = cfg.get("driversCam")
-        
+
     #drivers xmit
     if not cfg.get("driversXmit") == None:
         driversXmit = cfg.get("driversXmit")
-        
+
     #servers
         if not cfg.get("servers") == None:
             cams = cfg.get("servers")
@@ -166,11 +169,15 @@ def loadConfig():
     # plaza id
     if not cfg.get("plazaId") == None:
         plazaId = cfg.get("plazaId")
-        
+
     # lane mode
     if not cfg.get("laneMode") == None:
         laneMode = cfg.get("laneMode")
-        
+
+    #ipList
+    if not cfg.get("lanes") == None:
+        lanes = cfg.get("lanes")
+
     #ipList
     if not cfg.get("ipList") == None:
         ipList = cfg.get("ipList")
@@ -397,42 +404,47 @@ def massLock(name):
 
 ###########################
 def massLockSet(name, value):
-    
+
     ret = True
-    
+
     output = json.dumps(value, default=jsonConverter)
-    
+
     fileName = MASS_DIR + "/" + name + STATE_EXTENSION_MASS_LOCK
     writeFile(fileName, output)
-    
+
     #print("MLS: " + str(output))
-    
+
     return ret
 
 ###########################
 def massState(name):
 
-    raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
-    ret = json.loads(raw)
+    ret = {}
+    try:
+        raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
+        ret = json.loads(raw)
+    except Exception as ex:
+        msg = f"sidraCore.massState() error: {ex}"
+        print(msg)
 
     return ret
 
 ###########################
 def massOccupied(name):
-    
+
     state = massState(name)
     #print("ST: " + str(state))
     occupied = True
-    
+
     for mass in massSensors:
         if name == mass['name']:
             trip = mass['trip']
             main = mass['main']
-            
+
     #if state.get(trip) == MASS_EMPTY and state.get(main) == MASS_EMPTY:
     if state.get(main) == MASS_EMPTY:
         occupied = False
-        
+
     return occupied
 
 ####################################################

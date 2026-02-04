@@ -26,33 +26,33 @@ def log(message):
 
 #############################
 def logResponse(msg):
-	
+
 	current = []
-	
+
 	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
-	
+
 	if not sidraCore.fileExist(responseFile):
 		current = []
 	else:
 		current = json.loads(sidraCore.readFile(responseFile))
-		
+
 	current.append(msg)
 
 	sidraCore.writeFile(responseFile, json.dumps(current))
-	
+
 #############################
 def writeResponse(msg):
-		
+
 	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + driverRts.EXT_RESPONSE
 	responseFile = driverRts.DATA_DIR + "/" + fileName
 	sidraCore.writeFile(responseFile, json.dumps(msg))
 
 #############################
 def sendAckAlive():
-	
+
 	id = str(uuid.uuid4())
 	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-	
+
 	ack = {
 		'header':{
 		'command':"IsAlive",
@@ -63,15 +63,15 @@ def sendAckAlive():
 		'hmac':"XXXX"
 		}
 	}
-		
+
 	sidraCore.writeFile(responseFile, json.dumps(ack))
 
 #############################
 def sendAckInitialize():
-	
+
 	id = str(uuid.uuid4())
 	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-	
+
 	ack = {
 		'header':{
 		'command':"InitializeReader",
@@ -82,15 +82,15 @@ def sendAckInitialize():
 		'hmac':"XXXX"
 		}
 	}
-		
+
 	sidraCore.writeFile(responseFile, json.dumps(ack))
 
 #############################
 def sendAckAbort():
-	
+
 	id = str(uuid.uuid4())
 	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-	
+
 	ack = {
 		'header':{
 		'command':"AbortReader",
@@ -101,52 +101,52 @@ def sendAckAbort():
 		'hmac':"XXXX"
 		}
 	}
-		
+
 	sidraCore.writeFile(responseFile, json.dumps(ack))
-	
+
 
 #############################
 def replaceTransId(fileName):
-	
+
 	pruneResponses(1)
-	
+
 	newTransId = ""
-	
-	print("serverRts.replaceTransId() - starting")
-	
+
+	#print("serverRts.replaceTransId() - starting")
+
 	try:
 		contents = json.loads(sidraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
-		
+
 		#if it's an ANPR
 		if contents['header']['command'] == "ANPRInfo":
 			#print("FTID")
 			newTransId = findTransId(contents['body']['TagID'])
 			contents['body']['AnprID'] = newTransId
-		
+
 			sidraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
-			
+
 			if DEBUG:
 				c2 = contents
 				c2['body']['AnprImage'] = ""
 				print("SENDING TRANSACTION TO RTS: " + str(c2))
-			
+
 	except Exception as ex:
 		print("Error serverRts.replaceTransId() " + str(ex))
 
 #############################
 def findTransId(tid):
-	
+
 	ret = ""
-	
+
 	responses = []
-	
+
 	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
-	
+
 	if sidraCore.fileExist(responseFile):
 		responses = json.loads(sidraCore.readFile(responseFile))
 	else:
 		print("serverRts.findTansId - no RTS response file")
-	
+
 	for msg in responses:
 		try:
 			if msg['header']['command'] == "TagResult":
@@ -156,12 +156,12 @@ def findTransId(tid):
 		except Exception as ex:
 			print("serverRts.findTansId - findTransId() " + str(ex))
 			pass
-				
+
 	return ret
 
 #############################
 def pruneResponses(maxAgeMinutes=10):
-	
+
 	"""
 	Remove response entries older than maxAgeMinutes based on header.timestamp.
 	Timestamp format expected: "YYYY-MM-DD HH:MM:SS[.ffffff]"
@@ -221,7 +221,7 @@ def broadcastFile(filePath, targetPorts=None):
 	Read a file and send its contents to all connected clients
 	on the given ports (or all ports if targetPorts is None).
 	"""
-	
+
 	ret = True
 	data = sidraCore.readFile(filePath)
 
@@ -243,7 +243,7 @@ def broadcastFile(filePath, targetPorts=None):
 	deadClients = []
 
 	with clientsLock:
-		print(targetPorts)
+		#print(targetPorts)
 		for port in targetPorts:
 			socketSet = clientsByPort.get(port, set())
 			for clientSocket in list(socketSet):
@@ -281,7 +281,7 @@ def handleClientMessage(clientSocket, clientAddr, port, data):
 		try:
 			if not text:
 				return  # nothing usable to parse
-		
+
 			msg = json.loads(text)
 			logResponse(msg)
 			writeResponse(msg)
@@ -297,10 +297,10 @@ def handleClientMessage(clientSocket, clientAddr, port, data):
 				sendAckInitialize()
 				driverRts.setEnable(True)
 				log("driverRts enabled via InitializeReader")
-			
+
 		except Exception as ex:
 			print("serverRts.handleClientMessage() " + str(ex))
-	
+
 	except Exception as e:
 		log(f"Error in handleClientMessage from {clientAddr} on port {port}: {e}")
 		traceback.print_exc()
@@ -417,10 +417,10 @@ def acceptConnections(serverSocket, port):
 
 #############################
 def main():
-	
+
 	#sendAckInitialize()
 	#sendAckAbort()
-	
+
 	serverSockets = []
 
 	# create listeners for all ports

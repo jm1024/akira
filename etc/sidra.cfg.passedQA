@@ -30,9 +30,9 @@
         "slowMaxReportAge":"1000",
         "slowTrigger":"rear",
         "fastPre":"-500",
-        "fastPost":"500",
+        "fastPost":"300",
         "slowPre":"-500",
-        "slowPost":"3000",
+        "slowPost":"300",
         "antennas":[
         {"number":1, "lane":"08ME", "side":"fast", "power":"320"},
         {"number":2, "lane":"08ME", "side":"slow", "power":"290"}
@@ -40,15 +40,11 @@
     ],
 "cams":
     [
-        {"name":"e8.cam","ip":"10.3.1.40","lane":"08ME","leftPos":4,"rightPos":0,"resX":2448,"resY":2048,"facing":"front","skew":0}
+        {"name":"e8.cam","ip":"10.3.1.40","lane":"08ME","leftPos":3,"rightPos":0,"resX":2448,"resY":2048,"facing":"front","skew":0}
     ],
 "massSensors":
     [
         {"name":"e8.m1","ip":"10.3.1.81","lane":"08ME","trip":"108","main":"100","rear":"101"}
-    ],
-"lanes":
-    [
-        {"name":"08ME"}
     ],
 "ipList":
     [
