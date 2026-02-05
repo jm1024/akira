@@ -23,6 +23,8 @@ DEBUG_XMIT = False
 
 TAG_AUTHENTIC = "AUTHENTIC"
 
+RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "03":"Insufficient Balance", "04":"Suspended Tag", "05":"Terminated Tag", "06":"Not Registered Tag", "07":"Last Detected Tag", "99":"Others", }
+
 #############################
 def setEnable(state = True):
 	sidraCore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
@@ -102,12 +104,16 @@ def parseResponses(responses):
 			if response["body"]["Result"] == "07":
 				continue
 
+			thisResponseName =  RTS_CODES.get(response["body"]["Result"],"Unknown")
+
 			new = {
+				"id":str(uuid.uuid4())
 				"type":"tagResult",
 				"tid":response["body"]["TagID"],
 				"date":response["header"]["timestamp"],
 				"valid":valid,
-				"resultCode":response["body"]["Result"],
+				"code":response["body"]["Result"],
+				"name": thisResponseName,
 				"plaza":response["body"]["PlazaID"],
 				"lane":response["body"]["LaneID"],
 				"plate":response["body"]["RegPlateNum"]
@@ -294,7 +300,7 @@ def trans_DISABLED(data):
 
 
 ######################
-def noTag(lane):
+def noTag(lane, antenna):
 
 	#check wether RTS wants akira data
 	if not getEnable():
@@ -316,6 +322,7 @@ def noTag(lane):
 		'PlazaID':str(sidraCore.plazaId),
 		'LaneID':str(lane),
 		'Result':"00",
+		'Antenna':str(antenna),
 		'DetectedTime':None,
 		},
 		'hmac':"XXXX"
@@ -435,7 +442,7 @@ def cam(data):
 		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
 
 ######################
-def genFakeTagResponse_X(tid):
+def genFakeTagResponse(tid):
 
 	#00 = good
 	#01 = zero balance

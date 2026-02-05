@@ -57,7 +57,7 @@ READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
 
 #reader killswitch
-READER_ENABLED = True
+READER_ENABLED = False
 
 #time to squelch reads that have been sent
 MULTI_POOL_SQUELCH = True
@@ -108,7 +108,7 @@ LOG_EVENTS = True
 LOG_EVENTS_FILE = "/var/sidra/log/events.log"
 
 #detailed log # of reads etc
-LOG_STATS = False
+LOG_STATS = True
 LOG_STATS_FILE = "/var/sidra/log/stats.log"
 
 #log all reads
@@ -996,6 +996,10 @@ def laneThread(stop_event):
                 if DEBUG_DRIVER_RESPONSES:
                     print(response)
                 if response['type'] == "tagResult":
+                    #send response to sidraApi
+                    response['op'] = "addResponse"
+                    sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
+
                     if lastFastGood:
                         if response['tid'] == lastFastTid and response['valid']:
                             lastLastFastValid = lastFastValid
@@ -1144,7 +1148,7 @@ def laneThread(stop_event):
                 if DEBUG_DRIVER:
                     print("running driver: " + str(driverName))
                 if hasattr(driverModule, "noTag"):
-                    driverModule.noTag(lane)
+                    driverModule.noTag(lane, ANTENNA_FAST)
         if fastExpired:
             print(f"slowExpired used: {slowWindow['used']} - end: {slowWindow['end'].time()} {datetime.now().time()}")
             slowWindow = resetWindow("slow - expired")
@@ -1153,7 +1157,7 @@ def laneThread(stop_event):
                 if DEBUG_DRIVER:
                     print("running driver: " + str(driverName))
                 if hasattr(driverModule, "noTag"):
-                    driverModule.noTag(lane)
+                    driverModule.noTag(lane, ANTENNA_SLOW)
 
         #clean old RF events
         cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
