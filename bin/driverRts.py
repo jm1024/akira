@@ -23,7 +23,7 @@ DEBUG_XMIT = False
 
 TAG_AUTHENTIC = "AUTHENTIC"
 
-RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "03":"Insufficient Balance", "04":"Suspended Tag", "05":"Terminated Tag", "06":"Not Registered Tag", "07":"Last Detected Tag", "99":"Others", }
+RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "02":"Insufficient Balance", "03":"Ivalid Tag", "04":"Suspended Tag", "05":"Terminated Tag", "06":"Not Registered Tag", "07":"Last Detected Tag", "99":"Others", }
 
 #############################
 def setEnable(state = True):
@@ -107,7 +107,7 @@ def parseResponses(responses):
 			thisResponseName =  RTS_CODES.get(response["body"]["Result"],"Unknown")
 
 			new = {
-				"id":str(uuid.uuid4())
+				"id":str(uuid.uuid4()),
 				"type":"tagResult",
 				"tid":response["body"]["TagID"],
 				"date":response["header"]["timestamp"],
@@ -196,7 +196,7 @@ def read(data):
 
 	else:
 		print("driverRts.read() INAUTHENTIC TAG")
-		thisExt = EXT_TRANS
+		thisExt = EXT_READ
 		contents = {
 			"header": {
 				"command": "NoTagDetected",
@@ -307,6 +307,8 @@ def noTag(lane, antenna):
 		print("driverRts.noTag() akira is disabled, aborting")
 		return
 
+	#print("NO TAG DETECTED driverRts")
+
 	msgNTD = ""
 	transId = str(uuid.uuid4())
 
@@ -329,7 +331,7 @@ def noTag(lane, antenna):
 		}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
 
 ######################
 def laneClear(lane):
@@ -442,7 +444,7 @@ def cam(data):
 		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
 
 ######################
-def genFakeTagResponse(tid):
+def genFakeTagResponse_X(tid):
 
 	#00 = good
 	#01 = zero balance

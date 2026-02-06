@@ -25,6 +25,11 @@ for driver in sidraCore.driversRead:
     readDrivers[driver] = importlib.import_module(driver)
     print("Loaded read driver: " + driver)
 
+
+#reader killswitch
+READER_ENABLED = True
+
+
 #read window settings
 fastPre = 0
 fastPost = 0
@@ -33,17 +38,8 @@ slowPost = 0
 maxReportAge = 0
 minReads = 0
 slowTrigger = "main"
-#WINDOW_FAST_PRE = -500
-#WINDOW_FAST_POST = 250
-#WINDOW_SLOW_PRE = 600
-#WINDOW_SLOW_POST = 30000
 
 UNLOCK_LOCKOUT = 1500 # <----------- JM USE THIS
-
-#minimum number of report reads to accept as valid
-#MIN_READS = 5
-#max age in seconds for reports before they get flushed
-#MAX_REPORT_AGE = 5
 
 #lane
 lane = ""
@@ -55,9 +51,6 @@ antennas = []
 
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
-
-#reader killswitch
-READER_ENABLED = False
 
 #time to squelch reads that have been sent
 MULTI_POOL_SQUELCH = True
@@ -127,7 +120,7 @@ arrivals = {}
 reports = []
 squelch = []
 
-
+#queues
 rfQ = queue.Queue(maxsize=5000)
 massQ = queue.Queue(maxsize=5000)
 
@@ -997,7 +990,8 @@ def laneThread(stop_event):
                     print(response)
                 if response['type'] == "tagResult":
                     #send response to sidraApi
-                    response['op'] = "addResponse"
+                    response['op'] = "addResp"
+                    #print("XMIT RESP PREP")
                     sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
 
                     if lastFastGood:
