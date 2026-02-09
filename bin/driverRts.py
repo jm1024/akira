@@ -16,7 +16,7 @@ EXT_RESPONSE = ".rts-resp"
 
 RESPONSE_FILE = "response.log"
 
-OVERRIDE_AUTH = False
+OVERRIDE_AUTH = True
 
 DEBUG = False
 DEBUG_XMIT = False
@@ -166,8 +166,13 @@ def read(data):
 	authentic = data['tidAuthentic']
 	#JM hardwire authentic for now
 	if OVERRIDE_AUTH:
-		authentic == "AUTHENTIC"
+		if not authentic == TAG_AUTHENTIC:
+			print("driverRts - overrideAuth")
+		authentic = TAG_AUTHENTIC
 	#print("AUTHENTIC? " + str(authentic))
+
+	#hard auth
+	#authentic = TAG_AUTHENTIC
 
 	thisExt = EXT_READ
 
@@ -194,6 +199,7 @@ def read(data):
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
 
+
 	else:
 		print("driverRts.read() INAUTHENTIC TAG")
 		thisExt = EXT_READ
@@ -218,6 +224,8 @@ def read(data):
 			sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
+
+
 
 	"""
 	tData = {

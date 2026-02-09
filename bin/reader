@@ -71,7 +71,7 @@ frequency = "919250" # loaded from sidra.cfg
 
 DEBUG = True
 DEBUG_READER_RECV = False
-DEBUG_READER_COMM = False
+DEBUG_READER_COMM = True
 DEBUG_EVENTS = False
 DEBUG_RAW_ARRIVE = False
 DEBUG_ARRIVE = False
@@ -372,6 +372,14 @@ def getMassStates(current):
     #print(current)
     trip = current[massPinTrip]
     main = current[massPinMain]
+    #print(f"main {main}")
+
+    # EMERGENCY PATCH - UNDO - JM
+    #main = 0
+    #print(f"MAIN ACTUAL {current[massPinMain]}")
+    #main = current[massPinRear]
+    # END EMERGENCY PATCH
+
     rear = current[massPinRear]
 
     return trip, main, rear
@@ -988,6 +996,15 @@ def laneThread(stop_event):
             for response in responses:
                 if DEBUG_DRIVER_RESPONSES:
                     print(response)
+                    if LOG_EVENTS:
+                        try:
+                            if response['type'] == "tagResult":
+                                out = f">>> {response['tid']} code: {response['code']} {response['valid']}"
+                                sidraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
+                        except Exception as ex:
+                            print(f"reader.laneThread() error logging response {str(ex)}")
+
+
                 if response['type'] == "tagResult":
                     #send response to sidraApi
                     response['op'] = "addResp"
@@ -1797,6 +1814,7 @@ ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
 #ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.raw_arrive)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.report)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.depart)")
+#ret = xrCmd("reader.events.register(" + str(id) + ",event.status.return_loss)")
 print("----------------------------------------")
 
 ####################
