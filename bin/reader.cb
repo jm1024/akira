@@ -25,11 +25,10 @@ for driver in sidraCore.driversRead:
     readDrivers[driver] = importlib.import_module(driver)
     print("Loaded read driver: " + driver)
 
-#version
-VERSION = "1.00.00"
 
 #reader killswitch
 READER_ENABLED = True
+
 
 #read window settings
 fastPre = 0
@@ -56,7 +55,6 @@ READER_EVENT_PORT = 50008
 #time to squelch reads that have been sent
 MULTI_POOL_SQUELCH = True
 SQUELCH_TIME = 5000
-SQUELCH_DISABLE = False
 
 tagFilter = ""
 auth = True
@@ -1399,9 +1397,6 @@ def removeReports(tid, side):
 #######################
 def addSquelch(tid, side, duration):
 
-    if SQUELCH_DISABLE:
-        return
-
     global squelch
 
     if not isSquelched(tid, side):
@@ -1727,18 +1722,21 @@ if CONFIGURE:
     #ret - xrCmd("com.network.force_ntp_sync()")
     #ret = xrCmd("com.network.ntp_servers")
     ret = xrCmd("com.network.tcpkeepalive=1")
-    # depart_time was 250
     ret = xrCmd("tag.reporting.depart_time=1000")
+    ret = xrCmd("tag.reporting.report_fields=tag_id tid time antenna rssi")
+ 
     ret = xrCmd("tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid")
     ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
     ret = xrCmd("tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic")
     ret = xrCmd("tag.reporting.taglist_fields=tag_id time tid user_data time antenna repeat pw_authentic tid_authentic")
-    ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("setup.advanced.do_opspecs_once=0")
+    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi")
+    ret = xrCmd("setup.advanced.do_opspecs_once=1")
     ret = xrCmd("antennas.mux_sequence=0")
+    
+# cb    ret = xrCmd("modem.control.cognitive.auto_mux=1")
+# I don't know what this does so disabling.
     ret = xrCmd("modem.control.cognitive.auto_mux=0")
-
+    
     ret = xrCmd("modem.protocol.isoc.control.user_data_length=8")
     ret = xrCmd("modem.protocol.isoc.control.tid_data_length=6")
     ret = xrCmd("modem.protocol.isoc.filter.1.action=ASSERT_DEASSERT")
@@ -1751,64 +1749,52 @@ if CONFIGURE:
     ret = xrCmd("modem.protocol.isoc.filtering.enabled=1")
     ret = xrCmd("modem.protocol.isoc.filter.1.enabled=true")
     ret = xrCmd("modem.protocol.isoc.control.use_block_write=false")
-
+    
+# cb old    ret = xrCmd("modem.protocol.isoc.control.auto_mac.enable=true")
+# must disable this to have our settings work
     ret = xrCmd("modem.protocol.isoc.control.auto_mac.enable=false")
+
+# cb    ret = xrCmd("modem.protocol.isoc.control.inventory_both_targets=false")
+# this will hit both a and b states of a tag vs locking on a only
     ret = xrCmd("modem.protocol.isoc.control.inventory_both_targets=true")
+    
     ret = xrCmd("modem.protocol.isoc.control.query_sel=0")
     ret = xrCmd("modem.protocol.isoc.control.query_session=0")
+    
+# cb    ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
+#   This is superflous if we do both targets
+
     ret = xrCmd("modem.protocol.isoc.control.session_id=SESSION_1")
-
-    #ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
-
-    #authentication
-    if auth:
+    AUTH = False
+    if AUTH:
         ret = xrCmd("tag.security.password_authentication_enable=1")
         ret = xrCmd("tag.security.tid_authentication_enable=1")
     else:
         ret = xrCmd("tag.security.password_authentication_enable=0")
         ret = xrCmd("tag.security.tid_authentication_enable=0")
-
     ret = xrCmd("tag.security.tid_mask.enable=0")
-
-    #frequency
-    ret = xrCmd("setup.advanced.preferred_frequencies=" + str(frequency))
-    #ret = xrCmd("setup.advanced.preferred_frequencies=919250,919750,920250,920750,921250,921750,922250,922750")
-
-
-    #HOPPING MODE config
+    ret = xrCmd("antennas.1.conducted_power=310")
+    ret = xrCmd("antennas.2.conducted_power=310")
+    ret = xrCmd("antennas.3.conducted_power=310")
+    ret = xrCmd("antennas.4.conducted_power=310")
+    
+    # setup hops 
+# with clear channel yarr
+#    ret = xrCmd("setup.advanced.preferred_frequencies=918250 919250 919750 920250 920750 921250 921750 922250 922750")
+    ret = xrCmd("setup.advanced.preferred_frequencies=919250 919750 920250 920750 921250 921750 922250 922750")
     ret = xrCmd("modem.control.cognitive.lbt_max_hops=8")
 
 
-    #antenna power config
-    thisAntenna = 0
-    for antenna in antennas:
-        thisAntenna = antenna['number']
-        thisPower = antenna.get('power',"")
-        if thisPower == "":
-            thisPower = power
-        thisCmd = "antennas." + str(thisAntenna) + ".conducted_power=" + thisPower
-        ret = xrCmd(thisCmd)
-
-    #mode
-    ret = xrCmd("modem.protocol.isoc.physical.mode=" + str(mode))
     #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
+    ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
+    #ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
+    ret = xrCmd("tag.reporting.arrive_generation=no_wait")
+    ret = xrCmd("reader.profile.save(MalaysiaMLFF)")
+    ret = xrCmd("setup.operating_mode=active")
+    
 
-    #wait for auth/tid on arrival
-    if authWait:
-        ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
-    else:
-        if tidWait:
-            ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
 
-    ret = xrCmd("reader.profile.save(MalaysiaSLFF)")
-
-    #killswitch
-    if READER_ENABLED:
-        ret = xrCmd("setup.operating_mode=active")
-
-#ret = xrCmd("reader.profile.show_running_config()")
+ret = xrCmd("reader.profile.show_running_config()")
 
 #get the event channel
 event = recvEvent()
