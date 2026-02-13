@@ -1721,14 +1721,12 @@ if CONFIGURE:
     #ret = xrCmd("version.detail")
     ret = xrCmd("antennas.detected")
     ret = xrCmd("reader.timestamp_all_events=True")
-    #ret = xrCmd("tag.reporting.arrive_fields=tag_id antenna rssi tid time")
-    #ret = xrCmd("com.network.ntp_servers=time.google.com")
     ret = xrCmd("com.network.ntp.enabled=1")
+    #ret = xrCmd("com.network.ntp_servers=time.google.com")
     #ret - xrCmd("com.network.force_ntp_sync()")
     #ret = xrCmd("com.network.ntp_servers")
     ret = xrCmd("com.network.tcpkeepalive=1")
-    # depart_time was 250
-    ret = xrCmd("tag.reporting.depart_time=1000")
+    ret = xrCmd("tag.reporting.depart_time=1000") #was 250
     ret = xrCmd("tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid")
     ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
     ret = xrCmd("tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic")
@@ -1791,9 +1789,6 @@ if CONFIGURE:
 
     #mode
     ret = xrCmd("modem.protocol.isoc.physical.mode=" + str(mode))
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_320_MILLER4")
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_640_MILLER2")
-    #ret = xrCmd("modem.protocol.isoc.physical.mode= C1G2_MODE_256_MILLER2")
 
     #wait for auth/tid on arrival
     if authWait:
@@ -1815,8 +1810,8 @@ event = recvEvent()
 i1 = event.find('event.connection id =') + len('event.connection id =')
 id = int(event[i1:])
 
-ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
 #ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.raw_arrive)")
+ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.report)")
 ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.depart)")
 #ret = xrCmd("reader.events.register(" + str(id) + ",event.status.return_loss)")
