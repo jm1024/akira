@@ -6,9 +6,9 @@ USER = b"admin"
 PASS = b"admin"
 PORT = 23
 
-RELAY_INDEX = 1  # change to 1 if firmware is 1-based
+RELAY_INDEX = "000"  # change to 1 if firmware is 1-based
 
-
+#######################
 def state_to_cmd(s: str) -> bytes:
     v = s.strip().lower()
     if v in ("1", "on", "true", "high"):
@@ -17,7 +17,7 @@ def state_to_cmd(s: str) -> bytes:
         return b"off"
     raise ValueError("state must be 0/1 or off/on")
 
-
+##############################################
 def main() -> int:
     if len(sys.argv) != 3:
         print("Usage: readerSwitch <ip> <state>", file=sys.stderr)
@@ -67,6 +67,6 @@ def main() -> int:
     tn.close()
     return 0
 
-
+##############################################
 if __name__ == "__main__":
     raise SystemExit(main())

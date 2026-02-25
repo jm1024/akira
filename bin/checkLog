@@ -27,7 +27,7 @@ def main() -> int:
     missing = []
 
     for tid, c in counts.items():
-        if c["fast"] == 0 or c["slow"] == 0:
+        if c["fast"] == 0: # or c["slow"] == 0:
             missing.append((tid, c["fast"], c["slow"]))
 
     missing.sort()

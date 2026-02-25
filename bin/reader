@@ -454,6 +454,7 @@ def parseEvent(event):
         userData = ""
         tidAuthentic = ""
         pwAuthentic = ""
+        freq = ""
 
         for val in vals:
             d = val.split('=')
@@ -482,6 +483,9 @@ def parseEvent(event):
             if d[0] == "pw_authentic":
                 pwAuthentic = d[1]
                 pwAuthentic = pwAuthentic.strip(',')
+            if d[0] == "freq":
+                freq = d[1]
+                freq = freq.strip(',')
 
         try:
             if len(tid) > 24:
@@ -529,7 +533,7 @@ def parseEvent(event):
         #dtDate = sidraCore.rfStrToDt(date)
 
 
-        report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
+        report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
 
         #driver for fast read transmits to other systems
         #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
@@ -573,6 +577,7 @@ def parseEvent(event):
         userData = ""
         tidAuthentic = ""
         pwAuthentic = ""
+        freq = ""
 
         for val in vals:
             d = val.split('=')
@@ -605,6 +610,9 @@ def parseEvent(event):
             if d[0] == "pw_authentic":
                 pwAuthentic = d[1]
                 pwAuthentic = pwAuthentic.strip(',')
+            if d[0] == "freq":
+                freq = d[1]
+                freq = freq.strip(',')
 
         try:
             if len(tid) > 24:
@@ -617,7 +625,7 @@ def parseEvent(event):
         #date = sidraCore.rfStrToDt(sDate)
         date = datetime.now() # <--- JM GO BACK TO TITAN TIME
 
-        report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic}
+        report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
 
         if DEBUG_REPORT_TERSE:
         #    print("+++++++++++++++++++++++++")
@@ -1726,14 +1734,14 @@ if CONFIGURE:
     #ret - xrCmd("com.network.force_ntp_sync()")
     #ret = xrCmd("com.network.ntp_servers")
     ret = xrCmd("com.network.tcpkeepalive=1")
-    ret = xrCmd("tag.reporting.depart_time=1000") #was 250
+    ret = xrCmd("tag.reporting.depart_time=250") # operational setting was 1000
     ret = xrCmd("tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid")
     ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
     ret = xrCmd("tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic")
     ret = xrCmd("tag.reporting.taglist_fields=tag_id time tid user_data time antenna repeat pw_authentic tid_authentic")
     ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("setup.advanced.do_opspecs_once=0")
+    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic freq")
+    ret = xrCmd("setup.advanced.do_opspecs_once=1") # operational setting was 0
     ret = xrCmd("antennas.mux_sequence=0")
     ret = xrCmd("modem.control.cognitive.auto_mux=0")
 
@@ -1755,6 +1763,10 @@ if CONFIGURE:
     ret = xrCmd("modem.protocol.isoc.control.query_sel=0")
     ret = xrCmd("modem.protocol.isoc.control.query_session=0")
     ret = xrCmd("modem.protocol.isoc.control.session_id=SESSION_1")
+
+    #monday messing around
+    ret = xrCmd("modem.protocol.isoc.control.number_slots_q=2")
+    ret = xrCmd("modem.protocol.isoc.control.failsafe=31")
 
     #ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
 
