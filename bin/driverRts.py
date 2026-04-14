@@ -28,6 +28,7 @@ RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "02":"Insufficient Balance",
 #############################
 def setEnable(state = True):
 	try:
+		#sidraCore.log(f"{datetime.now()} driverRts.setEnable() {str(state)}") # test this!
 		sidraCore.log("driverRts.setEnable() " + str(state))
 	except Exception as ex:
 		print("driverRts.setEnable() error " + str(ex))

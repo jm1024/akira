@@ -863,11 +863,7 @@ def rfThread(stop_event):
 
     while not stop_event.is_set():
         event = recvEvent()
-        #rfQ.put(event)
-        try:
-            rfQ.put(event, timeout=0.05)
-        except queue.Full:
-            print("rfQ FULL - laneThread not draining?")
+        rfQ.put(event)
 
 #######################
 def massThread(stop_event):
@@ -950,282 +946,275 @@ def laneThread(stop_event):
     massUpdated = False
 
     while not stop_event.is_set():
+        updates = False
+        rfUpdated = False
+        massUpdated = False
 
-        try:
-            updates = False
-            rfUpdated = False
-            massUpdated = False
+        #receive rf updates
+        rfCount = 0
+        while True:
+            try:
+                event = rfQ.get_nowait()
+                if event is STOP:
+                    stop_event.set()
+                    return
+                #print("rf event:")
+                rfCount = rfCount +1
+            except queue.Empty:
+                break
 
-            #receive rf updates
-            rfCount = 0
-            while True:
-                try:
-                    event = rfQ.get_nowait()
-                    if event is STOP:
-                        stop_event.set()
-                        return
-                    #print("rf event:")
-                    rfCount = rfCount +1
-                except queue.Empty:
-                    break
+            parseEvent(event)
+            #print("laneThread received:")
+            rfUpdated = True
+            updates = True
+            rfQ.task_done()
 
-                parseEvent(event)
-                #print("laneThread received:")
-                rfUpdated = True
-                updates = True
-                rfQ.task_done()
+        #if rfCount > 0:
+        #    print("rfCount: " + str(rfCount))
 
-            #if rfCount > 0:
-            #    print("rfCount: " + str(rfCount))
+        #receive mass updates
+        while True:
+            try:
+                massEvent = massQ.get_nowait()
+                if massEvent is STOP:
+                    stop_event.set()
+                    return
+                #print("massEvent: " + str(massEvent))
+            except queue.Empty:
+                break
 
-            #receive mass updates
-            while True:
-                try:
-                    massEvent = massQ.get_nowait()
-                    if massEvent is STOP:
-                        stop_event.set()
-                        return
-                    #print("massEvent: " + str(massEvent))
-                except queue.Empty:
-                    break
+            massUpdated = True
+            updates = True
+            massQ.task_done()
 
-                massUpdated = True
-                updates = True
-                massQ.task_done()
+        # if no updates yield CPU
+        if not updates:
+            time.sleep(0.002)
 
-            # if no updates yield CPU
-            if not updates:
-                time.sleep(0.002)
+        #read responses from any enabled drivers
+        responses = []
+        for driverName, driverModule in readDrivers.items():
+            #print("XXX running driver: " + str(driverName))
+            if DEBUG_DRIVER:
+                print("running driver: " + str(driverName))
+            if hasattr(driverModule, "getResponses"):
+                responses = driverModule.getResponses()
 
-            #read responses from any enabled drivers
-            responses = []
-            for driverName, driverModule in readDrivers.items():
-                #print("XXX running driver: " + str(driverName))
-                if DEBUG_DRIVER:
-                    print("running driver: " + str(driverName))
-                if hasattr(driverModule, "getResponses"):
-                    responses = driverModule.getResponses()
-
-            #check responses for validation of last fast tag
-            if len(responses) > 0:
-                for response in responses:
-                    if DEBUG_DRIVER_RESPONSES:
-                        print(response)
-                        if LOG_EVENTS:
-                            try:
-                                if response['type'] == "tagResult":
-                                    out = f">>> {response['tid']} code: {response['code']} {response['valid']}"
-                                    sidraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
-                            except Exception as ex:
-                                print(f"reader.laneThread() error logging response {str(ex)}")
+        #check responses for validation of last fast tag
+        if len(responses) > 0:
+            for response in responses:
+                if DEBUG_DRIVER_RESPONSES:
+                    print(response)
+                    if LOG_EVENTS:
+                        try:
+                            if response['type'] == "tagResult":
+                                out = f">>> {response['tid']} code: {response['code']} {response['valid']}"
+                                sidraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
+                        except Exception as ex:
+                            print(f"reader.laneThread() error logging response {str(ex)}")
 
 
-                    if response['type'] == "tagResult":
-                        #send response to sidraApi
-                        response['op'] = "addResp"
-                        #print("XMIT RESP PREP")
-                        sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
+                if response['type'] == "tagResult":
+                    #send response to sidraApi
+                    response['op'] = "addResp"
+                    #print("XMIT RESP PREP")
+                    sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
 
-                        if lastFastGood:
-                            if response['tid'] == lastFastTid and response['valid']:
-                                lastLastFastValid = lastFastValid
-                                lastFastValid = True
-                                if DEBUG_DRIVER_RESPONSES:
-                                    print(f"VALIDATED {response['tid']}")
+                    if lastFastGood:
+                        if response['tid'] == lastFastTid and response['valid']:
+                            lastLastFastValid = lastFastValid
+                            lastFastValid = True
+                            if DEBUG_DRIVER_RESPONSES:
+                                print(f"VALIDATED {response['tid']}")
 
-            # if mass has changed state - set windows
-            if massUpdated:
-                massTrip = int(massEvent.get("trip",-1))
-                massMain = int(massEvent.get("main",-1))
-                massRear = int(massEvent.get("rear",-1)) # massEvent.get("rear",-1) <- JM CHANGE WHEN REAR IS ENABLED
-                massDate = datetime.now()
-
-                #################
-                #all sensors clear
-                if massMain == 0 and massTrip == 0 and massRear == 0:
-                    if datetime.now() > lastMass['tripLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT) and datetime.now() > lastMass['mainLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT):
-                        fastWindow = resetWindow(f"fast - lane clear {massTrip}{massMain}{massRear}")
-                        slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
-                        lastMass["lastUnlocked"] = datetime.now()
-                        #laneClear messages
-                        for driverName, driverModule in readDrivers.items():
-                            if DEBUG_DRIVER:
-                                print("running driver: " + str(driverName))
-                            if hasattr(driverModule, "laneClear"):
-                                driverModule.laneClear(lane)
-                    else:
-                        lastMass['unlockLockout'] = True
-                        print(f"unlock lockout {massTrip} {massMain} {massRear}")
-
-                #################
-                #if theres a change in trip
-                if massTrip == 1 and not massTrip == lastMass['trip']:
-
-                    #print(f"LFG: {lastFastTid} {lastFastGood} {lastFastValid}")
-
-                    #check for Fast Flow - if previous fast was good
-                    if lastFastGood and lastFastValid:
-                        begin = massDate + timedelta(milliseconds=fastPre)
-                        end   = massDate + timedelta(milliseconds=fastPost)
-                        print(f" -= FAST FLOW ON =-")
-                        fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
-                        lastFastGood = False
-                        lastFastTid = "NONE"
-                        lastFastValid = False
-                    elif massMain == 0 and massRear == 0:
-                    #if slow and rear are clear
-                        print(f" READING - NO FAST FLOW -lfv:{lastFastValid} llfv:{lastLastFastValid}")
-                        begin = massDate + timedelta(milliseconds=fastPre)
-                        end   = massDate + timedelta(milliseconds=fastPost)
-                        fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
-                    else:
-                        print(f" NOT READING FAST {massTrip}{massTrip}{massRear}")
-
-                #################
-                #if theres a change in main
-                #if massMain == 1 and lastMass['main'] == 0:
-                    #print("LOCK SLOW")
-                #    slowWindow = lockWindow(f"slow - main sensor {massTrip}{massMain}{massRear}")
-
-                #################
-                #if theres a change in rear
-                if massRear == 1 and lastMass['rear'] == 0:
-                    begin = massDate + timedelta(milliseconds=slowPre)
-                    end   = massDate + timedelta(milliseconds=slowPost)
-                    #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                    slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
-
-
-                # save current state as last state
-                lastMass["trip"] = massTrip
-                lastMass["main"] = massMain
-                lastMass["rear"] = massRear
-                lastMass["updated"] = massDate
-                lastMass["unlockLockout"] = False
-                if not lastMass['trip'] == massTrip:
-                    lastMass['tripLast'] = datetime.now()
-                if not lastMass['main'] == massMain:
-                    lastMass['mainLast'] = datetime.now()
-                if not lastMass['rear'] == massRear:
-                    lastMass['rearLast'] = datetime.now()
-
-
-                if DEBUG_MASS:
-                    debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+        # if mass has changed state - set windows
+        if massUpdated:
+            massTrip = int(massEvent.get("trip",-1))
+            massMain = int(massEvent.get("main",-1))
+            massRear = int(massEvent.get("rear",-1)) # massEvent.get("rear",-1) <- JM CHANGE WHEN REAR IS ENABLED
+            massDate = datetime.now()
 
             #################
-            #check fast zone
-            read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
-            if not read == None:
-
-                #re-open fast antenna
-                fastWindow = resetWindow(f"fast - read accepted  {massTrip}{massMain}{massRear}")
-                lastFastGood = True
-                lastFastTid = read['tid']
-                lastFastValid = False
-
-                sendRead(read)
-
-                #squelch
-                addSquelch(read['tid'], read['side'], SQUELCH_TIME)
-
-                #flushReports(ANTENNA_FAST)
-                if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
-
-                #make a fake tag response - only for debugging
-                if GEN_FAKE_TAG_RESPONSE:
+            #all sensors clear
+            if massMain == 0 and massTrip == 0 and massRear == 0:
+                if datetime.now() > lastMass['tripLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT) and datetime.now() > lastMass['mainLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT):
+                    fastWindow = resetWindow(f"fast - lane clear {massTrip}{massMain}{massRear}")
+                    slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
+                    lastMass["lastUnlocked"] = datetime.now()
+                    #laneClear messages
                     for driverName, driverModule in readDrivers.items():
                         if DEBUG_DRIVER:
                             print("running driver: " + str(driverName))
-                        if hasattr(driverModule, "genFakeTagResponse"):
-                            responses = driverModule.genFakeTagResponse(read['tid'])
+                        if hasattr(driverModule, "laneClear"):
+                            driverModule.laneClear(lane)
+                else:
+                    lastMass['unlockLockout'] = True
+                    print(f"unlock lockout {massTrip} {massMain} {massRear}")
 
             #################
-            #check slow zone
-            read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
-            if not read == None:
+            #if theres a change in trip
+            if massTrip == 1 and not massTrip == lastMass['trip']:
 
-                #reset read window until lane clear
-                thisDate = datetime.now()
-                begin = thisDate + timedelta(milliseconds=slowPre)
-                end   = thisDate + timedelta(milliseconds=slowPost)
+                #print(f"LFG: {lastFastTid} {lastFastGood} {lastFastValid}")
+
+                #check for Fast Flow - if previous fast was good
+                if lastFastGood and lastFastValid:
+                    begin = massDate + timedelta(milliseconds=fastPre)
+                    end   = massDate + timedelta(milliseconds=fastPost)
+                    print(f" -= FAST FLOW ON =-")
+                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
+                    lastFastGood = False
+                    lastFastTid = "NONE"
+                    lastFastValid = False
+                elif massMain == 0 and massRear == 0:
+                #if slow and rear are clear
+                    print(f" READING - NO FAST FLOW -lfv:{lastFastValid} llfv:{lastLastFastValid}")
+                    begin = massDate + timedelta(milliseconds=fastPre)
+                    end   = massDate + timedelta(milliseconds=fastPost)
+                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
+                else:
+                    print(f" NOT READING FAST {massTrip}{massTrip}{massRear}")
+
+            #################
+            #if theres a change in main
+            #if massMain == 1 and lastMass['main'] == 0:
+                #print("LOCK SLOW")
+            #    slowWindow = lockWindow(f"slow - main sensor {massTrip}{massMain}{massRear}")
+
+            #################
+            #if theres a change in rear
+            if massRear == 1 and lastMass['rear'] == 0:
+                begin = massDate + timedelta(milliseconds=slowPre)
+                end   = massDate + timedelta(milliseconds=slowPost)
                 #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                #slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor") # JM MAYBE we want tis istead of reset???
-                slowWindow = resetWindow(f"slow - read accepted {massTrip}{massMain}{massRear}")
-                sendRead(read)
+                slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
 
-                #squelch
-                addSquelch(read['tid'], read['side'], SQUELCH_TIME)
 
-                #flushReports(ANTENNA_SLOW)
-                if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
+            # save current state as last state
+            lastMass["trip"] = massTrip
+            lastMass["main"] = massMain
+            lastMass["rear"] = massRear
+            lastMass["updated"] = massDate
+            lastMass["unlockLockout"] = False
+            if not lastMass['trip'] == massTrip:
+                lastMass['tripLast'] = datetime.now()
+            if not lastMass['main'] == massMain:
+                lastMass['mainLast'] = datetime.now()
+            if not lastMass['rear'] == massRear:
+                lastMass['rearLast'] = datetime.now()
 
-            #################
-            #check for expired windows
-            fastExpired = windowExpired(fastWindow)
-            slowExpired = windowExpired(slowWindow)
-            if fastExpired:
-                print(f"fastExpired used: {fastWindow['used']} - end: {fastWindow['end'].time()} {datetime.now().time()}")
-                fastWindow = resetWindow("fast - expired")
-                #noTag messages
-                for driverName, driverModule in readDrivers.items():
-                    if DEBUG_DRIVER:
-                        print("running driver: " + str(driverName))
-                    if hasattr(driverModule, "noTag"):
-                        driverModule.noTag(lane, ANTENNA_FAST)
-            if fastExpired:
-                print(f"slowExpired used: {slowWindow['used']} - end: {slowWindow['end'].time()} {datetime.now().time()}")
-                slowWindow = resetWindow("slow - expired")
-                #noTag messages
-                for driverName, driverModule in readDrivers.items():
-                    if DEBUG_DRIVER:
-                        print("running driver: " + str(driverName))
-                    if hasattr(driverModule, "noTag"):
-                        driverModule.noTag(lane, ANTENNA_SLOW)
 
-            #clean old RF events
-            cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
-            cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
-            #print(slowMaxReportAge)
-
-            #clean squelch list
-            if DEBUG_SQUELCH:
-                squelchCount = len(squelch)
-                if not squelchCount == lastSquelchCount:
-                    print(f"squelchCount: {squelchCount}")
-                lastSquelchCount = squelchCount
-            cleanSquelch()
-
-            #see if you need to break lockout
-            lockoutChanged, fastWindow, slowWindow = lockoutBreak(fastWindow, slowWindow, lastMass)
-            if lockoutChanged:
+            if DEBUG_MASS:
                 debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
 
-            #debug read stats
-            if DEBUG_READ_MONITOR or LOG_STATS:
-                fc, sc = countReports()
-                fcs = str(fc).rjust(4)
-                scs = str(sc).rjust(4)
+        #################
+        #check fast zone
+        read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
+        if not read == None:
 
-                if DEBUG_READ_MONITOR:
-                    print(f"{fcs}{scs} {datetime.now().time()}")
+            #re-open fast antenna
+            fastWindow = resetWindow(f"fast - read accepted  {massTrip}{massMain}{massRear}")
+            lastFastGood = True
+            lastFastTid = read['tid']
+            lastFastValid = False
 
-                if LOG_STATS:
-                    if not lastSc == sc or not lastFc == fc :
-                        if fcs == "   0":
-                            fcs = "   -"
-                        if scs == "   0":
-                            scs = "   -"
-                        sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
-                lastFc = fc
-                lastSc = sc
+            sendRead(read)
 
-        except Exception as ex:
-            print(f"laneThread crashed: {ex}")
-            traceback.print_exc()
-            sidraCore.log(f"laneThread crashed: {ex}")
+            #squelch
+            addSquelch(read['tid'], read['side'], SQUELCH_TIME)
+
+            #flushReports(ANTENNA_FAST)
+            if LOG_STATS:
+                sidraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
+
+            #make a fake tag response - only for debugging
+            if GEN_FAKE_TAG_RESPONSE:
+                for driverName, driverModule in readDrivers.items():
+                    if DEBUG_DRIVER:
+                        print("running driver: " + str(driverName))
+                    if hasattr(driverModule, "genFakeTagResponse"):
+                        responses = driverModule.genFakeTagResponse(read['tid'])
+
+        #################
+        #check slow zone
+        read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
+        if not read == None:
+
+            #reset read window until lane clear
+            thisDate = datetime.now()
+            begin = thisDate + timedelta(milliseconds=slowPre)
+            end   = thisDate + timedelta(milliseconds=slowPost)
+            #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
+            #slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor") # JM MAYBE we want tis istead of reset???
+            slowWindow = resetWindow(f"slow - read accepted {massTrip}{massMain}{massRear}")
+            sendRead(read)
+
+            #squelch
+            addSquelch(read['tid'], read['side'], SQUELCH_TIME)
+
+            #flushReports(ANTENNA_SLOW)
+            if LOG_STATS:
+                sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
+
+        #################
+        #check for expired windows
+        fastExpired = windowExpired(fastWindow)
+        slowExpired = windowExpired(slowWindow)
+        if fastExpired:
+            print(f"fastExpired used: {fastWindow['used']} - end: {fastWindow['end'].time()} {datetime.now().time()}")
+            fastWindow = resetWindow("fast - expired")
+            #noTag messages
+            for driverName, driverModule in readDrivers.items():
+                if DEBUG_DRIVER:
+                    print("running driver: " + str(driverName))
+                if hasattr(driverModule, "noTag"):
+                    driverModule.noTag(lane, ANTENNA_FAST)
+        if fastExpired:
+            print(f"slowExpired used: {slowWindow['used']} - end: {slowWindow['end'].time()} {datetime.now().time()}")
+            slowWindow = resetWindow("slow - expired")
+            #noTag messages
+            for driverName, driverModule in readDrivers.items():
+                if DEBUG_DRIVER:
+                    print("running driver: " + str(driverName))
+                if hasattr(driverModule, "noTag"):
+                    driverModule.noTag(lane, ANTENNA_SLOW)
+
+        #clean old RF events
+        cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
+        cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
+        #print(slowMaxReportAge)
+
+        #clean squelch list
+        if DEBUG_SQUELCH:
+            squelchCount = len(squelch)
+            if not squelchCount == lastSquelchCount:
+                print(f"squelchCount: {squelchCount}")
+            lastSquelchCount = squelchCount
+        cleanSquelch()
+
+        #see if you need to break lockout
+        lockoutChanged, fastWindow, slowWindow = lockoutBreak(fastWindow, slowWindow, lastMass)
+        if lockoutChanged:
+            debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+
+        #debug read stats
+        if DEBUG_READ_MONITOR or LOG_STATS:
+            fc, sc = countReports()
+            fcs = str(fc).rjust(4)
+            scs = str(sc).rjust(4)
+
+            if DEBUG_READ_MONITOR:
+                print(f"{fcs}{scs} {datetime.now().time()}")
+
+            if LOG_STATS:
+                if not lastSc == sc or not lastFc == fc :
+                    if fcs == "   0":
+                        fcs = "   -"
+                    if scs == "   0":
+                        scs = "   -"
+                    sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
+            lastFc = fc
+            lastSc = sc
 
 #######################
 def checkReads(window, side, minReads):

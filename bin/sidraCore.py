@@ -281,6 +281,8 @@ def trnPrefix():
 ###########################
 def log(msg, isError = False):
 
+    msg = str(datetime.now()) + " " + msg
+
     if isError:
         fileName = LOG_DIR + "/" + ERR_LOG_FILE
     else:
