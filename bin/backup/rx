@@ -1,0 +1,3 @@
+#!/bin/bash
+killall xmit
+./xmit -d

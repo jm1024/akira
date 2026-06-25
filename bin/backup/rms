@@ -1,0 +1,4 @@
+#!/bin/bash
+pkill -f mass
+echo "FFF"
+./massInit

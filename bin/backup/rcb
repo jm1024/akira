@@ -1,0 +1,6 @@
+#!/bin/bash
+clear
+pkill -f mass
+pkill -f reader.cb
+echo "------------ start rcb -----------"
+/var/sidra/bin/reader.cb e8.r1

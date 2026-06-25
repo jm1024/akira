@@ -1,0 +1,7 @@
+#!/usr/bin/python3
+
+import sidraCore
+
+ret = sidraCore.decodeUserData(("0x0165007F000000000000000000000000"))
+
+print(ret)

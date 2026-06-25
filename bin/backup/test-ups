@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+
+import PyNUT
+ups    = PyNUT.PyNUTClient( host='127.0.0.1', login='upsadmin', password='passups' )
+result = ups.GetRWVars( ups='apc1' )
+print( result )

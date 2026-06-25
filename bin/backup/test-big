@@ -1,0 +1,3 @@
+#!/bin/bash
+cp /var/sidra/trn/done/* /var/sidra/trn
+chown james /var/sidra/trn/*

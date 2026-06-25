@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+import os
+import socket
+import threading
+import time
+import traceback
+import json
+import uuid
+from datetime import datetime, timedelta
+
+import sidraCore
+import driverRts
+
+PORTS = [2060, 2061] # kill 2215
+SCAN_INTERVAL_SECONDS = 0.01
+BUFFER_SIZE = 4096
+DEBUG = True
+
+clientsByPort = {port: set() for port in PORTS}
+clientsLock = threading.Lock()
+
+#############################
+def log(message):
+	if DEBUG:
+		print(message, flush=True)
+
+#############################
+def logResponse(msg):
+
+	current = []
+
+	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+
+	if not sidraCore.fileExist(responseFile):
+		current = []
+	else:
+		current = json.loads(sidraCore.readFile(responseFile))
+
+	current.append(msg)
+
+	sidraCore.writeFile(responseFile, json.dumps(current))
+
+#############################
+def writeResponse(msg):
+
+	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + driverRts.EXT_RESPONSE
+	responseFile = driverRts.DATA_DIR + "/" + fileName
+	sidraCore.writeFile(responseFile, json.dumps(msg))
+
+#############################
+def sendAckAlive():
+
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+
+	ack = {
+		'header':{
+		'command':"IsAlive",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
+		}
+	}
+
+	sidraCore.writeFile(responseFile, json.dumps(ack))
+
+#############################
+def sendAckInitialize():
+
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+
+	ack = {
+		'header':{
+		'command':"InitializeReader",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
+		}
+	}
+
+	sidraCore.writeFile(responseFile, json.dumps(ack))
+
+#############################
+def sendAckAbort():
+
+	id = str(uuid.uuid4())
+	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
+
+	ack = {
+		'header':{
+		'command':"AbortReader",
+		'timestamp':datetime.now().isoformat()
+		},
+		'body':{
+		'Result':"ACK",
+		'hmac':"XXXX"
+		}
+	}
+
+	sidraCore.writeFile(responseFile, json.dumps(ack))
+
+
+#############################
+def replaceTransId(fileName):
+
+	pruneResponses(1)
+
+	newTransId = ""
+
+	#print("serverRts.replaceTransId() - starting")
+
+	try:
+		contents = json.loads(sidraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
+
+		#if it's an ANPR
+		if contents['header']['command'] == "ANPRInfo":
+			#print("FTID")
+			newTransId = findTransId(contents['body']['TagID'])
+			contents['body']['AnprID'] = newTransId
+
+			sidraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
+
+			if DEBUG:
+				c2 = contents
+				c2['body']['AnprImage'] = ""
+				print("SENDING TRANSACTION TO RTS: " + str(c2))
+
+	except Exception as ex:
+		print("Error serverRts.replaceTransId() " + str(ex))
+
+#############################
+def findTransId(tid):
+
+	ret = ""
+
+	responses = []
+
+	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+
+	if sidraCore.fileExist(responseFile):
+		responses = json.loads(sidraCore.readFile(responseFile))
+	else:
+		print("serverRts.findTansId - no RTS response file")
+
+	for msg in responses:
+		try:
+			if msg['header']['command'] == "TagResult":
+				if msg['body']['TagID'] == tid:
+					ret = msg['body']['AnprID']
+					print("serverRts.findTansId - FOUND: " + str(msg['body']['AnprID']))
+		except Exception as ex:
+			print("serverRts.findTansId - findTransId() " + str(ex))
+			pass
+
+	return ret
+
+#############################
+def pruneResponses(maxAgeMinutes=10):
+
+	"""
+	Remove response entries older than maxAgeMinutes based on header.timestamp.
+	Timestamp format expected: "YYYY-MM-DD HH:MM:SS[.ffffff]"
+	"""
+	try:
+		responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
+
+		if not sidraCore.fileExist(responseFile):
+			return True  # nothing to prune
+
+		raw = sidraCore.readFile(responseFile)
+		if not raw:
+			return True  # empty file
+
+		responses = json.loads(raw)
+		if not isinstance(responses, list):
+			log(f"pruneResponses(): response file is not a list: {type(responses)}")
+			return False
+
+		cutoff = datetime.now() - timedelta(minutes=maxAgeMinutes)
+
+		kept = []
+		prunedCount = 0
+
+		for msg in responses:
+			try:
+				ts = msg.get("header", {}).get("timestamp")
+				if not ts:
+					kept.append(msg)
+					continue
+
+				# Accept both "...SS" and "...SS.ffffff"
+				# datetime.fromisoformat handles "YYYY-MM-DD HH:MM:SS.ffffff"
+				msgTime = datetime.fromisoformat(ts)
+
+				if msgTime >= cutoff:
+					kept.append(msg)
+				else:
+					prunedCount += 1
+			except Exception:
+				# If timestamp is malformed, keep the message (safer)
+				kept.append(msg)
+
+		if prunedCount:
+			sidraCore.writeFile(responseFile, json.dumps(kept))
+
+		log(f"pruneResponses(): pruned={prunedCount}, kept={len(kept)}")
+		return True
+
+	except Exception as ex:
+		print("Error serverRts.pruneResponses() " + str(ex))
+		return False
+
+#############################
+def broadcastFile(filePath, targetPorts=None):
+	"""
+	Read a file and send its contents to all connected clients
+	on the given ports (or all ports if targetPorts is None).
+	"""
+
+	ret = True
+	data = sidraCore.readFile(filePath)
+
+	if not data:
+		log(f"File {filePath} is empty, skipping broadcast")
+		return
+
+	# Ensure we always send bytes
+	if isinstance(data, str):
+		dataBytes = data.encode("utf-8")
+	else:
+		dataBytes = data  # assume it's already bytes
+
+	if targetPorts is None:
+		targetPorts = PORTS
+
+	log(f"Broadcasting file: {filePath} ({len(dataBytes)} bytes) to ports {targetPorts}")
+
+	deadClients = []
+
+	with clientsLock:
+		#print(targetPorts)
+		for port in targetPorts:
+			socketSet = clientsByPort.get(port, set())
+			for clientSocket in list(socketSet):
+				try:
+					log(f"Sending to client {clientSocket} on port {port}")
+					clientSocket.sendall(dataBytes)
+					ret = True
+				except Exception as e:
+					ret = False
+					log(f"Error sending to client {clientSocket} on port {port}: {e}")
+					deadClients.append((port, clientSocket))
+
+		for port, clientSocket in deadClients:
+			try:
+				clientSocket.close()
+			except Exception:
+				pass
+			if clientSocket in clientsByPort.get(port, set()):
+				clientsByPort[port].remove(clientSocket)
+			log(f"Removed dead client {clientSocket} from port {port}")
+
+	return ret
+
+#############################
+def handleClientMessage(clientSocket, clientAddr, port, data):
+
+	try:
+		text = None
+		try:
+			text = data.decode("utf-8", errors="replace")
+			log(f"serverRts from {clientAddr} on port {port}: {text!r}")
+		except Exception:
+			log(f"serverRts from {clientAddr} on port {port} (raw bytes): {data!r}")
+
+		try:
+			if not text:
+				return  # nothing usable to parse
+
+			msg = json.loads(text)
+			logResponse(msg)
+			writeResponse(msg)
+			command = msg.get('header', {}).get('command')
+
+			if command == "IsAlive":
+				sendAckAlive()
+			elif command == "AbortReader":
+				sendAckAbort()
+				driverRts.setEnable(False)
+				log("driverRts disabled via AbortReader")
+			elif command == "InitializeReader":
+				sendAckInitialize()
+				driverRts.setEnable(True)
+				log("driverRts enabled via InitializeReader")
+
+		except Exception as ex:
+			print("serverRts.handleClientMessage() " + str(ex))
+
+	except Exception as e:
+		log(f"Error in handleClientMessage from {clientAddr} on port {port}: {e}")
+		traceback.print_exc()
+
+
+#############################
+def clientLoop(clientSocket, clientAddr, port):
+	"""
+	Per-client thread: receive data from this client until it disconnects.
+	"""
+	log(f"Client thread started for {clientAddr} on port {port}")
+
+	with clientsLock:
+		clientsByPort[port].add(clientSocket)
+
+	try:
+		while True:
+			data = clientSocket.recv(BUFFER_SIZE)
+			if not data:
+				log(f"Client {clientAddr} disconnected from port {port}")
+				break
+
+			handleClientMessage(clientSocket, clientAddr, port, data)
+
+	except Exception as e:
+		log(f"Error in clientLoop for {clientAddr} on port {port}: {e}")
+		traceback.print_exc()
+
+	finally:
+		with clientsLock:
+			if clientSocket in clientsByPort.get(port, set()):
+				try:
+					clientSocket.close()
+				except Exception:
+					pass
+				clientsByPort[port].remove(clientSocket)
+		log(f"Client thread exiting for {clientAddr} on port {port}")
+
+
+#############################
+def watchDir():
+	"""
+	Watch driverRts.DATA_DIR for new files and broadcast them:
+
+		*.rts-r  -> only to clients on port 2060
+		*.rts-t  -> only to clients on port 2061
+
+	Anything else is skipped (but logged).
+	"""
+	if not os.path.isdir(driverRts.DATA_DIR):
+		log(f"Stream directory {driverRts.DATA_DIR} does not exist, creating it")
+		try:
+			os.makedirs(driverRts.DATA_DIR, exist_ok=True)
+		except Exception as e:
+			log(f"Failed to create directory {driverRts.DATA_DIR}: {e}")
+			return
+
+	log(f"Watching directory: {driverRts.DATA_DIR}")
+
+	while True:
+		try:
+			files = sorted(os.listdir(driverRts.DATA_DIR))
+
+			for fileName in files:
+				filePath = os.path.join(driverRts.DATA_DIR, fileName)
+				if not os.path.isfile(filePath):
+					continue
+
+				# Decide which port(s) to send to based on suffix
+				if fileName.endswith(".rts-r"):
+					targetPorts = [2060]
+				elif fileName.endswith(".rts-t"):
+					targetPorts = [2061]
+					replaceTransId(fileName) #replace transaction id if possible with transId from previous responses
+				else:
+					#log(f"Skipping file with unknown RTS suffix: {fileName}")
+					continue
+
+				if broadcastFile(filePath, targetPorts=targetPorts):
+
+					# delete the file immediately
+					try:
+						os.remove(filePath)
+						log(f"Deleted file: {filePath}")
+					except Exception as e:
+						log(f"Error deleting file {filePath}: {e}")
+						traceback.print_exc()
+				else:
+					log("Error sending file")
+
+		except Exception as e:
+			log(f"Error while watching directory: {e}")
+			traceback.print_exc()
+
+		time.sleep(SCAN_INTERVAL_SECONDS)
+
+
+#############################
+def acceptConnections(serverSocket, port):
+	"""Accept incoming TCP connections on a given socket and spawn a thread for each client."""
+	log(f"Server listening on port {port}")
+	while True:
+		clientSocket, clientAddr = serverSocket.accept()
+		log(f"New client connected from {clientAddr} on port {port}")
+		clientSocket.setblocking(True)
+
+		t = threading.Thread(
+			target=clientLoop,
+			args=(clientSocket, clientAddr, port),
+			daemon=True
+		)
+		t.start()
+
+
+#############################
+def main():
+
+	#sendAckInitialize()
+	#sendAckAbort()
+
+	serverSockets = []
+
+	# create listeners for all ports
+	for port in PORTS:
+		serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		serverSocket.bind(("", port))
+		serverSocket.listen(5)
+		serverSockets.append((serverSocket, port))
+
+	# start directory watcher
+	watcherThread = threading.Thread(target=watchDir, daemon=True)
+	watcherThread.start()
+
+	# start accept loops for each port
+	for serverSocket, port in serverSockets:
+		t = threading.Thread(
+			target=acceptConnections,
+			args=(serverSocket, port),
+			daemon=True
+		)
+		t.start()
+
+	try:
+		# keep main thread alive to catch KeyboardInterrupt
+		while True:
+			time.sleep(1)
+	except KeyboardInterrupt:
+		log("KeyboardInterrupt received, shutting down...")
+	finally:
+		# close listener sockets
+		for serverSocket, _ in serverSockets:
+			try:
+				serverSocket.close()
+			except Exception:
+				pass
+
+		# close client sockets per port
+		with clientsLock:
+			for port, socketSet in clientsByPort.items():
+				for clientSocket in list(socketSet):
+					try:
+						#print(str(clientSocket))
+						clientSocket.close()
+					except Exception:
+						pass
+				socketSet.clear()
+
+		log("Server shut down cleanly")
+
+
+#############################
+if __name__ == "__main__":
+	main()

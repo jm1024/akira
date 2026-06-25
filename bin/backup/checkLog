@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import re
+import sys
+from collections import defaultdict
+
+PATTERN = re.compile(r"<<<\s+(fast|slow):\s+([0-9A-Fa-f]+)\b")
+
+def main() -> int:
+    log_path = sys.argv[1] if len(sys.argv) > 1 else "/var/sidra/log/events.log"
+
+    # tid -> {"fast": int, "slow": int}
+    counts = defaultdict(lambda: {"fast": 0, "slow": 0})
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = PATTERN.search(line)
+                if not m:
+                    continue
+                kind = m.group(1).lower()
+                tid = m.group(2).upper()
+                counts[tid][kind] += 1
+    except FileNotFoundError:
+        print(f"ERROR: file not found: {log_path}", file=sys.stderr)
+        return 2
+
+    missing = []
+
+    for tid, c in counts.items():
+        if c["fast"] == 0: # or c["slow"] == 0:
+            missing.append((tid, c["fast"], c["slow"]))
+
+    missing.sort()
+
+    print("TID FAST_COUNT SLOW_COUNT")
+    for tid, fast_count, slow_count in missing:
+        print(f"{tid} {fast_count} {slow_count}")
+
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

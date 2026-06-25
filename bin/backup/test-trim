@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+
+tid = "E2801105200074C6E1DA0A55"
+
+print("x")
+
+try:
+    if len(tid) > 24:
+        print("reader: trim: " +str(tid))
+        tid = tid[:24]
+        print("reader: done: " +str(tid))
+except Exception as ex:
+    print("ERROR: reader: truncating tid: " + str(ex))
+

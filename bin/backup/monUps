@@ -1,0 +1,6 @@
+#!/bin/bash
+upsc apc1@127.0.0.1 2>/dev/null > /var/sidra/mon/ups-1
+upsc apc2@127.0.0.1 2>/dev/null > /var/sidra/mon/ups-2
+#upsc apc1@127.0.0.1 2>/dev/null | grep battery.charge: >> /var/sidra/mon/ups
+#upsc apc2@127.0.0.1 2>/dev/null | grep ups.status >> /var/sidra/mon/ups
+#upsc apc2@127.0.0.1 2>/dev/null | grep battery.charge: >> /var/sidra/mon/ups
