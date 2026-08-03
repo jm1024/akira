@@ -20,7 +20,6 @@ VERSION = "0.02.06"
 #config defaults
 sidraApi = ""  #API server to use
 plazaId = "000"
-deviceName = ""
 laneMode = "single"
 eventMargin = 8     #time margin for accepting events as together
 
@@ -56,8 +55,6 @@ TRN_WORKING_DIR = "/var/sidra/trn/working"
 TRN_DONE_DIR = "/var/sidra/trn/done"
 TRN_TMP_DIR = "/var/sidra/trn/tmp"
 XMIT_DIR = "/var/sidra/xmit"
-XMIT_STATE_DIR = "/var/sidra/xmit/state"
-XMIT_BAD_DIR = "/var/sidra/xmit/bad"
 MASS_DIR = "/var/sidra/mass"
 STREAM_DIR = "/var/sidra/stream"
 LOG_FILE = "sidra.log"
@@ -115,7 +112,6 @@ def loadConfig():
     #system info
     global sidraApi
     global plazaId
-    global deviceName
     global laneMode
     global driversRead
     global driversTrans
@@ -205,7 +201,7 @@ def loadConfig():
 
     #device info
     if not cfg.get("deviceName") == None:
-        deviceName = cfg.get("deviceName")
+        sidraApi = cfg.get("deviceName")
 
     #max image age
     if not cfg.get("imageRetentionSeconds") == None:
@@ -311,31 +307,6 @@ def logMcp(msg):
 ####################################################
 # communication
 ####################################################
-
-###########################
-def sidraApiList():
-
-    apis = sidraApi
-
-    if apis in [None, ""]:
-        return []
-
-    if isinstance(apis, str):
-        apis = [apis]
-
-    if not isinstance(apis, list):
-        return []
-
-    ret = []
-    for api in apis:
-        if not isinstance(api, str):
-            continue
-
-        api = api.strip()
-        if api and api not in ret:
-            ret.append(api)
-
-    return ret
 
 ###########################
 def queueXmit(payload, extension = ".x"):

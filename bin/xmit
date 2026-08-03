@@ -1,17 +1,89 @@
 #!/usr/bin/python3
-from datetime import date, datetime, timedelta
-import time
-import json
 import base64
-import os
-import uuid
-import sys
 import fcntl
+import json
+import os
+import sys
+import time
+import uuid
+from datetime import date, datetime, timedelta
 
 import sidraCore
 
-DEBUG = True
-DEBUG_LOAD = True
+DEBUG = False
+DEBUG_LOAD = False
+
+
+########################################
+def xmitStatePath(file):
+    return sidraCore.XMIT_STATE_DIR + "/" + file + ".state"
+
+
+########################################
+def loadXmitState(file):
+    path = xmitStatePath(file)
+    state = {"delivered": [], "failures": {}}
+
+    if not sidraCore.fileExists(path):
+        return state
+
+    try:
+        data = json.loads(sidraCore.readFile(path))
+    except Exception as ex:
+        sidraCore.log("xmit: invalid state file " + str(file) + " - " + str(ex), True)
+        return state
+
+    if not isinstance(data, dict):
+        sidraCore.log("xmit: invalid state file " + str(file) + " - not an object", True)
+        return state
+
+    delivered = data.get("delivered", [])
+    failures = data.get("failures", {})
+
+    if isinstance(delivered, list):
+        state["delivered"] = [str(api) for api in delivered]
+
+    if isinstance(failures, dict):
+        state["failures"] = failures
+
+    return state
+
+
+########################################
+def saveXmitState(file, state):
+    path = xmitStatePath(file)
+    tmpPath = path + ".tmp"
+
+    state["lastAttempt"] = datetime.now().isoformat()
+
+    with open(tmpPath, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+    os.replace(tmpPath, path)
+
+
+########################################
+def deleteXmitState(file):
+    path = xmitStatePath(file)
+    if sidraCore.fileExists(path):
+        sidraCore.deleteFile(path)
+
+
+########################################
+def cleanupOrphanedXmitStates():
+    for stateFile in sidraCore.fileList(sidraCore.XMIT_STATE_DIR):
+        if not stateFile.endswith(".state"):
+            continue
+
+        queueFile = stateFile[: -len(".state")]
+        queuePath = sidraCore.XMIT_DIR + "/" + queueFile
+        if not sidraCore.fileExists(queuePath):
+            sidraCore.deleteFile(sidraCore.XMIT_STATE_DIR + "/" + stateFile)
+
 
 ########################################
 def isFileStable(filepath, delay=0.5):
@@ -20,20 +92,52 @@ def isFileStable(filepath, delay=0.5):
     size2 = os.path.getsize(filepath)
     return size1 == size2
 
+
 ########################################
 def isFileLocked(path):
     try:
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(f, fcntl.LOCK_UN)
         return False  # lock acquired and released — file is not in use
     except BlockingIOError:
         return True  # another process has it locked
 
+
+########################################
+def rejectXmitFile(file, reason):
+    src = sidraCore.XMIT_DIR + "/" + file
+    dst = sidraCore.XMIT_BAD_DIR + "/" + file
+
+    if sidraCore.fileExists(dst):
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        dst = sidraCore.XMIT_BAD_DIR + "/" + file + "." + stamp
+
+    sidraCore.log(
+        "ERROR: xmit rejecting queue file "
+        + str(file)
+        + " - "
+        + str(reason),
+        True,
+    )
+
+    try:
+        sidraCore.moveFile(src, dst)
+        deleteXmitState(file)
+    except Exception as ex:
+        sidraCore.log(
+            "ERROR: xmit failed to move bad queue file "
+            + str(file)
+            + " - "
+            + str(ex),
+            True,
+        )
+
+
 ##############################################################################################
 # main
 
-#sidraCore.log("mcp Starting")
+# sidraCore.log("mcp Starting")
 
 run = True
 
@@ -43,30 +147,46 @@ if "-d" in sys.argv:
 if DEBUG:
     print("debug on")
 
+sidraCore.makeDir(sidraCore.XMIT_STATE_DIR)
+sidraCore.makeDir(sidraCore.XMIT_BAD_DIR)
+cleanupOrphanedXmitStates()
+
 events = []
 
 while run:
-
-    #sidraCore.log("mcp L-1")
-    #if DEBUG:
+    # sidraCore.log("mcp L-1")
+    # if DEBUG:
     #    print("LOAD: init")
 
     # get list of new files
     files = sidraCore.fileList(sidraCore.XMIT_DIR, newestFirst=True, max=100)
 
-    #let files finish writing out to disk
-    time.sleep(.1) # was .5 before file locking implemented - if file locks dont work maybe make this 1
+    # let files finish writing out to disk
+    time.sleep(
+        0.1
+    )  # was .5 before file locking implemented - if file locks dont work maybe make this 1
 
     fileCount = 0
 
-    #if DEBUG_LOAD:
+    # if DEBUG_LOAD:
     #    print("LOAD: " + str(fileCount))
 
     # work on each file
     for file in files:  # JM wrap this in a try
+        if file.endswith(".tmp"):
+            continue
+
+        if file.endswith(".state"):
+            baseFile = file[: -len(".state")]
+            if not sidraCore.fileExists(sidraCore.XMIT_DIR + "/" + baseFile):
+                sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+            continue
 
         fullPath = sidraCore.XMIT_DIR + "/" + file
-        #if not isFileStable(fullPath):
+        if not sidraCore.fileExists(fullPath):
+            continue
+
+        # if not isFileStable(fullPath):
         #    print("File still growing")
         #    continue
         if isFileLocked(fullPath):
@@ -75,34 +195,94 @@ while run:
 
         xmitResp = False
 
-        #load contents
-        #data = json.loads(sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file))
+        # load contents
+        # data = json.loads(sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file))
         data = sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file)
 
         fileCount = fileCount + 1
 
         try:
+            payload = json.loads(data)
+        except Exception as ex:
+            rejectXmitFile(file, "invalid json: " + str(ex))
+            continue
+
+        if not isinstance(payload, dict) or not payload.get("op"):
+            rejectXmitFile(file, "missing op")
+            continue
+
+        try:
+            apis = sidraCore.sidraApiList()
+            if not apis:
+                sidraCore.log("xmit: no sidraApi configured", True)
+                time.sleep(1)
+                continue
+
             dataSize = len(data)
             ts = datetime.now()
-            xmitResp = sidraCore.xmitEvent(sidraCore.sidraApi, data)
-            td = datetime.now() - ts
-            if xmitResp:
+            state = loadXmitState(file)
+            deliveredTargets = set(state.get("delivered", []))
+            okTargets = []
+            skippedTargets = []
+            failedTargets = []
+
+            for api in apis:
+                if api in deliveredTargets:
+                    skippedTargets.append(api)
+                    continue
+
                 if DEBUG:
-                    print("xmit: ok: " + str(file) + " " + str(td.microseconds / 1000) + " " + str(dataSize))
+                    print(api)
+                xmitResp = sidraCore.xmitEvent(api, data)
+                if xmitResp:
+                    okTargets.append(api)
+                    deliveredTargets.add(api)
+                    state["delivered"] = sorted(deliveredTargets)
+                    state.get("failures", {}).pop(api, None)
+                    saveXmitState(file, state)
+                else:
+                    failedTargets.append(api)
+                    state.setdefault("failures", {})[api] = "failed"
+                    saveXmitState(file, state)
+
+            td = datetime.now() - ts
+            missingTargets = [api for api in apis if api not in deliveredTargets]
+            if not missingTargets:
+                if DEBUG:
+                    print(
+                        "xmit: ok: "
+                        + str(file)
+                        + " "
+                        + str(td.microseconds / 1000)
+                        + " "
+                        + str(dataSize)
+                        + " targets: "
+                        + str(len(okTargets) + len(skippedTargets))
+                    )
                 sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+                deleteXmitState(file)
             else:
-                msg = "xmit: failed: " + str(file)
+                msg = (
+                    "xmit: failed: "
+                    + str(file)
+                    + " ok: "
+                    + str(okTargets)
+                    + " skipped: "
+                    + str(skippedTargets)
+                    + " failed: "
+                    + str(failedTargets)
+                    + " missing: "
+                    + str(missingTargets)
+                )
                 if DEBUG:
                     print(msg)
                 sidraCore.log((msg))
-                time.sleep(.5)
+                time.sleep(0.5)
         except Exception as ex:
             sidraCore.log("xmit: error: " + str(ex), True)
-
 
     if DEBUG:
         if fileCount > 0:
             print("xmit: sent: " + str(fileCount))
 
-    time.sleep(.05) # change to .01
-
+    time.sleep(0.05)  # change to .01

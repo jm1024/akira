@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+import os
+import json
+import sidraCore
+
+# Define file paths
+AKIRA_FILE = "akiraEnabled.rts"
+READER_NEW = "readerSwitch-pending"
+READER_ACTIVE = "readerSwitch"
+
+#######################################
+def checkFile(file):
+    ret = False
+	try:
+		result = sidraCore.readFile(file)
+		if result == "True":
+			ret = True
+	except Exception as ex:
+		print("reader.checkFile() " + str(ex))
+
+	return ret
+#######################################
+def main():
+    data = {}
+    
+    akiraPath = sidraCore.TMP_DIR + "/" + AKIRA_FILE
+    if os.path.exists(akiraPath):
+        akiraState = checkFile(akiraPath)
+        data['akiraEnabled'] = akiraState
+
+    readerNew = sidraCore.TMP_DIR + "/" + READER_NEW
+    readerActive = sidraCore.TMP_DIR + "/" + READER_ACTIVE
+    if os.path.exists(readerNew):
+        try:
+            os.replace(readerNew, readerActive)
+            readerState = checkFile(readerActive)
+            data['readerSwitch'] = readerState
+            
+        except OSError as e:
+            print(f"Failed to move {readerNew} to {readerActive}: {e}")
+    
+    if data:
+        data['op'] = 'updateTmp'
+        print(f"Transmitting data: {json.dumps(data)}")
+        
+        try:
+            xmitResponse = sidraCore.xmitEvent(sidraCore.sidraApi, data)
+            if xmitResponse and "readerSwitch" in xmitResponse:
+                sidraCore.writeFile(sidraCore.TMP_DIR + "/" + READER_NEW,
+                str(xmitResponse["readerSwitch"]))
+                
+            if not xmitResponse:
+                sidraCore.log(f"Failed to transmit tmp updates. API ERROR.")
+        except Exception as e:
+            sidraCore.log(f"Failed to transmit tmp updates: {e}")
+    else:
+        print("No files found to transmit.")
+
+if __name__ == "__main__":
+    main()

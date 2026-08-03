@@ -1,0 +1,7 @@
+#!/bin/bash
+echo "enabling tmp transmission in cron"
+if crontab -l | grep --quiet "/var/sidra/bin/tmpCron"; then
+  echo " - cron already configured"
+else
+  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/tmpCron"; } | crontab -
+fi
