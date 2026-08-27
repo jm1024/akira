@@ -31,6 +31,9 @@ VERSION = "1.00.00"
 #reader killswitch
 READER_ENABLED = True
 
+#reader redundancy
+READER_SWITCH_FILE = "readerSwitch"
+
 #read window settings
 fastPre = 0
 fastPost = 0
@@ -143,6 +146,20 @@ tnConn = None
 
 STOP = object()
 
+##################################################
+# misc methods
+##################################################
+def getSwitchFile():
+    ret = False
+    try:
+        result = sidraCore.readFile(sidraCore.TMP_DIR + "/" + READER_SWITCH_FILE)
+        text = result.strip().lower()
+        if text in ("1", "on", "true", "high"):
+            ret = True
+    except Exception as ex:
+        print("reader.getSwitchFile() " + str(ex))
+
+    return ret
 
 ##################################################
 # mass comm
@@ -1688,7 +1705,13 @@ readerName = sys.argv[1]
 
 sidraCore.log("Reader " + readerName + " Starting")
 
-for reader in sidraCore.readers:
+readers = sidraCore.readers
+
+# if switch is enabled, use backup readers
+if getSwitchFile():
+    readers = sidraCore.backupReaders
+
+for reader in readers:
     #print(reader['name'])
     if reader['name'] == readerName:
         readerIp = reader['ip']
@@ -1826,7 +1849,7 @@ if CONFIGURE:
     antennas_diag = xrCmd("antennas.diag")
     antennas_diag = antennas_diag.replace('\n','|')
     antennas_diag = antennas_diag.replace('\r','')
-    sidraCore.log(f"{datetime.now()} reader {readerName} antennas.diag: {antennas_diag.replace('\n','|')}")
+    sidraCore.log(f"{datetime.now()} reader {readerName} connected to {readerIp} antennas.diag: {antennas_diag.replace('\n','|')}")
 
     #killswitch
     if READER_ENABLED:

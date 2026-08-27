@@ -42,7 +42,8 @@ while True:
     msg = msg + "                          img: " + str(data['img']).rjust(7, ' ') + '\n'
     msg = msg + "                         used: " + str(data['du']).rjust(7, ' ') + '\n'
     msg = msg + "                         free: " + str(data['df']).rjust(7, ' ') + '\n'
-    msg = msg + "                          cpu: " + str(data['cpu']).rjust(7, ' ')
+    msg = msg + "                          cpu: " + str(data['cpu']).rjust(7, ' ') + '\n'
+    msg = msg + "                          uptime: " + str(data['server']).rjust(7, ' ')
 
     #UPS
     if len(data["ups"]) > 0:

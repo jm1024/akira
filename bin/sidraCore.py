@@ -32,6 +32,7 @@ lanes = []
 ipList = []
 cams = []
 readers = []
+backupReaders = []
 massSensors = []
 lidar = []
 driversRead = []
@@ -126,6 +127,7 @@ def loadConfig():
     global ipList
     global cams
     global readers
+    global backupReaders
     global massSensors
     global lidar
     global imageRetentionSeconds
@@ -194,6 +196,10 @@ def loadConfig():
     #readers
     if not cfg.get("readers") == None:
         readers = cfg.get("readers")
+        
+    #backupReaders
+    if not cfg.get("backupReaders") == None:
+        backupReaders = cfg.get("backupReaders")
 
     #massSensors
     if not cfg.get("massSensors") == None:

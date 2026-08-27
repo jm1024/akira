@@ -45,6 +45,16 @@ for driverXmit in sidraCore.driversXmit:
 for driverServer in sidraCore.driversServer:
         if not sidraCore.isRunning(driverServer):
             bOk = False
+            
+# check restart services for reader switch
+flagFile = "/var/sidra/tmp/restart"
+if sidraCore.fileExist(flagFile):
+    sidraCore.log("watchdog: failover flag detected. Forcing restart.")
+    bOk = False  
+    try:
+        sidraCore.deleteFile(flagFile)  
+    except Exception as e:
+        sidraCore.log("watchdog: error removing flag file: " + str(e))
 
 if not bOk:
     print("Restarting Sidra")
@@ -71,10 +81,10 @@ if not sidraCore.isRunning(sidraCore.BIN_DIR + "/mon"):
     subprocess.call([cmd])
 
 #mon
-data = monCore.getAll(sidraCore.ipList)
-now = datetime.now()
-monFileName = now.strftime("%Y%m%d%H%M") + ".mon"
-sidraCore.writeFile(monCore.MON_PATH + monFileName, json.dumps(data, indent=2))
+# data = monCore.getAll(sidraCore.ipList)
+# now = datetime.now()
+# monFileName = now.strftime("%Y%m%d%H%M") + ".mon"
+# sidraCore.writeFile(monCore.MON_PATH + monFileName, json.dumps(data, indent=2))
 
 #purge image files
 #sidraCore.log("Watchdog Purging Images")

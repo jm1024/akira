@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import time
+import telnetlib
 
 USER = b"admin"
 PASS = b"admin"
@@ -30,42 +31,50 @@ def main() -> int:
         print(e, file=sys.stderr)
         return 2
 
+    # Initialize tn as None so the 'finally' block doesn't crash if Telnet() fails
+    tn = None 
+
     try:
-        import telnetlib
+        tn = telnetlib.Telnet(ip, PORT, timeout=5)
+
+        # Wait for "User Name:" then send username
+        tn.read_until(b"User Name", timeout=5)
+        tn.write(USER + b"\r\n")
+
+        # Wait for "Password:" then send password
+        tn.read_until(b"Password", timeout=5)
+        tn.write(PASS + b"\r\n")
+
+        # Give it a moment and read whatever it prints
+        time.sleep(0.2)
+        out = tn.read_very_eager().lower()
+        
+        if b"denied" in out or b"bad user" in out:
+            print("Auth failed: access denied", file=sys.stderr)
+            return 3  # The finally block will still run before it actually returns
+
+        # Send relay command
+        cmd = b"relay " + onoff + b" " + str(RELAY_INDEX).encode("ascii") + b"\r\n"
+        tn.write(cmd)
+
+        time.sleep(0.2)
+        resp = tn.read_very_eager().decode("ascii", errors="replace").strip()
+        print(resp if resp else "Command sent.")
+        
+        return 0
+
     except Exception as e:
-        print(f"telnetlib not available: {e}", file=sys.stderr)
-        return 4
+        # Catch network timeouts or device disconnects mid-stream
+        print(f"Telnet communication error: {e}", file=sys.stderr)
+        return 1
 
-    tn = telnetlib.Telnet(ip, PORT, timeout=5)
-
-    # Wait for "User Name:" then send username
-    tn.read_until(b"User Name", timeout=5)
-    tn.write(USER + b"\r\n")
-
-    # Wait for "Password:" then send password
-    tn.read_until(b"Password", timeout=5)
-    tn.write(PASS + b"\r\n")
-
-    # Give it a moment and read whatever it prints
-    time.sleep(0.2)
-    out = tn.read_very_eager().lower()
-    if b"denied" in out or b"bad user" in out:
-        print("Auth failed: access denied", file=sys.stderr)
-        try:
-            tn.close()
-        except Exception:
-            pass
-        return 3
-
-    # Send relay command
-    cmd = b"relay " + onoff + b" " + str(RELAY_INDEX).encode("ascii") + b"\r\n"
-    tn.write(cmd)
-
-    time.sleep(0.2)
-    resp = tn.read_very_eager().decode("ascii", errors="replace").strip()
-    print(resp if resp else "Command sent.")
-    tn.close()
-    return 0
+    finally:
+        # 2. GUARANTEED EXECUTION: This runs no matter how the try block exits
+        if tn is not None:
+            try:
+                tn.close()
+            except Exception:
+                pass  # Ignore errors while closing; we just want to ensure it's closed
 
 ##############################################
 if __name__ == "__main__":

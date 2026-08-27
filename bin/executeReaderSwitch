@@ -1,0 +1,30 @@
+#!/bin/bash
+
+STATE=$1
+RELAY_IP="10.3.1.80"
+STATE_FILE="/var/sidra/tmp/readerSwitch"
+FLAG_FILE="/var/sidra/tmp/restart"
+
+if [ -z "$STATE" ]; then
+    echo "ERROR: Missing arguments. Usage: $0 <state>"
+    exit 1
+fi
+
+echo "Switching reader relay at $RELAY_IP to $STATE..."
+
+/var/sidra/bin/readerSwitch "$RELAY_IP" "$STATE"
+SWITCH_STATUS=$?
+
+if [ $SWITCH_STATUS -ne 0 ]; then
+    echo "ERROR: readerSwitch script failed with exit code $SWITCH_STATUS."
+    exit $SWITCH_STATUS
+fi
+
+echo "$STATE" > "$STATE_FILE"
+echo "State ($STATE) saved to $STATE_FILE"
+
+touch "$FLAG_FILE"
+chmod 666 "$FLAG_FILE" # Make sure anyone can delete it just in case
+echo "SUCCESS: Flag file created. Watchdog will restart services within 60 seconds."
+
+exit 0

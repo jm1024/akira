@@ -1,60 +1,86 @@
 #!/usr/bin/python3
 import os
 import json
+import requests
 import sidraCore
 
 # Define file paths
 AKIRA_FILE = "akiraEnabled.rts"
-READER_NEW = "readerSwitch-pending"
-READER_ACTIVE = "readerSwitch"
 
 #######################################
-def checkFile(file):
-    ret = False
-	try:
-		result = sidraCore.readFile(file)
-		if result == "True":
-			ret = True
-	except Exception as ex:
-		print("reader.checkFile() " + str(ex))
-
-	return ret
+def checkFile(file_path):
+    try:
+        if sidraCore.readFile(file_path).strip() == "True":
+            return "True"
+    except Exception as ex:
+        msg = f"tmpCron checkFile() error: {ex}"
+        print(msg)
+        sidraCore.log(msg)
+        
+    return "False"
 #######################################
+
+def localXmitEvent(url, payload):
+    """
+    Transmits the payload to the API. 
+    Since we use SSH for commands now, we only care if the API received this (200 OK).
+    """
+    try:
+        headers = {'Content-type': 'application/json'}
+        resp = requests.post(url, headers=headers, data=payload, timeout=5)
+        
+        if resp.status_code == 200:
+            return True
+        else:
+            op_name = json.loads(payload).get('op', 'Unknown')
+            msg = f"ERROR xmit {url} {op_name} resp: {resp.status_code}"
+            print(msg)
+            sidraCore.log(msg)
+            return False
+            
+    except Exception as ex:
+        msg = f"Error transmitting to API {url}: {ex}"
+        print(msg)
+        sidraCore.log(msg)
+        return False
+
+#######################################
+
 def main():
     data = {}
     
-    akiraPath = sidraCore.TMP_DIR + "/" + AKIRA_FILE
+    akiraPath = os.path.join(sidraCore.TMP_DIR, AKIRA_FILE)
     if os.path.exists(akiraPath):
-        akiraState = checkFile(akiraPath)
-        data['akiraEnabled'] = akiraState
-
-    readerNew = sidraCore.TMP_DIR + "/" + READER_NEW
-    readerActive = sidraCore.TMP_DIR + "/" + READER_ACTIVE
-    if os.path.exists(readerNew):
-        try:
-            os.replace(readerNew, readerActive)
-            readerState = checkFile(readerActive)
-            data['readerSwitch'] = readerState
-            
-        except OSError as e:
-            print(f"Failed to move {readerNew} to {readerActive}: {e}")
+        data['akiraEnabled'] = checkFile(akiraPath)
     
-    if data:
-        data['op'] = 'updateTmp'
-        print(f"Transmitting data: {json.dumps(data)}")
-        
-        try:
-            xmitResponse = sidraCore.xmitEvent(sidraCore.sidraApi, data)
-            if xmitResponse and "readerSwitch" in xmitResponse:
-                sidraCore.writeFile(sidraCore.TMP_DIR + "/" + READER_NEW,
-                str(xmitResponse["readerSwitch"]))
-                
-            if not xmitResponse:
-                sidraCore.log(f"Failed to transmit tmp updates. API ERROR.")
-        except Exception as e:
-            sidraCore.log(f"Failed to transmit tmp updates: {e}")
-    else:
+    if not data:
         print("No files found to transmit.")
+        return
+        
+    data['op'] = 'updateTmp'
+    payload = json.dumps(data)
+    print(f"Transmitting data: {payload}")
+    
+    apis = sidraCore.sidraApiList()
+    if not apis:
+        msg = "xmit: no sidraApi configured"
+        print(msg)
+        sidraCore.log(msg)
+        return
+        
+    failedTargets = []
+
+    for api in apis:
+        success = localXmitEvent(api, payload)
+        if not success:
+            failedTargets.append(api)
+
+    if failedTargets:
+        msg = f"Failed to transmit to these APIs: {failedTargets}"
+        print(msg)
+        sidraCore.log(msg)
+    else:
+        print("Successfully updated all APIs.")
 
 if __name__ == "__main__":
     main()

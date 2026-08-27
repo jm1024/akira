@@ -189,7 +189,15 @@ def getUps():
         print("monCore: getUps: ERROR: " + str(ex))
 
     return ret
-
+##########################################
+def getServerUptime():
+    ret = "DOWN"
+    
+    with open('/proc/uptime', 'r') as f:
+        seconds = int(float(f.readline().split()[0]))
+        ret = displayElapsed(seconds, 2)
+        
+    return ret
 
 ##########################################
 def getAll(ipList):
@@ -213,6 +221,7 @@ def getAll(ipList):
     cpu = getCpu()
     epm, eph = getEventCounts()
     ups = getUps()
+    server = getServerUptime()
 
     #mass sensor states
     massSensors = []
@@ -236,7 +245,8 @@ def getAll(ipList):
         "epm": epm,
         "eph": eph,
         "mass": massSensors,
-        "ups": ups
+        "ups": ups,
+        "server": server
     }
 
     return data
