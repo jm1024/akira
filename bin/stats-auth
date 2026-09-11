@@ -1,7 +1,9 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
 echo Total:
-grep epc /var/sidra/log/sidra.log | wc -l
+grep epc "$AKIRA_ROOT/log/akira.log" | wc -l
 echo Inuthentic:
-grep INAUTHENTIC /var/sidra/log/sidra.log | wc -l
+grep INAUTHENTIC "$AKIRA_ROOT/log/akira.log" | wc -l
 echo Unknown:
-grep UNKNOWN /var/sidra/log/sidra.log | wc -l
+grep UNKNOWN "$AKIRA_ROOT/log/akira.log" | wc -l

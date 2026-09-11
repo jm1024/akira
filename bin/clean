@@ -1,5 +1,7 @@
 #!/bin/bash
-rm /var/sidra/img/*
-rm /var/sidra/trn/*
-rm /var/sidra/trn/working/*
-rm /var/sidra/trn/done/*
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
+rm "$AKIRA_ROOT"/img/*
+rm "$AKIRA_ROOT"/trn/*
+rm "$AKIRA_ROOT"/trn/working/*
+rm "$AKIRA_ROOT"/trn/done/*

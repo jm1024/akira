@@ -1,0 +1,966 @@
+#!/usr/bin/env python3
+"""Akira Lane Control (ALC) socket server.
+
+The XLC connects to this server over a raw TCP socket. Messages are compact
+UTF-8 JSON terminated by LF. Each configured lane has its own TCP port and
+controller connection. The port determines the lane; a response may omit laneID
+but must match that lane if supplied. Each lane is polled on connect and after
+200 ms of inactivity, with retransmission when no laneState response arrives
+within 20 ms.
+
+Local Akira processes submit commands through a Unix socket. A command is
+accepted only while the XLC connection is live and must complete inside the
+short dispatch deadline. Disconnected, timed-out, and interrupted commands
+are rejected and never retained for replay.
+"""
+
+import argparse
+import json
+import math
+import os
+import queue
+import signal
+import socket
+import stat
+import sys
+import threading
+import time
+import traceback
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from synergyProtocol import configured_lane_ids, lane_endpoints, validate_lane_id, validate_transaction_fields
+
+
+PROJECT_ROOT = Path(
+    os.environ.get("AKIRA_ROOT", Path(__file__).resolve().parent.parent)
+).resolve()
+DEFAULT_BIND = "0.0.0.0"
+DEFAULT_DATA_DIR = str(PROJECT_ROOT / "synergy")
+DEFAULT_HEARTBEAT_MS = 200.0
+DEFAULT_RETRY_MS = 20.0
+DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_COMMAND_POLL_MS = 10.0
+DEFAULT_MAX_LINE_BYTES = 64 * 1024
+DEFAULT_DISPATCH_TIMEOUT_MS = 250.0
+DEFAULT_DISPATCH_QUEUE_SIZE = 8
+
+COMMAND_FIELDS = {
+    "addQueue": ("txID", "tagID", "laneID", "msgID", "signMsg", "dateTime"),
+    "setSignMsg": ("laneID", "signMsg", "dateTime"),
+    "closeGate": ("laneID", "signMsg", "dateTime"),
+}
+LANE_STATE_FIELDS = ("laneID", "laneState", "gateState", "signMsg", "queueCount")
+
+
+class ConnectionClosed(Exception):
+    pass
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class NoResponse(Exception):
+    pass
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def compact_json(message):
+    return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+
+
+def log(event, **details):
+    record = {"time": utc_now(), "event": event}
+    record.update(details)
+    try:
+        print(compact_json(record), flush=True)
+    except Exception:
+        pass
+
+
+def atomic_write_json(path, value, sync=False):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(value, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+            output.flush()
+            if sync:
+                os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def parse_iso_datetime(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("dateTime must be a non-empty ISO-8601 string")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("dateTime must include a timezone offset")
+    return parsed
+
+
+def validate_command(message):
+    if not isinstance(message, dict):
+        raise ValueError("command must be a JSON object")
+
+    operation = message.get("op")
+    if operation not in COMMAND_FIELDS:
+        raise ValueError(f"unsupported op: {operation!r}")
+
+    missing = [field for field in COMMAND_FIELDS[operation] if field not in message]
+    if missing:
+        raise ValueError(f"{operation} missing required fields: {', '.join(missing)}")
+
+    for field in COMMAND_FIELDS[operation]:
+        if field == "dateTime":
+            parse_iso_datetime(message[field])
+        elif not isinstance(message[field], str) or not message[field]:
+            raise ValueError(f"{field} must be a non-empty string")
+
+    if operation == "addQueue":
+        validate_transaction_fields(message)
+    validate_lane_id(message.get("laneID"))
+
+    return message
+
+
+def validate_lane_state(message, lane_id=None):
+    if not isinstance(message, dict):
+        raise ValueError("laneState response must be a JSON object")
+
+    if lane_id is not None:
+        message = dict(message)
+        message.setdefault("laneID", lane_id)
+        if message["laneID"] != lane_id:
+            raise ValueError(f"response laneID {message['laneID']!r} does not match port lane {lane_id!r}")
+    missing = [field for field in LANE_STATE_FIELDS if field not in message]
+    if missing:
+        raise ValueError(f"laneState response missing: {', '.join(missing)}")
+    validate_lane_id(message["laneID"])
+
+    if isinstance(message["laneState"], bool) or not isinstance(message["laneState"], int):
+        raise ValueError("laneState must be an integer")
+    if message["gateState"] not in (0, 1) or isinstance(message["gateState"], bool):
+        raise ValueError("gateState must be 0 or 1")
+    if not isinstance(message["signMsg"], str):
+        raise ValueError("signMsg must be a string")
+    if (
+        isinstance(message["queueCount"], bool)
+        or not isinstance(message["queueCount"], int)
+        or message["queueCount"] < 0
+    ):
+        raise ValueError("queueCount must be a non-negative integer")
+
+    return message
+
+
+@dataclass
+class PendingDispatch:
+    request: dict
+    deadline: float
+    require_open_gate: bool = False
+    completed: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    active: bool = False
+    cancelled: bool = False
+    result: dict | None = None
+
+    def claim(self):
+        with self.lock:
+            if self.cancelled or self.completed.is_set() or time.monotonic() >= self.deadline:
+                return False
+            self.active = True
+            return True
+
+    def cancel_if_queued(self):
+        with self.lock:
+            if not self.active and not self.completed.is_set():
+                self.cancelled = True
+                return True
+            return False
+
+    def complete(self, result):
+        with self.lock:
+            if self.completed.is_set():
+                return
+            self.result = result
+            self.completed.set()
+
+
+class StatusTracker:
+    COUNTERS = ("responses", "commandsCompleted", "commandsRejected", "retransmissions",
+                "responseTimeouts", "invalidResponses")
+
+    def __init__(self, path, bind_address, lane_ports, dispatch_socket):
+        self.path = Path(path)
+        self.last_write = 0.0
+        self.lock = threading.RLock()
+        self.rtt_totals = {lane: [0.0, 0] for lane in lane_ports}
+        self.data = {
+            "startedAt": utc_now(), "bind": bind_address,
+            "lanePorts": dict(lane_ports), "dispatchSocket": str(dispatch_socket),
+            "connected": False, "anyConnected": False,
+            "lanes": {lane: dict(laneID=lane, port=port, connected=False, ready=False,
+                                 client=None, currentOp=None, lastLaneState=None,
+                                 lastResponseAt=None, lastDispatchError=None,
+                                 **{key: 0 for key in self.COUNTERS})
+                      for lane, port in lane_ports.items()},
+            "lastLaneState": None, "lastResponseAt": None, "lastDispatchError": None,
+            **{key: 0 for key in self.COUNTERS},
+        }
+        self.write(force=True)
+
+    def write(self, force=False):
+        with self.lock:
+            now = time.monotonic()
+            if not force and now - self.last_write < 1.0:
+                return
+            try:
+                self.data.pop("statusWriteError", None)
+                atomic_write_json(self.path, self.data)
+            except Exception as error:
+                self.data["statusWriteError"] = str(error)
+                log("status_write_failed", path=str(self.path), error=str(error))
+            self.last_write = now
+
+    def connected(self, lane_id, client):
+        with self.lock:
+            self.data["lanes"][lane_id].update(connected=True, ready=False, client=client)
+            self._connection_summary()
+
+    def ready(self, lane_id):
+        with self.lock:
+            self.data["lanes"][lane_id]["ready"] = True
+            self._connection_summary()
+
+    def disconnected(self, lane_id):
+        with self.lock:
+            self.data["lanes"][lane_id].update(connected=False, ready=False, client=None, currentOp=None)
+            self._connection_summary()
+
+    def _connection_summary(self):
+        lanes = self.data["lanes"].values()
+        self.data["connected"] = all(lane["ready"] for lane in lanes)
+        self.data["anyConnected"] = any(lane["connected"] for lane in lanes)
+        self.write(force=True)
+
+    def begin(self, operation, lane_id):
+        with self.lock:
+            self.data["lanes"][lane_id]["currentOp"] = operation
+            self.write()
+
+    def _count(self, key, lane_id):
+        self.data[key] += 1
+        if lane_id in self.data["lanes"]:
+            self.data["lanes"][lane_id][key] += 1
+
+    def retry(self, lane_id):
+        with self.lock:
+            self._count("retransmissions", lane_id)
+            self.write()
+
+    def timeout(self, lane_id):
+        with self.lock:
+            self._count("responseTimeouts", lane_id)
+            self.data["lanes"][lane_id]["currentOp"] = None
+            self.write(force=True)
+
+    def invalid_response(self, lane_id):
+        with self.lock:
+            self._count("invalidResponses", lane_id)
+            self.write()
+
+    def rejected(self, code, error, lane_id=None):
+        with self.lock:
+            self._count("commandsRejected", lane_id)
+            details = {"time": utc_now(), "laneID": lane_id, "code": code, "error": str(error)}
+            self.data["lastDispatchError"] = details
+            if lane_id in self.data["lanes"]:
+                self.data["lanes"][lane_id]["lastDispatchError"] = details
+            self.write(force=True)
+
+    def response(self, operation, lane_state, rtt_ms, is_command):
+        with self.lock:
+            lane_id = lane_state["laneID"]
+            lane = self.data["lanes"][lane_id]
+            # Preserve connection/port diagnostics when refreshing wire state.
+            lane.update({key: lane_state[key] for key in LANE_STATE_FIELDS})
+            lane.update(currentOp=None, lastLaneState=dict(lane_state), lastResponseAt=utc_now(),
+                        lastRttMs=round(rtt_ms, 3) if rtt_ms is not None else None)
+            self.data["lastLaneState"] = dict(lane_state)
+            self.data["lastResponseAt"] = lane["lastResponseAt"]
+            self._count("responses", lane_id)
+            if rtt_ms is not None:
+                totals = self.rtt_totals[lane_id]
+                totals[0] += rtt_ms
+                totals[1] += 1
+                lane["averageRttMs"] = round(totals[0] / totals[1], 3)
+            if is_command:
+                self._count("commandsCompleted", lane_id)
+                lane["lastDispatchError"] = None
+                self.data["lastDispatchError"] = None
+            self.write(force=is_command)
+
+
+class LineJsonSession:
+    def __init__(self, client_socket, max_line_bytes, invalid_callback, lane_id=None):
+        self.lane_id = lane_id
+        self.socket = client_socket
+        self.max_line_bytes = max_line_bytes
+        self.invalid_callback = invalid_callback
+        self.buffer = bytearray()
+
+    def send(self, message, timeout_seconds):
+        payload = compact_json(message).encode("utf-8") + b"\n"
+        self.socket.settimeout(timeout_seconds)
+        try:
+            self.socket.sendall(payload)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as error:
+            raise ConnectionClosed(str(error)) from error
+
+    def next_json(self, deadline):
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self.buffer[:newline])
+                del self.buffer[: newline + 1]
+                if not line.strip():
+                    continue
+                if len(line) > self.max_line_bytes:
+                    self.invalid_callback("line exceeds maximum size")
+                    continue
+                try:
+                    message = json.loads(line.decode("utf-8"))
+                    if not isinstance(message, dict):
+                        raise ValueError("JSON message must be an object")
+                    return message
+                except Exception as error:
+                    self.invalid_callback(str(error))
+                    continue
+
+            if len(self.buffer) > self.max_line_bytes:
+                raise ProtocolError("unterminated message exceeds maximum size")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+
+            self.socket.settimeout(remaining)
+            try:
+                chunk = self.socket.recv(4096)
+            except socket.timeout:
+                return None
+            except (ConnectionResetError, OSError) as error:
+                raise ConnectionClosed(str(error)) from error
+
+            if not chunk:
+                raise ConnectionClosed("peer closed the connection")
+            self.buffer.extend(chunk)
+
+
+@dataclass
+class LaneChannel:
+    lane_id: str
+    port: int
+    dispatch_queue: queue.Queue
+    partner_ready: threading.Event = field(default_factory=threading.Event)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    client_socket: socket.socket | None = None
+    client_thread: threading.Thread | None = None
+
+
+
+class AkiraServer:
+    def __init__(self, args):
+        self.args = args
+        self.lane_ids = args.lanes
+        self.heartbeat_seconds = args.heartbeat_ms / 1000.0
+        self.retry_seconds = args.retry_ms / 1000.0
+        self.command_poll_seconds = args.command_poll_ms / 1000.0
+        self.dispatch_timeout_seconds = args.dispatch_timeout_ms / 1000.0
+        self.dispatch_socket_path = Path(args.dispatch_socket)
+        self.channels = {lane: LaneChannel(lane, port, queue.Queue(maxsize=args.dispatch_queue_size))
+                         for lane, port in args.lane_ports.items()}
+        self.dispatch_listener = None
+        self.dispatch_thread = None
+        self.status = StatusTracker(
+            Path(args.data_dir) / "status.json",
+            args.bind,
+            args.lane_ports,
+            self.dispatch_socket_path,
+        )
+        self.stop_requested = False
+
+    def request_stop(self, _signum=None, _frame=None):
+        self.stop_requested = True
+
+    def invalid_response(self, error, lane_id):
+        self.status.invalid_response(lane_id)
+        log("invalid_response", laneID=lane_id, port=self.channels[lane_id].port, error=error)
+
+    @staticmethod
+    def dispatch_failure(request, code, error):
+        return {
+            "ok": False,
+            "code": code,
+            "operation": request.get("op") if isinstance(request, dict) else None,
+            "respondedAt": utc_now(),
+            "error": str(error),
+        }
+
+    def reject(self, request, code, error):
+        lane_id = request.get("laneID") if isinstance(request, dict) else None
+        self.status.rejected(code, error, lane_id)
+        log(
+            "dispatch_rejected",
+            laneID=lane_id,
+            op=request.get("op") if isinstance(request, dict) else None,
+            code=code,
+            error=str(error),
+        )
+        result = self.dispatch_failure(request, code, error)
+        result["notSent"] = True
+        return result
+
+    def _receive_local_command(self, connection):
+        deadline = time.monotonic() + self.dispatch_timeout_seconds
+        buffer = bytearray()
+        while b"\n" not in buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("local command was not received before its deadline")
+            connection.settimeout(remaining)
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise ConnectionError("local command socket closed before a complete request")
+            buffer.extend(chunk)
+            if len(buffer) > self.args.max_line_bytes:
+                raise ValueError("local command exceeds maximum size")
+        raw, _, _remainder = buffer.partition(b"\n")
+        request = json.loads(raw.decode("utf-8"))
+        command = validate_command(request)
+        validate_lane_id(command["laneID"], self.lane_ids)
+        if "_authorizationDeadline" in command:
+            deadline = command["_authorizationDeadline"]
+            if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+                raise ValueError("invalid local authorization deadline")
+        if "_requireOpenGate" in command and (
+            not isinstance(command["_requireOpenGate"], bool) or command["op"] != "addQueue"
+        ):
+            raise ValueError("open-gate guard is only valid on addQueue")
+        return command
+
+    def _send_local_result(self, connection, result):
+        payload = compact_json(result).encode("utf-8") + b"\n"
+        connection.settimeout(self.dispatch_timeout_seconds)
+        connection.sendall(payload)
+
+    def handle_local_dispatch(self, connection):
+        request = {}
+        try:
+            request = self._receive_local_command(connection)
+            # Private, same-host monotonic timestamp; never send it to Synergy.
+            authorization_deadline = request.pop("_authorizationDeadline", float("inf"))
+            require_open_gate = request.pop("_requireOpenGate", False)
+            channel = self.channels[request["laneID"]]
+            pending = None
+            with channel.lock:
+                if not channel.partner_ready.is_set():
+                    result = self.reject(request, "DISCONNECTED", "Synergy lane client is not connected")
+                else:
+                    candidate = PendingDispatch(
+                        request=request,
+                        deadline=min(authorization_deadline, time.monotonic() + self.dispatch_timeout_seconds),
+                        require_open_gate=require_open_gate,
+                    )
+                    try:
+                        channel.dispatch_queue.put_nowait(candidate)
+                        pending = candidate
+                    except queue.Full:
+                        result = self.reject(request, "BUSY", "lane live dispatch channel is busy")
+            if pending is not None:
+                if pending.completed.wait(self.dispatch_timeout_seconds):
+                    result = pending.result
+                else:
+                    not_sent = pending.cancel_if_queued()
+                    result = self.reject(request, "TIMEOUT", "live command did not complete before its deadline")
+                    result["notSent"] = not_sent
+            self._send_local_result(connection, result)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            try:
+                self._send_local_result(
+                    connection, self.reject(request, "INVALID_COMMAND", error)
+                )
+            except Exception:
+                pass
+        except Exception as error:
+            log("local_dispatch_error", error=str(error))
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    def dispatch_listener_loop(self):
+        while not self.stop_requested:
+            try:
+                connection, _address = self.dispatch_listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_requested:
+                    break
+                raise
+            thread = threading.Thread(
+                target=self.handle_local_dispatch,
+                args=(connection,),
+                name="serverSynergyDispatchRequest",
+                daemon=True,
+            )
+            thread.start()
+
+    def next_dispatch(self, channel):
+        while True:
+            try:
+                pending = channel.dispatch_queue.get_nowait()
+            except queue.Empty:
+                return None
+            if pending.claim():
+                return pending
+            pending.complete(
+                dict(self.dispatch_failure(
+                    pending.request, "TIMEOUT", "live command expired before transmission"
+                ), notSent=True)
+            )
+            channel.dispatch_queue.task_done()
+
+    def fail_queued_dispatches(self, channel, code, error):
+        while True:
+            try:
+                pending = channel.dispatch_queue.get_nowait()
+            except queue.Empty:
+                return
+            pending.complete(dict(self.dispatch_failure(pending.request, code, error), notSent=True))
+            channel.dispatch_queue.task_done()
+
+    def exchange(self, session, request, is_command=False, authorization_deadline=None):
+        operation = request["op"]
+        lane_id = validate_lane_id(request.get("laneID"), self.lane_ids)
+        if getattr(session, "lane_id", lane_id) not in (None, lane_id):
+            raise ProtocolError("command lane does not match controller connection")
+        first_sent_at = None
+        self.status.begin(operation, lane_id)
+
+        for attempt in range(1, self.args.max_attempts + 1):
+            if self.stop_requested:
+                raise ConnectionClosed("server stopping")
+
+            remaining = (authorization_deadline - time.monotonic()
+                         if authorization_deadline is not None else self.retry_seconds)
+            if remaining <= 0:
+                raise NoResponse("authorization expired before transmission")
+            session.send(request, min(self.retry_seconds, remaining))
+            sent_wall = utc_now()
+            sent_monotonic = time.monotonic()
+            if first_sent_at is None:
+                first_sent_at = sent_wall
+
+            deadline = min(sent_monotonic + self.retry_seconds,
+                           authorization_deadline if authorization_deadline is not None else float("inf"))
+            while True:
+                response = session.next_json(deadline)
+                if response is None:
+                    break
+                try:
+                    lane_state = validate_lane_state(response, lane_id)
+                    if lane_state["laneID"] != lane_id:
+                        raise ValueError(f"response laneID {lane_state['laneID']!r} does not match {lane_id!r}")
+                except ValueError as error:
+                    self.invalid_response(str(error), lane_id)
+                    continue
+
+                rtt_ms = (time.monotonic() - sent_monotonic) * 1000.0
+                self.status.response(
+                    operation,
+                    lane_state,
+                    rtt_ms,
+                    is_command=is_command,
+                )
+                if operation != "NOP" or self.args.debug:
+                    log(
+                        "response",
+                        op=operation,
+                        laneID=lane_id,
+                        port=self.channels[lane_id].port,
+                        attempt=attempt,
+                        rttMs=round(rtt_ms, 3),
+                        laneState=lane_state,
+                    )
+
+                return {
+                    "request": request,
+                    "response": lane_state,
+                    "firstSentAt": first_sent_at,
+                    "respondedAt": utc_now(),
+                    "attempts": attempt,
+                    "roundTripMs": round(rtt_ms, 3),
+                }
+
+            if attempt < self.args.max_attempts:
+                self.status.retry(lane_id)
+                if operation != "NOP" or self.args.debug:
+                    log("retransmit", op=operation, laneID=lane_id, port=self.channels[lane_id].port, nextAttempt=attempt + 1)
+
+        self.status.timeout(lane_id)
+        log("response_timeout", op=operation, laneID=lane_id, port=self.channels[lane_id].port, attempts=self.args.max_attempts)
+        raise NoResponse(f"no laneState response for {operation}")
+
+    def handle_unsolicited(self, message, lane_id):
+        try:
+            lane_state = validate_lane_state(message, lane_id)
+            validate_lane_id(lane_state["laneID"], self.lane_ids)
+        except ValueError as error:
+            self.invalid_response(str(error), lane_id)
+            return
+        self.status.response("unsolicited", lane_state, None, is_command=False)
+        log("unsolicited_lane_state", laneID=lane_id, port=self.channels[lane_id].port, laneState=lane_state)
+
+    def exchange_dispatch(self, session, pending):
+        if pending.require_open_gate:
+            # Check the actual controller in the same serialized exchange loop.
+            # A historical successful tag response does not prove the gate is
+            # still open when a following car is ready to join the queue.
+            checked = self.exchange(session, {"op": "NOP", "laneID": pending.request["laneID"]},
+                                    authorization_deadline=pending.deadline)
+            state = checked["response"]
+            if state["laneState"] != 1 or state["gateState"] != 1:
+                result = self.reject(pending.request, "GATE_NOT_OPEN", "Following car requires an open gate")
+                result.update(notSent=True, response=state)
+                return result
+        result = {"ok": True, "code": "ACKNOWLEDGED"}
+        result.update(self.exchange(session, pending.request, is_command=True,
+                                    authorization_deadline=pending.deadline))
+        return result
+
+    def handle_client(self, client_socket, address, channel):
+        lane_id = channel.lane_id
+        client_name = f"{address[0]}:{address[1]}"
+        try:
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            session = LineJsonSession(
+                client_socket,
+                self.args.max_line_bytes,
+                lambda error: self.invalid_response(error, lane_id),
+                lane_id=lane_id,
+            )
+            self.status.connected(lane_id, client_name)
+            log("client_connected", laneID=lane_id, port=channel.port, client=client_name)
+
+            self.exchange(session, {"op": "NOP", "laneID": lane_id})
+            next_heartbeat = time.monotonic() + self.heartbeat_seconds
+            with channel.lock:
+                if self.stop_requested:
+                    return
+                channel.partner_ready.set()
+                self.status.ready(lane_id)
+
+            while not self.stop_requested:
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    self.exchange(session, {"op": "NOP", "laneID": lane_id})
+                    next_heartbeat = time.monotonic() + self.heartbeat_seconds
+                    continue
+
+                pending = self.next_dispatch(channel)
+                if pending is not None:
+                    try:
+                        result = self.exchange_dispatch(session, pending)
+                    except Exception as error:
+                        pending.complete(
+                            self.dispatch_failure(
+                                pending.request, "DELIVERY_FAILED", error
+                            )
+                        )
+                        channel.dispatch_queue.task_done()
+                        raise
+                    pending.complete(result)
+                    channel.dispatch_queue.task_done()
+                    log(
+                        "command_completed" if result["ok"] else "command_not_sent",
+                        op=pending.request["op"],
+                        laneID=pending.request["laneID"],
+                        attempts=result.get("attempts", 0),
+                        roundTripMs=result.get("roundTripMs"),
+                    )
+                    next_heartbeat = time.monotonic() + self.heartbeat_seconds
+                    continue
+
+                deadline = min(
+                    next_heartbeat,
+                    now + self.command_poll_seconds,
+                )
+                unsolicited = session.next_json(deadline)
+                if unsolicited is not None:
+                    self.handle_unsolicited(unsolicited, lane_id)
+
+        except (ConnectionClosed, NoResponse, ProtocolError) as error:
+            log("client_disconnected", laneID=lane_id, port=channel.port, client=client_name, reason=str(error))
+        except Exception as error:
+            log("client_error", laneID=lane_id, port=channel.port, client=client_name, error=str(error))
+            traceback.print_exc()
+        finally:
+            with channel.lock:
+                channel.partner_ready.clear()
+                self.fail_queued_dispatches(channel, "DISCONNECTED", "Synergy lane client disconnected before delivery")
+                client_socket.close()
+                channel.client_socket = None
+                self.status.disconnected(lane_id)
+
+    def lane_listener_loop(self, listener, channel):
+        while not self.stop_requested:
+            try:
+                client, address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_requested:
+                    break
+                raise
+            with channel.lock:
+                if self.stop_requested or channel.client_socket is not None:
+                    client.close()
+                    log("client_rejected", laneID=channel.lane_id, port=channel.port,
+                        reason="lane already connected or server stopping")
+                    continue
+                channel.client_socket = client
+                channel.client_thread = threading.Thread(
+                    target=self.handle_client, args=(client, address, channel),
+                    name=f"serverSynergyLane-{channel.lane_id}", daemon=True)
+                channel.client_thread.start()
+
+    def start_dispatch_listener(self):
+        self.dispatch_socket_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = self.dispatch_socket_path.lstat().st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(mode):
+                raise RuntimeError(
+                    f"refusing to replace non-socket path {self.dispatch_socket_path}"
+                )
+            self.dispatch_socket_path.unlink()
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.dispatch_socket_path))
+            os.chmod(self.dispatch_socket_path, 0o660)
+            listener.listen(self.args.dispatch_queue_size)
+            listener.settimeout(0.2)
+        except Exception:
+            listener.close()
+            raise
+        self.dispatch_listener = listener
+        self.dispatch_thread = threading.Thread(
+            target=self.dispatch_listener_loop,
+            name="serverSynergyDispatch",
+            daemon=True,
+        )
+        self.dispatch_thread.start()
+
+    def serve(self):
+        listeners = []
+        threads = []
+        try:
+            # Bind every port before enabling any partner or local dispatch.
+            for channel in self.channels.values():
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listeners.append(listener)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((self.args.bind, channel.port))
+                listener.listen(4)
+                listener.settimeout(0.2)
+            self.start_dispatch_listener()
+            for listener, channel in zip(listeners, self.channels.values()):
+                thread = threading.Thread(target=self.lane_listener_loop, args=(listener, channel),
+                                          name=f"serverSynergyListen-{channel.lane_id}", daemon=True)
+                threads.append(thread)
+                thread.start()
+            log("server_started", bind=self.args.bind, lanePorts=self.args.lane_ports,
+                dispatchSocket=str(self.dispatch_socket_path), dispatchTimeoutMs=self.args.dispatch_timeout_ms,
+                heartbeatMs=self.args.heartbeat_ms, retryMs=self.args.retry_ms, maxAttempts=self.args.max_attempts)
+            while not self.stop_requested:
+                if any(not thread.is_alive() for thread in threads):
+                    raise RuntimeError("lane listener stopped unexpectedly")
+                time.sleep(0.1)
+        finally:
+            self.stop_requested = True
+            for listener in listeners:
+                listener.close()
+            for channel in self.channels.values():
+                with channel.lock:
+                    channel.partner_ready.clear()
+                    self.fail_queued_dispatches(channel, "SERVER_STOPPING", "serverSynergy is stopping")
+                    if channel.client_socket is not None:
+                        try:
+                            channel.client_socket.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+            if self.dispatch_listener is not None:
+                self.dispatch_listener.close()
+            for thread in threads + [channel.client_thread for channel in self.channels.values()] + [self.dispatch_thread]:
+                if thread is not None:
+                    thread.join(timeout=1.0)
+            if self.dispatch_listener is not None:
+                try:
+                    if stat.S_ISSOCK(self.dispatch_socket_path.lstat().st_mode):
+                        self.dispatch_socket_path.unlink()
+                except FileNotFoundError:
+                    pass
+            for lane_id in self.channels:
+                self.status.disconnected(lane_id)
+            log("server_stopped")
+
+
+def positive_float(value):
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lanes", default=os.environ.get("AKIRA_LANES"),
+                        help="comma-separated lane IDs (default: lanes in akira.cfg)")
+    parser.add_argument("--bind", default=os.environ.get("AKIRA_BIND"), help="override configured listen address")
+    parser.add_argument("--lane-ports", help="override lane ports, e.g. 06=2070,07=2071")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=os.environ.get("AKIRA_PORT"),
+        help="single-lane TCP port override; requires --lanes with one lane",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=os.environ.get("AKIRA_DATA_DIR", DEFAULT_DATA_DIR),
+        help=f"runtime status root (default: {DEFAULT_DATA_DIR})",
+    )
+    parser.add_argument(
+        "--dispatch-socket",
+        default=os.environ.get("AKIRA_DISPATCH_SOCKET"),
+        help="local live-dispatch Unix socket (default: <data-dir>/live.sock)",
+    )
+    parser.add_argument(
+        "--dispatch-timeout-ms",
+        type=positive_float,
+        default=float(
+            os.environ.get(
+                "AKIRA_DISPATCH_TIMEOUT_MS", DEFAULT_DISPATCH_TIMEOUT_MS
+            )
+        ),
+    )
+    parser.add_argument(
+        "--dispatch-queue-size",
+        type=positive_int,
+        default=int(
+            os.environ.get(
+                "AKIRA_DISPATCH_QUEUE_SIZE", DEFAULT_DISPATCH_QUEUE_SIZE
+            )
+        ),
+    )
+    parser.add_argument(
+        "--heartbeat-ms",
+        type=positive_float,
+        default=float(os.environ.get("AKIRA_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS)),
+    )
+    parser.add_argument(
+        "--retry-ms",
+        type=positive_float,
+        default=float(os.environ.get("AKIRA_RETRY_MS", DEFAULT_RETRY_MS)),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=int(os.environ.get("AKIRA_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)),
+    )
+    parser.add_argument(
+        "--command-poll-ms",
+        type=positive_float,
+        default=float(
+            os.environ.get("AKIRA_COMMAND_POLL_MS", DEFAULT_COMMAND_POLL_MS)
+        ),
+    )
+    parser.add_argument(
+        "--max-line-bytes",
+        type=positive_int,
+        default=int(os.environ.get("AKIRA_MAX_LINE_BYTES", DEFAULT_MAX_LINE_BYTES)),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=os.environ.get("AKIRA_DEBUG", "0").lower() in ("1", "true", "yes"),
+        help="log successful NOP exchanges",
+    )
+    args = parser.parse_args(argv)
+    try:
+        args.lanes = configured_lane_ids(PROJECT_ROOT, args.lanes)
+        bind, args.lane_ports = lane_endpoints(PROJECT_ROOT, args.lanes, args.lane_ports, args.port)
+        args.bind = args.bind or bind
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        parser.error(f"invalid lane configuration: {error}")
+    if not args.dispatch_socket:
+        args.dispatch_socket = str(Path(args.data_dir) / "live.sock")
+    if args.command_poll_ms > args.heartbeat_ms:
+        parser.error("--command-poll-ms cannot exceed --heartbeat-ms")
+    minimum_dispatch_ms = (
+        args.retry_ms * args.max_attempts + args.command_poll_ms
+    )
+    if args.dispatch_timeout_ms <= minimum_dispatch_ms:
+        parser.error(
+            "--dispatch-timeout-ms must exceed retry-ms * max-attempts "
+            "+ command-poll-ms"
+        )
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    server = AkiraServer(args)
+    signal.signal(signal.SIGINT, server.request_stop)
+    signal.signal(signal.SIGTERM, server.request_stop)
+    try:
+        server.serve()
+    except KeyboardInterrupt:
+        server.request_stop()
+    except Exception as error:
+        log("server_error", error=str(error))
+        traceback.print_exc()
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

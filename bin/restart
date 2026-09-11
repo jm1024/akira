@@ -1,3 +1,4 @@
 #!/bin/bash
-/var/sidra/bin/down
-/var/sidra/bin/up
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+"$SCRIPT_DIR/down"
+"$SCRIPT_DIR/up"

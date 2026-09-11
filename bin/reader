@@ -8,20 +8,22 @@ import threading
 import queue
 import time
 
-#mass imports
-import telnetlib
-import argparse
+import errno
 import os
+import re
 import signal
 import traceback
 
-import sidraCore
+import akiraCore
+import massSensor
+from lanePassage import LanePassages
+from numatoTelnet import NumatoConnection
 
 import importlib
 
 #dynamically load all read drivers
 readDrivers = {}
-for driver in sidraCore.driversRead:
+for driver in akiraCore.driversRead:
     readDrivers[driver] = importlib.import_module(driver)
     print("Loaded read driver: " + driver)
 
@@ -39,14 +41,12 @@ fastPre = 0
 fastPost = 0
 slowPre = 0
 slowPost = 0
-maxReportAge = 0
-minReads = 0
-slowTrigger = "main"
 
-UNLOCK_LOCKOUT = 1500 # <----------- JM USE THIS
-
-#lane
-lane = ""
+# reader lanes. A physical reader may serve one or more lanes; all mutable
+# detection state is held in LaneContext instances below.
+readerLanes = []
+laneContexts = {}
+antennaMap = {}
 
 #reader info
 readerName = ""
@@ -55,9 +55,11 @@ antennas = []
 
 READER_COMMAND_PORT = 50007
 READER_EVENT_PORT = 50008
+READER_FRAME_DELIMITER = b"\r\n\r\n"
+READER_RECONNECT_SECONDS = 2
+READER_MAX_FRAME_BYTES = 65536
 
 #time to squelch reads that have been sent
-MULTI_POOL_SQUELCH = True
 SQUELCH_TIME = 5000
 SQUELCH_DISABLE = False
 
@@ -72,7 +74,7 @@ region = "" # JM implement from .cfg
 #frequency 918.25 MHz - non MY
 #frequency = "918250"
 #frequency 919.25 - MY
-frequency = "919250" # loaded from sidra.cfg
+frequency = "919250" # loaded from akira.cfg
 
 DEBUG = True
 DEBUG_READER_RECV = False
@@ -103,15 +105,15 @@ GEN_FAKE_TAG_RESPONSE = True
 
 #event log
 LOG_EVENTS = True
-LOG_EVENTS_FILE = "/var/sidra/log/events.log"
+LOG_EVENTS_FILE = akiraCore.LOG_DIR + "/events.log"
 
 #detailed log # of reads etc
 LOG_STATS = True
-LOG_STATS_FILE = "/var/sidra/log/stats.log"
+LOG_STATS_FILE = akiraCore.LOG_DIR + "/stats.log"
 
 #log all reads
 LOG_READS = False
-LOG_READS_FILE = "/var/sidra/log/reads.log"
+LOG_READS_FILE = akiraCore.LOG_DIR + "/reads.log"
 
 
 AUTH_AUTHENTIC = "AUTHENTIC"
@@ -122,29 +124,443 @@ ANTENNA_FAST = "fast"
 ANTENNA_SLOW = "slow"
 
 arrivals = {}
-reports = []
-squelch = []
+arrivalsLock = threading.RLock()
 
 #queues
 rfQ = queue.Queue(maxsize=5000)
-massQ = queue.Queue(maxsize=5000)
 
 ######################
 #mass settings
 MASS_PORT = 23
 MASS_USERNAME = "admin"
 MASS_PASSWORD = "admin"
-
-massName = ""
-massIp = ""
-massPinTrip = ""
-massPinMain = ""
-massPinRear = ""
-state = {}
-
-tnConn = None
+massReconnectSeconds = 10
+readerReconnectFatalSeconds = 60
 
 STOP = object()
+
+command_socket = None
+commandRecvBuffer = b""
+commandLock = threading.RLock()
+activeEventConnection = None
+activeEventConnectionLock = threading.RLock()
+readerProcessLock = None
+
+
+class LaneContext:
+    """Mutable detection state for exactly one lane."""
+
+    def __init__(self, lane, mass_config):
+        self.lane = str(lane)
+        self.mass_config = massSensor.normalizeConfig(mass_config)
+        self.clear_debounce_ms = self.mass_config["clearDebounceMs"]
+        self.massQ = queue.Queue(maxsize=5000)
+        self.lastPublishedMassState = None
+        self.responseQ = queue.Queue(maxsize=1000)
+        self.reports = []
+        self.squelch = []
+        self.lock = threading.RLock()
+        self.arbitrationWindowActivity = None
+
+
+class ReaderCommandError(RuntimeError):
+    pass
+
+
+class DelimitedReaderConnection:
+    """Buffered TCP connection for the reader's CRLF-delimited protocol."""
+
+    def __init__(self, host, port, timeout=5, socket_factory=socket.create_connection):
+        self.host = host
+        self.port = int(port)
+        self.socket = socket_factory((host, self.port), timeout)
+        self.socket.settimeout(1.0)
+        self.buffer = b""
+
+    def readFrame(self, stop_event=None, timeout=None):
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(0, float(timeout))
+
+        while True:
+            marker = self.buffer.find(READER_FRAME_DELIMITER)
+            if marker >= 0:
+                frame = self.buffer[:marker]
+                self.buffer = self.buffer[marker + len(READER_FRAME_DELIMITER):]
+                return frame.decode("ascii", errors="replace").strip()
+
+            if len(self.buffer) > READER_MAX_FRAME_BYTES:
+                raise ConnectionError(
+                    f"reader frame exceeded {READER_MAX_FRAME_BYTES} bytes without delimiter"
+                )
+
+            if stop_event is not None and stop_event.is_set():
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for reader frame from {self.host}:{self.port}"
+                )
+
+            try:
+                chunk = self.socket.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise ConnectionError("reader event connection closed")
+            self.buffer += chunk
+
+    def close(self):
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.socket.close()
+
+
+class ReaderLinkHealth:
+    """Thread-safe state used by the parent to supervise the shared RF link."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.connected = False
+        self.disconnectedSince = time.monotonic()
+        self.lastEventAt = None
+        self.lastError = "not connected"
+
+    def markConnected(self):
+        with self.lock:
+            self.connected = True
+            self.disconnectedSince = None
+            self.lastError = ""
+
+    def markEvent(self):
+        with self.lock:
+            self.lastEventAt = time.monotonic()
+
+    def markDisconnected(self, error):
+        with self.lock:
+            if self.connected or self.disconnectedSince is None:
+                self.disconnectedSince = time.monotonic()
+            self.connected = False
+            self.lastError = str(error)
+
+    def disconnectedFor(self):
+        with self.lock:
+            if self.connected or self.disconnectedSince is None:
+                return 0.0
+            return time.monotonic() - self.disconnectedSince
+
+    def error(self):
+        with self.lock:
+            return self.lastError
+
+
+class CrossLaneArbiter:
+    """Assign qualified lane/side/TID pools as one passage-level matching.
+
+    Each lane/side slot submits every qualified candidate in its current mass
+    window. An uncontested active lane claims immediately; simultaneous active
+    lanes wait briefly for a matching with at most one TID per slot and at most
+    one slot per TID. Once assigned, later fast/slow reads for the winning lane
+    remain valid and renew ownership while other lanes are suppressed.
+    """
+
+    def __init__(
+        self,
+        arbitration_ms=150,
+        assignment_ms=5000,
+        mass_tolerance_ms=10,
+    ):
+        self.arbitration_seconds = max(0, int(arbitration_ms)) / 1000.0
+        self.assignment_seconds = max(1, int(assignment_ms)) / 1000.0
+        self.mass_tolerance_ms = max(0, float(mass_tolerance_ms))
+        self.condition = threading.Condition()
+        self.pendingBatch = None
+        self.activeWindows = {}
+        self.assignments = {}
+        self.lastAmbiguityLogAt = 0.0
+
+    def setLaneWindowActivity(self, lane, fastActive, slowActive):
+        """Publish the lane's current mass-gated RF window activity."""
+        lane = str(lane)
+        updates = {
+            (lane, ANTENNA_FAST): bool(fastActive),
+            (lane, ANTENNA_SLOW): bool(slowActive),
+        }
+        with self.condition:
+            changed = any(
+                self.activeWindows.get(slot) != active
+                for slot, active in updates.items()
+            )
+            self.activeWindows.update(updates)
+            if changed:
+                self.condition.notify_all()
+
+    def _active_lanes(self):
+        return {
+            slot[0]
+            for slot, active in self.activeWindows.items()
+            if active
+        }
+
+    def _clean_assignments(self, now):
+        expired = [tid for tid, value in self.assignments.items() if value[1] <= now]
+        for tid in expired:
+            del self.assignments[tid]
+
+    @staticmethod
+    def _candidate_sort_key(item):
+        lane, evidence = item
+        return (
+            -int(bool(evidence.get("massActive", False))),
+            float(evidence.get("massOffsetMs", 999999999)),
+            -int(evidence.get("reads", 0)),
+            -int(evidence.get("rssi", -999999)),
+            str(lane),
+        )
+
+    def _cross_lane_evidence_ambiguous(self, first, second):
+        if bool(first.get("massActive", False)) != bool(
+            second.get("massActive", False)
+        ):
+            return False
+        firstOffset = float(first.get("massOffsetMs", 999999999))
+        secondOffset = float(second.get("massOffsetMs", 999999999))
+        if firstOffset == secondOffset:
+            return True
+        difference = abs(firstOffset - secondOffset)
+        if difference != difference:  # NaN, including inf - inf
+            return True
+        return difference <= self.mass_tolerance_ms
+
+    def _best_matching(self, pools):
+        """Return conservative mutual-best slot/TID assignments.
+
+        A slot must prefer the TID, and the TID must independently prefer that
+        lane. Weak fallback candidates are never used merely to fill more
+        slots. Cross-lane mass timing inside the configured tolerance fails
+        closed because RF count/RSSI can be dominated by antenna bleed.
+        """
+        slotWinners = {}
+        candidatesByTid = {}
+
+        for slot, pool in pools.items():
+            if not pool:
+                continue
+            selectedTid, selectedEvidence = min(
+                pool.items(),
+                key=lambda item: self._candidate_sort_key(item),
+            )
+            slotWinners[slot] = (selectedTid, selectedEvidence)
+            for tid, evidence in pool.items():
+                candidatesByTid.setdefault(tid, []).append((slot, evidence))
+
+        winningLaneByTid = {}
+        for tid, candidates in candidatesByTid.items():
+            bestByLane = {}
+            for slot, evidence in candidates:
+                lane = slot[0]
+                current = bestByLane.get(lane)
+                if current is None or (
+                    self._candidate_sort_key((slot, evidence))
+                    < self._candidate_sort_key(current)
+                ):
+                    bestByLane[lane] = (slot, evidence)
+
+            rankedLanes = sorted(
+                bestByLane.items(),
+                key=lambda item: (
+                    self._candidate_sort_key((item[0], item[1][1])),
+                    str(item[0]),
+                ),
+            )
+            if len(rankedLanes) == 1:
+                winningLaneByTid[tid] = rankedLanes[0][0]
+                continue
+            if not self._cross_lane_evidence_ambiguous(
+                rankedLanes[0][1][1],
+                rankedLanes[1][1][1],
+            ):
+                winningLaneByTid[tid] = rankedLanes[0][0]
+
+        mutualByTid = {}
+        for slot, selected in slotWinners.items():
+            tid, evidence = selected
+            if winningLaneByTid.get(tid) != slot[0]:
+                continue
+            mutualByTid.setdefault(tid, []).append((slot, evidence))
+
+        matching = {}
+        for tid, mutualCandidates in mutualByTid.items():
+            selectedSlot, selectedEvidence = min(
+                mutualCandidates,
+                key=lambda item: (
+                    self._candidate_sort_key(item),
+                    str(item[0]),
+                ),
+            )
+            matching[selectedSlot] = (tid, selectedEvidence)
+        return matching
+
+    def submitPool(self, lane, side, candidates, evidenceByTid=None):
+        lane = str(lane)
+        side = str(side or "")
+        slot = (lane, side)
+        evidenceByTid = evidenceByTid or {}
+
+        with self.condition:
+            now = time.monotonic()
+            self._clean_assignments(now)
+
+            pool = {}
+            assignedHere = []
+            for read in candidates:
+                tid = str(read.get("tid", ""))
+                if not tid:
+                    continue
+                assigned = self.assignments.get(tid)
+                if assigned is not None and assigned[0] != lane:
+                    continue
+                evidence = dict(evidenceByTid.get(tid, {}))
+                evidence.setdefault("reads", read.get("reads", read.get("count", 0)))
+                evidence.setdefault("rssi", read.get("rssi", -999999))
+                pool[tid] = evidence
+                if assigned is not None:
+                    assignedHere.append(tid)
+
+            # Preserve an existing TID-to-lane decision across fast/slow reads.
+            if assignedHere:
+                assignedTid = sorted(
+                    assignedHere,
+                    key=lambda tid: self._candidate_sort_key((lane, pool[tid])),
+                )[0]
+                # A later fast/slow sighting in the owning lane is part of the
+                # same passage, so keep the lane claim alive from this sighting.
+                self.assignments[assignedTid] = (
+                    lane,
+                    now + self.assignment_seconds,
+                )
+                return next(
+                    (read for read in candidates if str(read.get("tid", "")) == assignedTid),
+                    None,
+                )
+            if not pool:
+                return None
+
+            # Most passages occupy only one lane. In that case there is no
+            # competing mass-gated lane evidence to wait for: claim the best
+            # qualified TID immediately. A live pending batch always wins this
+            # check so an in-flight contender cannot be bypassed.
+            if self.pendingBatch is None and self._active_lanes() == {lane}:
+                matching = self._best_matching({slot: pool})
+                selected = matching.get(slot)
+                if selected is None:
+                    return None
+                selectedTid = selected[0]
+                assigned = self.assignments.get(selectedTid)
+                if assigned is not None and assigned[0] != lane:
+                    return None
+                self.assignments[selectedTid] = (
+                    lane,
+                    now + self.assignment_seconds,
+                )
+                return next(
+                    (read for read in candidates if str(read.get("tid", "")) == selectedTid),
+                    None,
+                )
+
+            batch = self.pendingBatch
+            if batch is None:
+                batch = {
+                    "deadline": now + self.arbitration_seconds,
+                    "pools": {},
+                    "reads": {},
+                    "decisions": None,
+                }
+                self.pendingBatch = batch
+
+            batch["pools"][slot] = pool
+            batch["reads"][slot] = {
+                str(read.get("tid", "")): read for read in candidates if read.get("tid")
+            }
+
+            while batch["decisions"] is None:
+                remaining = batch["deadline"] - time.monotonic()
+                if remaining > 0:
+                    self.condition.wait(timeout=remaining)
+                    continue
+
+                resolutionNow = time.monotonic()
+                self._clean_assignments(resolutionNow)
+                eligiblePools = {}
+                for poolSlot, submittedPool in batch["pools"].items():
+                    poolLane = poolSlot[0]
+                    eligiblePool = {
+                        tid: evidence
+                        for tid, evidence in submittedPool.items()
+                        if tid not in self.assignments
+                        or self.assignments[tid][0] == poolLane
+                    }
+                    if eligiblePool:
+                        eligiblePools[poolSlot] = eligiblePool
+
+                matching = self._best_matching(eligiblePools)
+                if not matching and len(eligiblePools) > 1:
+                    nowMonotonic = time.monotonic()
+                    if nowMonotonic - self.lastAmbiguityLogAt >= 60:
+                        summary = {
+                            f"{poolSlot[0]}/{poolSlot[1] or 'unspecified'}": sorted(pool)
+                            for poolSlot, pool in eligiblePools.items()
+                        }
+                        message = (
+                            f"CROSS LANE AMBIGUOUS pools:{summary}; "
+                            "no tag assignment emitted"
+                        )
+                        if LOG_EVENTS:
+                            print(message)
+                            akiraCore.log(message)
+                        self.lastAmbiguityLogAt = nowMonotonic
+                batch["decisions"] = {}
+                assignmentExpiry = time.monotonic() + self.assignment_seconds
+                for selectedSlot, selected in matching.items():
+                    selectedLane = selectedSlot[0]
+                    selectedTid = selected[0]
+                    assigned = self.assignments.get(selectedTid)
+                    if assigned is not None and assigned[0] != selectedLane:
+                        continue
+                    self.assignments[selectedTid] = (selectedLane, assignmentExpiry)
+                    batch["decisions"][selectedSlot] = selectedTid
+                if self.pendingBatch is batch:
+                    self.pendingBatch = None
+                self.condition.notify_all()
+
+            selectedTid = batch["decisions"].get(slot)
+            if selectedTid is None:
+                return None
+            return batch["reads"][slot].get(selectedTid)
+
+    def submit(self, read, evidence=None):
+        lane = str(read.get("lane", ""))
+        tid = str(read.get("tid", ""))
+        if not lane or not tid:
+            return False
+        winner = self.submitPool(
+            lane,
+            read.get("side", ""),
+            [read],
+            {tid: dict(evidence or {})},
+        )
+        return winner is not None and str(winner.get("tid", "")) == tid
+
+    def assignedLane(self, tid):
+        with self.condition:
+            now = time.monotonic()
+            self._clean_assignments(now)
+            assigned = self.assignments.get(str(tid))
+            return assigned[0] if assigned is not None else None
+
+
+tagArbiter = CrossLaneArbiter()
 
 ##################################################
 # misc methods
@@ -152,7 +568,7 @@ STOP = object()
 def getSwitchFile():
     ret = False
     try:
-        result = sidraCore.readFile(sidraCore.TMP_DIR + "/" + READER_SWITCH_FILE)
+        result = akiraCore.readFile(akiraCore.TMP_DIR + "/" + READER_SWITCH_FILE)
         text = result.strip().lower()
         if text in ("1", "on", "true", "high"):
             ret = True
@@ -161,18 +577,67 @@ def getSwitchFile():
 
     return ret
 
+
+def acquireReaderProcessLock(reader_name):
+    """Hold a Linux abstract socket so only one process owns a reader."""
+    global readerProcessLock
+
+    safeName = re.sub(r"[^A-Za-z0-9_.-]", "_", str(reader_name))
+    address = "\0akira.reader." + safeName
+    lockSocket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        lockSocket.bind(address)
+    except OSError as ex:
+        lockSocket.close()
+        if ex.errno == errno.EADDRINUSE:
+            raise RuntimeError(f"reader {reader_name} is already running") from ex
+        raise
+    readerProcessLock = lockSocket
+    return lockSocket
+
 ##################################################
 # mass comm
 ##################################################
 
 #############################
-def monitorNotifications(tn, stop_event):
+def publishMassState(context, current):
+    logicalState = massSensor.logicalState(current, context.mass_config)
+    massEvent = {
+        "lane": context.lane,
+        "date": datetime.now(),
+        **logicalState,
+    }
 
-    global lane
+    # One Numato monitor owns each lane. Changes within an occupied group do
+    # not change passage state, but still belong in the raw diagnostic snapshot.
+    state = tuple(logicalState[role] for role in massSensor.MASS_ROLES)
+    published = False
+    if state != context.lastPublishedMassState:
+        try:
+            context.massQ.put(massEvent, timeout=0.05)
+        except queue.Full:
+            print(f"massQ FULL - lane {context.lane} not draining?")
+        else:
+            context.lastPublishedMassState = state
+            published = True
+
+    if published and LOG_READS:
+        akiraCore.appendFile(LOG_READS_FILE, json.dumps(massEvent, default=akiraCore.jsonConverter) + '\n')
+
+    try:
+        massFile = akiraCore.MASS_DIR + "/" + context.lane + akiraCore.STATE_EXTENSION_MASS
+        akiraCore.writeFile(massFile, json.dumps(massEvent, default=akiraCore.jsonConverter))
+    except Exception as ex:
+        print(f"reader.publishMassState error writing mass file {context.lane} {str(ex)}")
+    return published
+
+
+#############################
+def monitorNotifications(tn, stop_event, context):
 
     try:
         while not stop_event.is_set():
-            data = tn.read_until(b"\n", timeout=1)
+            data = tn.readline(timeout=1)
 
             if stop_event.is_set():
                 break
@@ -180,7 +645,7 @@ def monitorNotifications(tn, stop_event):
             if not data:
                 continue
 
-            text = data.decode(errors="ignore").strip()
+            text = data.strip()
             if not text:
                 continue
 
@@ -188,41 +653,21 @@ def monitorNotifications(tn, stop_event):
             if state is None:
                 continue
 
-            tripState, mainState, rearState = getMassStates(state)
-
-            massEvent = {
-                "lane": lane,
-                "date": datetime.now(),
-                "trip": tripState,
-                "main": mainState,
-                "rear": rearState,
-            }
-
-            #massQ.put(massEvent)
-            try:
-                massQ.put(massEvent, timeout=0.05)
-            except queue.Full:
-                print("massQ FULL - laneThread not draining?")
-
-            if LOG_READS:
-                sidraCore.appendFile(LOG_READS_FILE, json.dumps(massEvent, default=sidraCore.jsonConverter) + '\n')
-
-            try:
-                massFile = sidraCore.MASS_DIR + "/" + str(lane) + sidraCore.STATE_EXTENSION_MASS
-                #print(massFile)
-                sidraCore.writeFile(massFile, json.dumps(massEvent, default=sidraCore.jsonConverter))
-            except Exception as ex:
-                msg  = f"reader.monitorNotifications error writing mass file {lane} {str(ex)}"
-                print(msg)
+            publishMassState(context, state)
 
 
 
     except Exception as ex:
-        print("Exception in mass monitorNotifications:", ex)
+        print(f"Exception in mass monitorNotifications lane:{context.lane}: {ex}")
         traceback.print_exc()
 
     finally:
-        print("MASS THREAD END " + str(lane))
+        print("MASS THREAD END " + context.lane)
+        try:
+            sendLine(tn, "gpio notify off")
+            tn.read_available(timeout=0.2)
+        except Exception:
+            pass
         try:
             tn.close()
         except Exception:
@@ -230,25 +675,21 @@ def monitorNotifications(tn, stop_event):
 
 #############################
 def readUntil(tn, marker, timeout=.5):
-    """Read until marker bytes are seen or timeout expires."""
+    """Read until a text marker is seen or timeout expires."""
     if DEBUG_MASS_DETAIL:
         print(f"readUntil({marker!r})")
-    data = tn.read_until(marker.encode("ascii"), timeout)
+    data = tn.read_until(marker, timeout=timeout)
     if DEBUG_MASS_DETAIL and data:
-        try:
-            print("<<", data.decode(errors="ignore"))
-        except Exception:
-            print("<<", data)
+        print("<<", data)
     return data
 
 
 #############################
 def sendLine(tn, line):
     """Send a line terminated with CRLF."""
-    msg = (line + "\r\n").encode("ascii")
     if DEBUG_MASS_DETAIL:
-        print(">>", msg)
-    tn.write(msg)
+        print(">>", line)
+    tn.write_line(line)
 
 
 #############################
@@ -267,8 +708,7 @@ def login(tn):
 
     # Read a little bit of what comes next
     time.sleep(0.2)
-    data = tn.read_very_eager()
-    text = data.decode(errors="ignore") if data else ""
+    text = tn.read_available(timeout=0.2)
 
     #if DEBUG and text:
     #    print("LOGIN RESPONSE RAW:\n", text)
@@ -282,125 +722,52 @@ def login(tn):
 
 
 #############################
-def setAllInputsAndNotify(tn):
+def setAllInputsAndNotify(tn, context):
     """
     - iomask: affect all 16 bits
     - iodir: 1 = input, so ffff = all inputs
     - readall once (and set initial global state)
     - enable notifications
     """
-    global state
-
+    # Each connection must publish an initial snapshot, even if it matches the
+    # previous connection. If readall is empty, the first notification does so.
+    context.lastPublishedMassState = None
     # iomask: affect all 16 bits
     sendLine(tn, "gpio iomask ffff")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
     # iodir: 1 = input, so ffff = all inputs
     sendLine(tn, "gpio iodir ffff")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
     # initial read
     sendLine(tn, "gpio readall")
-    time.sleep(0.1)
-    resp = tn.read_very_eager()
+    resp = tn.read_available(timeout=0.2)
 
     if resp:
-        text = resp.decode(errors="ignore").strip()
+        text = resp.strip()
         if DEBUG_MASS_DETAIL:
             print("READALL:\n", text)
 
         parsed = parseGpio(text)
         if parsed is not None:
-            state = parsed
-            #updateMass(parsed)
+            publishMassState(context, parsed)
             if DEBUG_MASS_DETAIL:
-                print(state)
+                print(parsed)
 
     # enable notifications
     sendLine(tn, "gpio notify on")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
 #############################
 def parseGpio(text):
-
-    #print("parseGpio: " + str(text))
-
-    text = text.strip()
-    if not text:
-        return None
-
-    #if DEBUG:
-    #    print(text)
-
-    parts = text.split()
-    if not parts:
-        return None
-
-    hexChars = "0123456789ABCDEFabcdef"
-    hexVal = None
-
-    # Case 1: notification line like '# FEFF FEFE FFFF'
-    # You believe the first hex after '#' is the current state,
-    # so use parts[1].
-    if parts[0] == "#" and len(parts) >= 2:
-        candidate = "".join(c for c in parts[1] if c in hexChars)
-        if candidate:
-            hexVal = candidate
-
-    # Case 2: readall or anything else: first token that has any hex in it
-    if hexVal is None:
-        for p in parts:
-            candidate = "".join(c for c in p if c in hexChars)
-            if candidate:
-                hexVal = candidate
-                break
-
-    if hexVal is None:
-        print("parseGpio: no hex found in:", repr(text))
-        return None
-
-    try:
-        value = int(hexVal, 16)
-    except ValueError:
-        print("parseGpio: bad hex:", hexVal)
-        return None
-
-    # 16-bit, LSB = io100
-    bits = f"{value:016b}"[::-1]
-
-    result = {}
-    for i in range(16):
-        pin = i + 100
-        result[f"{pin}"] = int(bits[i])
-
-    #updateMass(result)
-
-    return result
+    return massSensor.parseGpio(text)
 
 
 #############################
-def getMassStates(current):
-
-    global massPinTrip
-    global massPinMain
-    global massPinRear
-
-    #print(current)
-    trip = current[massPinTrip]
-    main = current[massPinMain]
-
-    # EMERGENCY PATCH FOR FAILED MID SENSOR - JM
-    #main = 0
-    #print(f"MAIN ACTUAL {current[massPinMain]}")
-    #main = current[massPinRear]
-    # END EMERGENCY PATCH
-
-    rear = current[massPinRear]
-
-    return trip, main, rear
+def getMassStates(current, mass_config):
+    logicalState = massSensor.logicalState(current, mass_config)
+    return logicalState["fast"], logicalState["mid"], logicalState["slow"]
 
 
 ##################################################
@@ -413,34 +780,128 @@ def xmitCmd(cmd):
     if DEBUG_READER_COMM:
         print(readerIp + " -> " + cmd)
 
+    if command_socket is None:
+        raise ConnectionError("reader command connection is not open")
     cmd = cmd + "\r\n"
-    command_socket.sendall(cmd.encode())
+    command_socket.sendall(cmd.encode("ascii"))
 
 #######################
 def recvCmd():
 
-    bResp = command_socket.recv(256)
+    global commandRecvBuffer
+
+    if command_socket is None:
+        raise ConnectionError("reader command connection is not open")
+
+    while True:
+        marker = commandRecvBuffer.find(READER_FRAME_DELIMITER)
+        if marker >= 0:
+            bResp = commandRecvBuffer[:marker]
+            commandRecvBuffer = commandRecvBuffer[marker + len(READER_FRAME_DELIMITER):]
+            break
+        if len(commandRecvBuffer) > READER_MAX_FRAME_BYTES:
+            raise ConnectionError(
+                f"reader command frame exceeded {READER_MAX_FRAME_BYTES} bytes without delimiter"
+            )
+        chunk = command_socket.recv(4096)
+        if not chunk:
+            raise ConnectionError("reader command connection closed")
+        commandRecvBuffer += chunk
 
     if DEBUG_READER_COMM:
-        print(readerIp + " <- " + bResp.decode().strip())
+        print(readerIp + " <- " + bResp.decode("ascii", errors="replace").strip())
 
-    return bResp.decode().strip()
+    return bResp.decode("ascii", errors="replace").strip()
 
 #######################
 def xrCmd(cmd):
 
-    xmitCmd(cmd)
-    return recvCmd()
+    with commandLock:
+        xmitCmd(cmd)
+        response = recvCmd()
+    firstLine = response.splitlines()[0].strip().lower() if response else ""
+    if firstLine != "ok" and not firstLine.startswith("ok "):
+        raise ReaderCommandError(f"reader rejected {cmd!r}: {response or 'empty response'}")
+    return response
 
 #######################
-def recvEvent():
+def connectCommandSocket():
+    global command_socket
+    global commandRecvBuffer
 
-    bResp = event_socket.recv(256)
+    with commandLock:
+        oldSocket = command_socket
+        command_socket = None
+        commandRecvBuffer = b""
+        if oldSocket is not None:
+            try:
+                oldSocket.close()
+            except OSError:
+                pass
+        command_socket = socket.create_connection((readerIp, READER_COMMAND_PORT), timeout=5)
+        command_socket.settimeout(5)
 
-    if DEBUG_READER_RECV:
-        print(readerIp + " << " + bResp.decode().strip())
 
-    return bResp.decode().strip()
+def closeCommandSocket():
+    global command_socket
+    global commandRecvBuffer
+
+    with commandLock:
+        oldSocket = command_socket
+        command_socket = None
+        commandRecvBuffer = b""
+        if oldSocket is not None:
+            try:
+                oldSocket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            oldSocket.close()
+
+
+def readEventConnectionId(connection, stop_event=None, timeout=5):
+    banner = connection.readFrame(stop_event=stop_event, timeout=timeout)
+    if banner is None and stop_event is not None and stop_event.is_set():
+        raise InterruptedError("reader event handshake interrupted")
+    match = re.fullmatch(r"event\.connection\s+id\s*=\s*(\d+)", banner or "")
+    if match is None:
+        raise ConnectionError(f"invalid reader event banner: {banner!r}")
+    return int(match.group(1))
+
+
+def registerEventConnectionId(connectionId):
+    for eventName in ("event.tag.arrive", "event.tag.report", "event.tag.depart"):
+        xrCmd(f"reader.events.register({connectionId},{eventName})")
+
+
+def connectEventConnection(stop_event=None):
+    connection = DelimitedReaderConnection(readerIp, READER_EVENT_PORT, timeout=5)
+    try:
+        connectionId = readEventConnectionId(connection, stop_event=stop_event, timeout=5)
+        registerEventConnectionId(connectionId)
+        return connection
+    except Exception:
+        # Never reuse a partially registered event session: the Titan rejects
+        # duplicate registration. The caller will retry with a fresh ID.
+        connection.close()
+        raise
+
+
+def setActiveEventConnection(connection):
+    global activeEventConnection
+    with activeEventConnectionLock:
+        activeEventConnection = connection
+
+
+def closeActiveEventConnection():
+    global activeEventConnection
+    with activeEventConnectionLock:
+        connection = activeEventConnection
+        activeEventConnection = None
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
 
 
 ##################################################
@@ -448,13 +909,51 @@ def recvEvent():
 ##################################################
 
 #######################
+def getAntennaAssignment(antenna):
+    return antennaMap.get(str(antenna))
+
+
+#######################
+def getLaneContext(laneValue):
+    laneText = str(laneValue).strip()
+    context = laneContexts.get(laneText)
+    if context is not None:
+        return context
+    try:
+        numericMatches = [
+            candidate
+            for configuredLane, candidate in laneContexts.items()
+            if int(configuredLane) == int(laneText)
+        ]
+    except (TypeError, ValueError):
+        return None
+    return numericMatches[0] if len(numericMatches) == 1 else None
+
+
+#######################
+def routeReport(report):
+    context = getLaneContext(report.get('lane', ''))
+    if context is None:
+        msg = f"reader: dropping RF event from unconfigured antenna {report.get('antenna')}"
+        print(msg)
+        akiraCore.log(msg)
+        return False
+
+    with context.lock:
+        if isSquelched(context, report.get('tid', ''), report.get('side', '')):
+            return False
+        context.reports.append(report)
+    return True
+
+
+#######################
 def parseEvent(event):
 
     global arrivals
-    global reports
-    #global reportsSlow
 
     vals = event.split(" ")
+    if not vals or not vals[0]:
+        return
 
     #full arrive event
     if vals[0] == "event.tag.arrive":
@@ -518,7 +1017,7 @@ def parseEvent(event):
 
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(arrival, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(arrival, default=akiraCore.jsonConverter) + '\n')
 
         if DEBUG_ARRIVE:
             output = "==============================================="
@@ -532,50 +1031,34 @@ def parseEvent(event):
             output = output + "\n--------------------------------------------"
             print(output)
 
-        arrivals[epc] = arrival
-
-        #driver for fast read transmits to other systems
-        #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
-        lane = 0
-        side = "unknown"
+        assignment = getAntennaAssignment(antenna)
+        if assignment is None:
+            routeReport({'antenna': antenna})
+            return
+        lane = assignment['lane']
+        side = assignment['side']
         id = str(uuid.uuid4())
-        for thisAntenna in antennas:
-            if str(thisAntenna.get('number')) == str(antenna):
-                lane = thisAntenna.get('lane')
-                side = thisAntenna.get('side')
         arrival['id'] = id
         arrival['lane'] = lane
         arrival['side'] = side
 
-        #dtDate = sidraCore.rfStrToDt(date)
+        with arrivalsLock:
+            arrivals[(epc, lane)] = arrival
+
+        #dtDate = akiraCore.rfStrToDt(date)
 
 
         report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
 
-        #driver for fast read transmits to other systems
-        #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
-        lane = 0
-        side = "unknown"
         id = str(uuid.uuid4())
-        for thisAntenna in antennas:
-            if str(thisAntenna.get('number')) == str(antenna):
-                lane = thisAntenna.get('lane')
-                side = thisAntenna.get('side')
         report['id'] = id
         report['lane'] = lane
         report['side'] = side
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=akiraCore.jsonConverter) + '\n')
 
-        # if not squelched add
-        if not isSquelched(tid, side):
-            #add to appropriate list
-            #print(f"addArrive {report['tid']} {report['side']}")
-            reports.append(report)
-        #else:
-        #    if DEBUG_SQUELCH:
-        #        print(f" is squelched {tid} {side}")
+        routeReport(report)
 
     ##################################################################
     # report event
@@ -639,7 +1122,7 @@ def parseEvent(event):
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
 
-        #date = sidraCore.rfStrToDt(sDate)
+        #date = akiraCore.rfStrToDt(sDate)
         date = datetime.now() # <--- JM GO BACK TO TITAN TIME
 
         report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
@@ -649,28 +1132,21 @@ def parseEvent(event):
             print(tid)
         #    print("-------------------------")
 
-        #driver for fast read transmits to other systems
-        #dt, reader, lane, side, antenna, rssi, epc, tid, userData, tidAuthentic, pwAuthentic
-        lane = 0
-        side = "unknown"
+        assignment = getAntennaAssignment(antenna)
+        if assignment is None:
+            routeReport({'antenna': antenna})
+            return
+        lane = assignment['lane']
+        side = assignment['side']
         id = str(uuid.uuid4())
-        for thisAntenna in antennas:
-            if str(thisAntenna.get('number')) == str(antenna):
-                lane = thisAntenna.get('lane')
-                side = thisAntenna.get('side')
         report['id'] = id
         report['lane'] = lane
         report['side'] = side
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=akiraCore.jsonConverter) + '\n')
 
-        # if not squelched add
-        if not isSquelched(report['tid'], report['side']):
-            reports.append(report)
-        #else:
-        #    if DEBUG_SQUELCH:
-        #        print(f" is squelched {report['tid']} {report['side']}")
+        routeReport(report)
 
     ##################################################################
     #depart events
@@ -741,36 +1217,36 @@ def parseEvent(event):
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
 
-        lane = 0
-        side = "unknown"
-        for thisAntenna in antennas:
-            if str(thisAntenna.get('number')) == str(antenna):
-                lane = thisAntenna.get('lane')
-                side = thisAntenna.get('side')
+        assignment = getAntennaAssignment(antenna)
+        if assignment is None:
+            routeReport({'antenna': antenna})
+            return
+        lane = assignment['lane']
+        side = assignment['side']
 
         #get arrival data because.... star :(
-        if epc in arrivals:
+        arrivalKey = (epc, lane)
+        with arrivalsLock:
+            arrival = arrivals.pop(arrivalKey, None)
+        if arrival is not None:
             if DEBUG_ARRIVAL_MATCH:
                 print("FOUND ARRIVAL")
-                print(arrivals[epc])
-            rssi = arrivals[epc].get('rssi')
-            date = arrivals[epc].get('date')
+                print(arrival)
+            rssi = arrival.get('rssi')
+            date = arrival.get('date')
             if pwAuthentic == "" or pwAuthentic == AUTH_INAUTHENTIC:
-                pwAuthentic = arrivals[epc].get('pwAuthentic')
+                pwAuthentic = arrival.get('pwAuthentic')
             if tidAuthentic == "" or tidAuthentic == AUTH_INAUTHENTIC:
-                tidAuthentic = arrivals[epc].get('tidAuthentic')
+                tidAuthentic = arrival.get('tidAuthentic')
             if tid == "":
-                tid = arrivals[epc].get('tid')
+                tid = arrival.get('tid')
             if userData == "":
-                userData = arrivals[epc].get('userData')
-            #print(arrivals)
-            arrivals = sidraCore.removeDictKey(arrivals, epc)
-            #print(arrivals)
+                userData = arrival.get('userData')
         else:
             #print("NO ARRIVAL DATA")
             if DEBUG_ARRIVAL_MATCH:
                 print("NO ARRIVAL DATA")
-            sidraCore.log("NO ARRIVAL DATA: " + str(epc))
+            akiraCore.log(f"NO ARRIVAL DATA lane:{lane}: {epc}")
 
 
         #print(epc)
@@ -791,11 +1267,11 @@ def parseEvent(event):
 def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userData, tidAuthentic, pwAuthentic):
 
     # get plate and class from userData
-    tagPlate, tagClass = sidraCore.decodeUserData(userData)
+    tagPlate, tagClass = akiraCore.decodeUserData(userData)
 
     trnId = str(uuid.uuid4())
 
-    trn = sidraCore.trnPrefix() + trnId
+    trn = akiraCore.trnPrefix() + trnId
     #tDate = str(date) #datetime.now()
     #print(" ------>DT " + str(dt))
     #print("RSSI trans: " + str(rssi))
@@ -829,7 +1305,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    driver.read(tData)
     #driverRts.read(tData)
 
-    #tDate = sidraCore.rfStrToDt(tDate)
+    #tDate = akiraCore.rfStrToDt(tDate)
     #sAuth = "n"
     #if pwAuthentic == "AUTHENTIC":
     #    sAuth = "y"
@@ -855,7 +1331,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    if hasattr(driverModule, "read"):
     #        driverModule.read(tData)
 
-    sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
+    akiraCore.saveTransaction(trn + akiraCore.TRN_EXTENSION_READER, json.dumps(tData, default=akiraCore.jsonConverter))
 
     output = str(date)
     output = output + " RF  > lane: " + str(lane)
@@ -869,77 +1345,213 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #output = output + " tagP: " + str(tagPlate)
     #output = output + " date: " + str(dt)
 
-    sidraCore.log(output)
+    akiraCore.log(output)
 
 ##################################################
 # threads
 ##################################################
 
 #######################
-def rfThread(stop_event):
+def rfThread(stop_event, initialConnection, linkHealth):
+
+    connection = initialConnection
+    lastError = None
+    lastErrorLogAt = 0.0
 
     while not stop_event.is_set():
-        event = recvEvent()
-        #rfQ.put(event)
         try:
-            rfQ.put(event, timeout=0.05)
-        except queue.Full:
-            print("rfQ FULL - laneThread not draining?")
+            if connection is None:
+                connection = reconnectReaderEvent(stop_event)
+                setActiveEventConnection(connection)
+                if stop_event.is_set():
+                    closeActiveEventConnection()
+                    return
+                akiraCore.log(f"reader {readerName} RF event connection restored")
+            linkHealth.markConnected()
+
+            event = connection.readFrame(stop_event=stop_event)
+            if event is None:
+                return
+            if DEBUG_READER_RECV:
+                print(readerIp + " << " + event)
+            linkHealth.markEvent()
+            try:
+                rfQ.put(event, timeout=0.05)
+            except queue.Full:
+                msg = "reader rfQ full - RF dispatch is not draining"
+                print(msg)
+                akiraCore.log(msg)
+        except Exception as ex:
+            if stop_event.is_set():
+                return
+            linkHealth.markDisconnected(ex)
+            nowMonotonic = time.monotonic()
+            errorText = str(ex)
+            if errorText != lastError or nowMonotonic - lastErrorLogAt >= 60:
+                msg = f"reader {readerName} RF link lost: {errorText}; reconnecting"
+                print(msg)
+                akiraCore.log(msg)
+                lastError = errorText
+                lastErrorLogAt = nowMonotonic
+            try:
+                connection.close()
+            except Exception:
+                pass
+            connection = None
+            setActiveEventConnection(None)
+            stop_event.wait(READER_RECONNECT_SECONDS)
 
 #######################
-def massThread(stop_event):
+def rfDispatchThread(stop_event):
+    while not stop_event.is_set():
+        try:
+            event = rfQ.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        try:
+            if event is STOP:
+                return
+            parseEvent(event)
+        except Exception as ex:
+            print(f"rfDispatchThread(): {ex}")
+            traceback.print_exc()
+            akiraCore.log(f"rfDispatchThread(): {ex}")
+        finally:
+            rfQ.task_done()
 
-    global lane
-    global massName
-    global massPinTrip
-    global massPinMain
-    global massPinRear
-    global massIp
-    global tnConn
-    #print("massThread init: " + str(lane))
-
-    for mass in sidraCore.massSensors:
-        if mass["lane"] == lane:
-            massName = mass["name"]
-            #lane = mass["lane"]
-            massIp = mass["ip"]
-            massPinTrip = mass['trip']
-            massPinMain = mass['main']
-            massPinRear = mass['rear']
-
-    print("MASS THREAD START " + str(lane))
-
-    if DEBUG_MASS:
-        print(f"Connecting to Numato GPIO @ {massIp}:{MASS_PORT}")
-
-    tnConn = None
-
-    try:
-        tnConn = telnetlib.Telnet(massIp, MASS_PORT, timeout=5)
-
-        # explicitly own both SIGINT (^C) and SIGHUP
-        #signal.signal(signal.SIGINT, handleSignal)
-        #signal.signal(signal.SIGHUP, handleSignal)
-
-        login(tnConn)
-        setAllInputsAndNotify(tnConn)
-        monitorNotifications(tnConn, stop_event)
-
-    except Exception as ex:
-        print("massThread(): " + str(ex))
-
-
-    #while not stop_event.is_set():
-    #    event = massEvent()
-    #    massQ.put(event)
 
 #######################
-def laneThread(stop_event):
+def driverResponseThread(stop_event):
+    while not stop_event.is_set():
+        responses = []
+        for driverName, driverModule in readDrivers.items():
+            try:
+                if hasattr(driverModule, "getResponses"):
+                    responses.extend(driverModule.getResponses())
+            except Exception as ex:
+                akiraCore.log(f"reader.driverResponseThread {driverName}: {ex}")
 
-    print("LANE THREAD START " + str(lane) + '\n')
+        for response in responses:
+            if DEBUG_DRIVER_RESPONSES:
+                print(response)
+            if response.get('type') != "tagResult":
+                continue
 
-    massTrip = 0
-    massMain = 0
+            if LOG_EVENTS:
+                out = (
+                    f">>> lane:{response.get('lane')} {response.get('tid')} "
+                    f"code:{response.get('code')} {response.get('valid')}"
+                )
+                akiraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
+
+            response['op'] = "addResp"
+            akiraCore.queueXmit(
+                json.dumps(response, default=akiraCore.jsonConverter),
+                akiraCore.QUEUE_EXTENSION_RESPONSE,
+            )
+
+            context = getLaneContext(response.get('lane', ''))
+            if context is None:
+                akiraCore.log(
+                    f"reader.driverResponseThread response for unknown lane {response.get('lane')}"
+                )
+                continue
+            try:
+                context.responseQ.put(response, timeout=0.05)
+            except queue.Full:
+                akiraCore.log(f"reader responseQ full for lane {context.lane}")
+
+        if not responses:
+            stop_event.wait(0.02)
+
+
+#######################
+def massThread(context, stop_event):
+    mass = context.mass_config
+    massIp = mass['ip']
+    print("MASS THREAD START " + context.lane)
+    lastError = None
+    lastErrorLogAt = 0.0
+
+    while not stop_event.is_set():
+        tnConn = None
+        try:
+            if DEBUG_MASS:
+                print(f"Connecting lane {context.lane} to Numato GPIO @ {massIp}:{MASS_PORT}")
+            tnConn = NumatoConnection(massIp, MASS_PORT, timeout=5)
+            login(tnConn)
+            if lastError is not None:
+                akiraCore.log(f"massThread({context.lane}): reconnected to {massIp}")
+                lastError = None
+            setAllInputsAndNotify(tnConn, context)
+            monitorNotifications(tnConn, stop_event, context)
+        except Exception as ex:
+            if not stop_event.is_set():
+                errorText = str(ex)
+                nowMonotonic = time.monotonic()
+                if errorText != lastError or nowMonotonic - lastErrorLogAt >= 300:
+                    msg = f"massThread({context.lane}): {errorText}; reconnecting"
+                    print(msg)
+                    akiraCore.log(msg)
+                    lastErrorLogAt = nowMonotonic
+                lastError = errorText
+        finally:
+            if tnConn is not None:
+                try:
+                    tnConn.close()
+                except Exception:
+                    pass
+
+        if stop_event.wait(massReconnectSeconds):
+            break
+
+
+#######################
+def notifyLaneClear(lane):
+    for driverName, driverModule in readDrivers.items():
+        if DEBUG_DRIVER:
+            print("running driver: " + str(driverName))
+        if hasattr(driverModule, "laneClear"):
+            driverModule.laneClear(lane)
+
+
+#######################
+def massClearReady(lastMass, clearDebounceMs, now=None):
+    now = now or datetime.now()
+    if not all(int(lastMass.get(key, -1)) == 0 for key in ("trip", "main", "rear")):
+        return False
+    clearSince = lastMass.get("clearSince")
+    if clearSince is None:
+        return False
+    return now >= clearSince + timedelta(milliseconds=clearDebounceMs)
+
+
+def syncArbitrationWindowActivity(context, fastWindow, slowWindow):
+    """Publish non-expired mass-window activity for hybrid arbitration."""
+    now = datetime.now()
+    activity = (
+        fastWindow.get("reading", False) and now <= fastWindow.get("end", now),
+        slowWindow.get("reading", False) and now <= slowWindow.get("end", now),
+    )
+    if context.arbitrationWindowActivity == activity:
+        return
+    context.arbitrationWindowActivity = activity
+    tagArbiter.setLaneWindowActivity(
+        context.lane,
+        activity[0],
+        activity[1],
+    )
+
+
+#######################
+def laneThread(context, stop_event):
+
+    lane = context.lane
+    print("LANE THREAD START " + lane + '\n')
+
+    massTrip = -1
+    massMain = -1
+    massRear = -1
     massDate = datetime.now()
 
     #lastMassTrip = -1
@@ -947,13 +1559,21 @@ def laneThread(stop_event):
     #lastMassRear = -1
     #lastMassDate = datetime.now()
 
-    lastMass = {"trip":-1,"tripLast":datetime.now(),"main":-1,"mainLast":datetime.now(),"rear":-1,"rearLast":datetime.now(),"lastUnlocked":datetime.now(), "updated":datetime.now(), "unlockLockout":False}
+    lastMass = {
+        "trip": -1,
+        "tripLast": datetime.now(),
+        "main": -1,
+        "mainLast": datetime.now(),
+        "rear": -1,
+        "rearLast": datetime.now(),
+        "clearSince": None,
+        "lastUnlocked": datetime.now(),
+        "updated": datetime.now(),
+        "unlockLockout": False,
+    }
 
-    #was the last fast read good
-    lastFastGood = False
-    lastFastTid = "NONE"
-    lastFastValid = False
-    lastLastFastValid = False
+    passages = LanePassages()
+    lastFastClearAt = None
 
     lastFc = -1
     lastSc = -1
@@ -970,185 +1590,166 @@ def laneThread(stop_event):
 
         try:
             updates = False
-            rfUpdated = False
             massUpdated = False
 
-            #receive rf updates
-            rfCount = 0
-            while True:
-                try:
-                    event = rfQ.get_nowait()
-                    if event is STOP:
-                        stop_event.set()
-                        return
-                    #print("rf event:")
-                    rfCount = rfCount +1
-                except queue.Empty:
-                    break
-
-                parseEvent(event)
-                #print("laneThread received:")
-                rfUpdated = True
-                updates = True
-                rfQ.task_done()
-
-            #if rfCount > 0:
-            #    print("rfCount: " + str(rfCount))
-
-            #receive mass updates
-            while True:
-                try:
-                    massEvent = massQ.get_nowait()
-                    if massEvent is STOP:
-                        stop_event.set()
-                        return
-                    #print("massEvent: " + str(massEvent))
-                except queue.Empty:
-                    break
-
+            # Process mass changes in order. Draining the queue and applying
+            # only its final item can lose a short occupied transition.
+            try:
+                massEvent = context.massQ.get_nowait()
+                if massEvent is STOP:
+                    context.massQ.task_done()
+                    return
                 massUpdated = True
                 updates = True
-                massQ.task_done()
+                context.massQ.task_done()
+            except queue.Empty:
+                pass
 
             # if no updates yield CPU
             if not updates:
                 time.sleep(0.002)
 
-            #read responses from any enabled drivers
             responses = []
-            for driverName, driverModule in readDrivers.items():
-                #print("XXX running driver: " + str(driverName))
-                if DEBUG_DRIVER:
-                    print("running driver: " + str(driverName))
-                if hasattr(driverModule, "getResponses"):
-                    responses = driverModule.getResponses()
+            while True:
+                try:
+                    response = context.responseQ.get_nowait()
+                except queue.Empty:
+                    break
+                if response is STOP:
+                    context.responseQ.task_done()
+                    return
+                responses.append(response)
+                context.responseQ.task_done()
 
-            #check responses for validation of last fast tag
-            if len(responses) > 0:
-                for response in responses:
-                    if DEBUG_DRIVER_RESPONSES:
-                        print(response)
-                        if LOG_EVENTS:
-                            try:
-                                if response['type'] == "tagResult":
-                                    out = f">>> {response['tid']} code: {response['code']} {response['valid']}"
-                                    sidraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
-                            except Exception as ex:
-                                print(f"reader.laneThread() error logging response {str(ex)}")
-
-
-                    if response['type'] == "tagResult":
-                        #send response to sidraApi
-                        response['op'] = "addResp"
-                        #print("XMIT RESP PREP")
-                        sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
-
-                        if lastFastGood:
-                            if response['tid'] == lastFastTid and response['valid']:
-                                lastLastFastValid = lastFastValid
-                                lastFastValid = True
-                                if DEBUG_DRIVER_RESPONSES:
-                                    print(f"VALIDATED {response['tid']}")
+            for response in responses:
+                if response.get('type') == "tagResult":
+                    passages.response(response, datetime.now() + timedelta(seconds=1))
 
             # if mass has changed state - set windows
             if massUpdated:
-                massTrip = int(massEvent.get("trip",-1))
-                massMain = int(massEvent.get("main",-1))
-                massRear = int(massEvent.get("rear",-1)) # massEvent.get("rear",-1) <- JM CHANGE WHEN REAR IS ENABLED
-                massDate = datetime.now()
+                massTrip = int(massEvent.get("fast", massEvent.get("trip", -1)))
+                massMain = int(massEvent.get("mid", massEvent.get("main", -1)))
+                massRear = int(massEvent.get("slow", massEvent.get("rear", -1)))
+                massDate = massEvent.get("date", datetime.now())
+                logicalChanged = any(
+                    lastMass[key] != value
+                    for key, value in (
+                        ("trip", massTrip),
+                        ("main", massMain),
+                        ("rear", massRear),
+                    )
+                )
 
                 #################
                 #all sensors clear
                 if massMain == 0 and massTrip == 0 and massRear == 0:
-                    if datetime.now() > lastMass['tripLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT) and datetime.now() > lastMass['mainLast'] + timedelta(milliseconds=UNLOCK_LOCKOUT):
+                    wasClear = all(lastMass[key] == 0 for key in ("trip", "main", "rear"))
+                    if not wasClear or lastMass["clearSince"] is None:
+                        lastMass["clearSince"] = massDate
+                    if wasClear and not lastMass["unlockLockout"]:
+                        pass
+                    elif massClearReady(lastMass, context.clear_debounce_ms):
                         fastWindow = resetWindow(f"fast - lane clear {massTrip}{massMain}{massRear}")
                         slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
                         lastMass["lastUnlocked"] = datetime.now()
-                        #laneClear messages
-                        for driverName, driverModule in readDrivers.items():
-                            if DEBUG_DRIVER:
-                                print("running driver: " + str(driverName))
-                            if hasattr(driverModule, "laneClear"):
-                                driverModule.laneClear(lane)
+                        lastMass["unlockLockout"] = False
+                        notifyLaneClear(lane)
+                        passages.clear()
                     else:
                         lastMass['unlockLockout'] = True
-                        print(f"unlock lockout {massTrip} {massMain} {massRear}")
+                        print(f"lane:{lane} unlock lockout {massTrip} {massMain} {massRear}")
+                else:
+                    lastMass["clearSince"] = None
+                    lastMass["unlockLockout"] = False
 
-                #################
-                #if theres a change in trip
-                if massTrip == 1 and not massTrip == lastMass['trip']:
-
-                    #print(f"LFG: {lastFastTid} {lastFastGood} {lastFastValid}")
-
-                    #check for Fast Flow - if previous fast was good
-                    if lastFastGood and lastFastValid:
-                        begin = massDate + timedelta(milliseconds=fastPre)
-                        end   = massDate + timedelta(milliseconds=fastPost)
-                        print(f" -= FAST FLOW ON =-")
-                        fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
-                        lastFastGood = False
-                        lastFastTid = "NONE"
-                        lastFastValid = False
-                    elif massMain == 0 and massRear == 0:
-                    #if slow and rear are clear
-                        print(f" READING - NO FAST FLOW -lfv:{lastFastValid} llfv:{lastLastFastValid}")
-                        begin = massDate + timedelta(milliseconds=fastPre)
-                        end   = massDate + timedelta(milliseconds=fastPost)
-                        fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
-                    else:
-                        print(f" NOT READING FAST {massTrip}{massTrip}{massRear}")
-
-                #################
-                #if theres a change in main
-                #if massMain == 1 and lastMass['main'] == 0:
-                    #print("LOCK SLOW")
-                #    slowWindow = lockWindow(f"slow - main sensor {massTrip}{massMain}{massRear}")
-
+                # Handle the downstream edge first if both ends change in
+                # one snapshot; a car already at the gate precedes a new arrival.
+                if lastMass['main'] == -1:
+                    passages.initialize_occupied(massMain, massRear)
                 #################
                 #if theres a change in rear
-                if massRear == 1 and lastMass['rear'] == 0:
+                if massRear == 1 and lastMass['rear'] != 1:
+                    passage = passages.slow_trigger()
+                    for driverModule in readDrivers.values():
+                        if hasattr(driverModule, "passageState"):
+                            driverModule.passageState(lane, passage.id, True)
                     begin = massDate + timedelta(milliseconds=slowPre)
                     end   = massDate + timedelta(milliseconds=slowPost)
                     #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
                     slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
+                elif massRear == 0 and lastMass['rear'] == 1:
+                    passage = passages.slow
+                    passages.pause_slow(massDate + timedelta(milliseconds=context.mass_config['slowClearDebounceMs']))
+                    slowWindow = resetWindow("slow - vehicle left gate sensor")
+                    if passage is not None:
+                        for driverModule in readDrivers.values():
+                            if hasattr(driverModule, "passageState"):
+                                driverModule.passageState(lane, passage.id, False)
 
+
+                #################
+                #if theres a change in trip
+                if massTrip == 0 and lastMass['trip'] == 1:
+                    lastFastClearAt = massDate
+                fastBounce = (passages.fast is not None and not passages.fast.ended
+                              and lastFastClearAt is not None
+                              and massDate < lastFastClearAt + timedelta(milliseconds=context.mass_config['fastClearDebounceMs']))
+                if massTrip == 1 and lastMass['trip'] != 1 and not fastBounce:
+                    passages.fast_trigger(massMain, massRear)
+                    for retired in passages.retired:
+                        for driverModule in readDrivers.values():
+                            if hasattr(driverModule, "passageEnd"):
+                                driverModule.passageEnd(lane, retired)
+                    passages.retired.clear()
+                    begin = massDate + timedelta(milliseconds=fastPre)
+                    end = massDate + timedelta(milliseconds=fastPost)
+                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
+
+
+                # Save change timestamps before replacing the previous state.
+                if lastMass['trip'] != massTrip:
+                    lastMass['tripLast'] = massDate
+                if lastMass['main'] != massMain:
+                    lastMass['mainLast'] = massDate
+                if lastMass['rear'] != massRear:
+                    lastMass['rearLast'] = massDate
 
                 # save current state as last state
                 lastMass["trip"] = massTrip
                 lastMass["main"] = massMain
                 lastMass["rear"] = massRear
-                lastMass["updated"] = massDate
-                lastMass["unlockLockout"] = False
-                if not lastMass['trip'] == massTrip:
-                    lastMass['tripLast'] = datetime.now()
-                if not lastMass['main'] == massMain:
-                    lastMass['mainLast'] = datetime.now()
-                if not lastMass['rear'] == massRear:
-                    lastMass['rearLast'] = datetime.now()
+                if logicalChanged:
+                    lastMass["updated"] = massDate
 
 
                 if DEBUG_MASS:
-                    debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+                    debugMass(context, massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+
+            if context.massQ.empty() and passages.release_due(datetime.now()):
+                ended = passages.slow_clear()
+                for driverModule in readDrivers.values():
+                    if hasattr(driverModule, "passageEnd"):
+                        driverModule.passageEnd(lane, ended.id)
+
+            syncArbitrationWindowActivity(context, fastWindow, slowWindow)
 
             #################
             #check fast zone
-            read = checkReads(fastWindow, ANTENNA_FAST, fastMinReads)
-            if not read == None:
-
-                #re-open fast antenna
-                fastWindow = resetWindow(f"fast - read accepted  {massTrip}{massMain}{massRear}")
-                lastFastGood = True
-                lastFastTid = read['tid']
-                lastFastValid = False
-
+            candidates = checkReadCandidates(
+                context, fastWindow, ANTENNA_FAST, fastMinReads
+            )
+            read = arbitrateCandidates(candidates, lastMass)
+            suppressCrossLaneAssignments(context, candidates)
+            if read is not None:
+                fastWindow = resetWindow(f"fast - read accepted {massTrip}{massMain}{massRear}")
+                acceptCandidate(context, read)
+                read.update(passages.fast.read_metadata())
+                passages.fast.pending_id = read['id']
                 sendRead(read)
-
-                #squelch
-                addSquelch(read['tid'], read['side'], SQUELCH_TIME)
 
                 #flushReports(ANTENNA_FAST)
                 if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
+                    akiraCore.appendFile(LOG_STATS_FILE,f"lane:{lane} fast: {read['tid']} reads:{read['reads']} {datetime.now().time()}\n")
 
                 #make a fake tag response - only for debugging
                 if GEN_FAKE_TAG_RESPONSE:
@@ -1158,33 +1759,49 @@ def laneThread(stop_event):
                         if hasattr(driverModule, "genFakeTagResponse"):
                             responses = driverModule.genFakeTagResponse(read['tid'])
 
+            # A fast acceptance may have closed its window. Publish that before
+            # deciding whether the slow pool has another active lane to contend.
+            syncArbitrationWindowActivity(context, fastWindow, slowWindow)
+
             #################
             #check slow zone
-            read = checkReads(slowWindow, ANTENNA_SLOW, slowMinReads)
-            if not read == None:
-
-                #reset read window until lane clear
-                thisDate = datetime.now()
-                begin = thisDate + timedelta(milliseconds=slowPre)
-                end   = thisDate + timedelta(milliseconds=slowPost)
-                #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                #slowWindow = readWindow(slowWindow, begin, end, "slow - main sensor") # JM MAYBE we want tis istead of reset???
+            slowPassage = passages.slow
+            if slowPassage is not None and slowPassage.authorized and slowPassage.authorized_tid:
+                # A fast-authorized car still needs slow-side squelching. Its
+                # lingering tag must not become a fallback for the next car.
+                addSquelch(context, slowPassage.authorized_tid, ANTENNA_SLOW,
+                           SQUELCH_TIME, refresh=True)
+            if slowPassage is not None and (slowPassage.authorized or slowPassage.uncertain) and slowWindow['reading']:
+                slowWindow = resetWindow("slow - passage already submitted")
+            slowReady = (massRear == 1 and slowPassage is not None and not slowPassage.authorized
+                         and not slowPassage.uncertain and slowPassage.pending_id is None
+                         and datetime.now() >= slowPassage.retry_at)
+            if slowReady and massRear == 1 and not slowWindow['reading']:
+                now = datetime.now()
+                slowWindow = readWindow(slowWindow, now + timedelta(milliseconds=slowPre),
+                                        now + timedelta(milliseconds=slowPost), "slow - stopped-car retry")
+            candidates = checkReadCandidates(
+                context, slowWindow, ANTENNA_SLOW, slowMinReads
+            ) if slowReady else []
+            read = arbitrateCandidates(candidates, lastMass)
+            suppressCrossLaneAssignments(context, candidates)
+            if read is not None:
                 slowWindow = resetWindow(f"slow - read accepted {massTrip}{massMain}{massRear}")
+                acceptCandidate(context, read)
+                read.update(slowPassage.read_metadata())
+                slowPassage.pending_id = read['id']
                 sendRead(read)
-
-                #squelch
-                addSquelch(read['tid'], read['side'], SQUELCH_TIME)
 
                 #flushReports(ANTENNA_SLOW)
                 if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
+                    akiraCore.appendFile(LOG_STATS_FILE,f"lane:{lane} slow: {read['tid']} reads:{read['reads']} {datetime.now().time()}\n")
 
             #################
             #check for expired windows
             fastExpired = windowExpired(fastWindow)
             slowExpired = windowExpired(slowWindow)
             if fastExpired:
-                print(f"fastExpired used: {fastWindow['used']} - end: {fastWindow['end'].time()} {datetime.now().time()}")
+                print(f"lane:{lane} fastExpired used:{fastWindow['used']} end:{fastWindow['end'].time()} {datetime.now().time()}")
                 fastWindow = resetWindow("fast - expired")
                 #noTag messages
                 for driverName, driverModule in readDrivers.items():
@@ -1192,42 +1809,51 @@ def laneThread(stop_event):
                         print("running driver: " + str(driverName))
                     if hasattr(driverModule, "noTag"):
                         driverModule.noTag(lane, ANTENNA_FAST)
-            if fastExpired:
-                print(f"slowExpired used: {slowWindow['used']} - end: {slowWindow['end'].time()} {datetime.now().time()}")
+            if slowExpired:
+                print(f"lane:{lane} slowExpired used:{slowWindow['used']} end:{slowWindow['end'].time()} {datetime.now().time()}")
                 slowWindow = resetWindow("slow - expired")
-                #noTag messages
-                for driverName, driverModule in readDrivers.items():
-                    if DEBUG_DRIVER:
-                        print("running driver: " + str(driverName))
-                    if hasattr(driverModule, "noTag"):
-                        driverModule.noTag(lane, ANTENNA_SLOW)
+                if slowReady and not slowPassage.no_tag_shown:
+                    for driverModule in readDrivers.values():
+                        if hasattr(driverModule, "noTag"):
+                            driverModule.noTag(lane, ANTENNA_SLOW)
+                    slowPassage.no_tag_shown = True
 
             #clean old RF events
-            cleanOldRf(ANTENNA_FAST, fastMaxReportAge)
-            cleanOldRf(ANTENNA_SLOW, slowMaxReportAge)
+            cleanOldRf(context, ANTENNA_FAST, fastMaxReportAge)
+            cleanOldRf(context, ANTENNA_SLOW, slowMaxReportAge)
             #print(slowMaxReportAge)
 
             #clean squelch list
             if DEBUG_SQUELCH:
-                squelchCount = len(squelch)
+                with context.lock:
+                    squelchCount = len(context.squelch)
                 if not squelchCount == lastSquelchCount:
                     print(f"squelchCount: {squelchCount}")
                 lastSquelchCount = squelchCount
-            cleanSquelch()
+            cleanSquelch(context)
 
             #see if you need to break lockout
-            lockoutChanged, fastWindow, slowWindow = lockoutBreak(fastWindow, slowWindow, lastMass)
+            lockoutChanged, fastWindow, slowWindow = lockoutBreak(
+                fastWindow,
+                slowWindow,
+                lastMass,
+                context.clear_debounce_ms,
+            )
             if lockoutChanged:
-                debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+                notifyLaneClear(lane)
+                passages.clear()
+                debugMass(context, massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
+
+            syncArbitrationWindowActivity(context, fastWindow, slowWindow)
 
             #debug read stats
             if DEBUG_READ_MONITOR or LOG_STATS:
-                fc, sc = countReports()
+                fc, sc = countReports(context)
                 fcs = str(fc).rjust(4)
                 scs = str(sc).rjust(4)
 
                 if DEBUG_READ_MONITOR:
-                    print(f"{fcs}{scs} {datetime.now().time()}")
+                    print(f"lane:{lane} {fcs}{scs} {datetime.now().time()}")
 
                 if LOG_STATS:
                     if not lastSc == sc or not lastFc == fc :
@@ -1235,23 +1861,25 @@ def laneThread(stop_event):
                             fcs = "   -"
                         if scs == "   0":
                             scs = "   -"
-                        sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
+                        akiraCore.appendFile(LOG_STATS_FILE,f"lane:{lane} {fcs}{scs}  {datetime.now().time()}\n")
                 lastFc = fc
                 lastSc = sc
 
         except Exception as ex:
             print(f"laneThread crashed: {ex}")
             traceback.print_exc()
-            sidraCore.log(f"laneThread crashed: {ex}")
+            akiraCore.log(f"laneThread crashed: {ex}")
 
 #######################
-def checkReads(window, side, minReads):
+def checkReadCandidates(context, window, side, minReads):
 
-    ret = None
+    ret = []
 
     #if no reads don't waste time
-    if len(reports) == 0:
-        return ret
+    with context.lock:
+        reports = list(context.reports)
+        if len(reports) == 0:
+            return ret
 
     #print("check " + str(side) + " " + str(len(reports)))
 
@@ -1324,7 +1952,7 @@ def checkReads(window, side, minReads):
                         update["rssi"] = rssi
                         update["bestRead"] = read
                     if not read.get("userData","") == "":
-                        update['userData'] = read.get('userdata')
+                        update['userData'] = read.get('userData')
                     if read.get('pwAuthentic','') == AUTH_AUTHENTIC:
                         update['pwAuthentic'] = AUTH_AUTHENTIC
                     if read.get('tidAuthentic','') == AUTH_AUTHENTIC:
@@ -1342,65 +1970,53 @@ def checkReads(window, side, minReads):
         #if blankTidCount > 0:
         #    print(f"blank Tid count:{blankTidCount}")
 
-        # find best candidate
+        # Find every qualified candidate. Cross-lane assignment must see the
+        # whole pool; choosing one per lane first can accept reciprocal swaps.
         candidateCount = 0
         highestCount = 0
-        potential = None
-        accepted = None
 
         #if this is a mixed pool
-        if len(candidates) > 1:
+        if len(candidates) > 1 and DEBUG:
             print("******************************")
-            print("mixed read pool:")
+            print(f"mixed read pool lane:{context.lane}:")
             for tid in candidates:
                 poolCount = candidates[tid]["count"]   # or len(...) if you want fields
                 print(f"{tid} {poolCount}")
             print("******************************")
 
-        #check candidates to see if any are > minReads and if they are authentic
-        highestCandidate = ""
-        for candidate in candidates.values():
-            #print(f"{side} t:{candidate.get('tid')} c:{candidate.get('count')} t:{totalCount} g:{goodCount} b:{badCount} bPre:{badCountPre} bPost:{badCountPost} bSide:{badCountSide} - {datetime.now()}")
-            candidateCount = candidateCount +1
-            thisCount = candidate.get('count')
-            if thisCount > highestCount:
-                #if not candidate.get('tidAuthentic','') == AUTH_AUTHENTIC: # <--- JM to enable auth
-                #    if DEBUG_INAUTHENTIC:
-                #        print("INAUTHENTIC TAG: " + candidate.get('tid','none'))
-                #else:
-                # - for now include inauthentic tags
-                highestCount = thisCount
-                potential = candidate
-
-        #if you have a potential does it have enough reads?
-        if not potential == None:
-            if potential['count'] >= minReads:
-                accepted = potential
-
-        #if you've accepted a candidate
-        if not accepted == None:
-            accepted['id'] = str(uuid.uuid4())
-            if MULTI_POOL_SQUELCH:
-                if len(candidates) > 1:
-                    for tid in candidates:
-                        if not tid == accepted['tid']:
-                            print("#############################################")
-                            print(f"Multi Pool Squelch - {tid}")
-                            print("#############################################")
-                            sidraCore.log(f"Multi Pool Squelch -> {tid} kept: {accepted['tid']}")
-                            addSquelch(tid, ANTENNA_FAST, SQUELCH_TIME)
-                            addSquelch(tid, ANTENNA_SLOW, SQUELCH_TIME)
-            if DEBUG:
-                out = f"<<< {side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}"
-                if LOG_EVENTS:
-                    sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
-                print(out)
-            ret = accepted
-
-            window['used'] = True
+        # Check candidates to see if any have enough reads. Authentication
+        # behavior remains downstream-compatible with the prior implementation.
+        candidateCount = len(candidates)
+        if candidates:
+            orderedCandidates = sorted(
+                candidates.values(),
+                key=lambda candidate: (
+                    -int(candidate.get("count", 0)),
+                    -int(candidate.get("rssi", -999999)),
+                    str(candidate.get("tid", "")),
+                ),
+            )
+            highestCount = orderedCandidates[0].get("count", 0)
+            qualified = [
+                candidate
+                for candidate in orderedCandidates
+                if candidate.get("count", 0) >= minReads
+            ]
+            for accepted in qualified:
+                accepted['id'] = str(uuid.uuid4())
+                accepted['reads'] = accepted['count']
+                accepted['otherTids'] = [
+                    tid for tid in candidates if tid != accepted['tid']
+                ]
+                if DEBUG:
+                    out = f"<<< lane:{context.lane} {side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}"
+                    if LOG_EVENTS:
+                        akiraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
+                    print(out)
+            ret = qualified
 
     if DEBUG_READ_SEEK:
-        if ret == None and candidateCount > 0:
+        if not ret and candidateCount > 0:
             print("CR: ",f"{side} {candidateCount} {highestCount}", end="\r", flush=True)
             #print(f"cr {side} {candidateCount} {highestCount}")
 
@@ -1409,6 +2025,92 @@ def checkReads(window, side, minReads):
 
     # return
     return ret
+
+
+def checkReads(context, window, side, minReads):
+    """Compatibility helper returning the strongest qualified candidate."""
+    candidates = checkReadCandidates(context, window, side, minReads)
+    return candidates[0] if candidates else None
+
+
+#######################
+def squelchTidBothSides(context, tid, duration=SQUELCH_TIME):
+    addSquelch(context, tid, ANTENNA_FAST, duration)
+    addSquelch(context, tid, ANTENNA_SLOW, duration)
+
+
+#######################
+def rejectCrossLaneCandidate(context, read):
+    """Remove only the losing TID so this lane can reconsider its pool."""
+    assignmentMs = max(1, int(tagArbiter.assignment_seconds * 1000))
+    squelchTidBothSides(context, read['tid'], assignmentMs)
+
+
+#######################
+def suppressCrossLaneAssignments(context, candidates):
+    for read in candidates:
+        winnerLane = tagArbiter.assignedLane(read.get('tid'))
+        if winnerLane is None or winnerLane == context.lane:
+            continue
+        rejectCrossLaneCandidate(context, read)
+        logCrossLaneSuppression(read)
+
+
+#######################
+def acceptCandidate(context, read):
+    """Squelch only the accepted TID; unrelated tags remain eligible."""
+    addSquelch(context, read['tid'], read['side'], SQUELCH_TIME)
+    # Discard unrelated evidence from this completed passage without blocking
+    # fresh reports for a close-following vehicle.
+    for tid in read.get('otherTids', []):
+        removeReports(context, tid, read['side'])
+
+#######################
+def candidateEvidence(read, lastMass):
+    readDate = read.get('date', datetime.now())
+    massDate = lastMass.get('updated', readDate)
+    try:
+        massOffsetMs = abs((readDate - massDate).total_seconds() * 1000)
+    except Exception:
+        massOffsetMs = 999999999
+
+    return {
+        "massActive": any(int(lastMass.get(pin, 0)) == 1 for pin in ("trip", "main", "rear")),
+        "massOffsetMs": massOffsetMs,
+        "reads": read.get("reads", read.get("count", 0)),
+        "rssi": read.get("rssi", -999999),
+    }
+
+
+#######################
+def arbitrateCandidates(candidates, lastMass):
+    if not candidates:
+        return None
+    lane = str(candidates[0].get("lane", ""))
+    side = str(candidates[0].get("side", ""))
+    evidenceByTid = {
+        str(read.get("tid", "")): candidateEvidence(read, lastMass)
+        for read in candidates
+    }
+    return tagArbiter.submitPool(lane, side, candidates, evidenceByTid)
+
+
+#######################
+def arbitrateCandidate(read, lastMass):
+    evidence = candidateEvidence(read, lastMass)
+    return tagArbiter.submit(read, evidence)
+
+
+#######################
+def logCrossLaneSuppression(read):
+    winnerLane = tagArbiter.assignedLane(read.get('tid')) or "unknown"
+    msg = (
+        f"CROSS LANE SUPPRESS tid:{read.get('tid')} "
+        f"lane:{read.get('lane')} winner:{winnerLane} side:{read.get('side')}"
+    )
+    print(msg)
+    akiraCore.log(msg)
+
 
 #######################
 def sendRead(read):
@@ -1425,69 +2127,79 @@ def sendRead(read):
 
 
 #######################
-def removeReports(tid, side):
-    global reports
-    reports[:] = [
-        r for r in reports
-        if not (r.get("tid") == tid and r.get("side") == side)
-    ]
+def removeReports(context, tid, side):
+    with context.lock:
+        context.reports[:] = [
+            r for r in context.reports
+            if not (r.get("tid") == tid and r.get("side") == side)
+        ]
 
 #######################
-def addSquelch(tid, side, duration):
+def addSquelch(context, tid, side, duration, refresh=False):
 
     if SQUELCH_DISABLE:
         return
 
-    global squelch
+    with context.lock:
+        alreadySquelched = isSquelched(context, tid, side)
+        if alreadySquelched and refresh:
+            for entry in context.squelch:
+                if entry['tid'] == tid and entry['side'] == side:
+                    entry['end'] = datetime.now() + timedelta(milliseconds=duration)
+            return
 
-    if not isSquelched(tid, side):
+    if not alreadySquelched:
 
         end = datetime.now() + timedelta(milliseconds=duration)
 
         newSquelch = {'tid':tid, 'side':side, 'end':end}
 
-        squelch.append(newSquelch)
+        with context.lock:
+            context.squelch.append(newSquelch)
 
         #clean reports of this tag on this side
-        removeReports(tid, side)
+        removeReports(context, tid, side)
 
         if LOG_STATS and DEBUG_SQUELCH:
-            sidraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
+            akiraCore.appendFile(LOG_STATS_FILE,f"lane:{context.lane} squelch: {tid}\n")
 
         if DEBUG_SQUELCH:
             print(f"squelched: {tid} {side} {end} {datetime.now()}")
 
 
 #######################
-def cleanSquelch():
-    global squelch
-
+def cleanSquelch(context):
     now = datetime.now()
-
-    squelch[:] = [
-        s for s in squelch
-        if s.get("end") >= now
-    ]
+    with context.lock:
+        context.squelch[:] = [
+            s for s in context.squelch
+            if s.get("end") >= now
+        ]
 
 #######################
-def isSquelched(tid, side):
+def isSquelched(context, tid, side):
 
-    #now = datetime.now()
-    for s in squelch:
-        if (
-            s.get("tid") == tid and
-            s.get("side") == side #and
-            #s.get("end", now) > now
-        ):
-            return True
+    now = datetime.now()
+    with context.lock:
+        # RF routing runs in a different thread from lane maintenance. Enforce
+        # expiry here so a delayed lane loop cannot extend a squelch interval.
+        context.squelch[:] = [
+            squelch
+            for squelch in context.squelch
+            if squelch.get("end", now) >= now
+        ]
+        for s in context.squelch:
+            if (
+                s.get("tid") == tid and
+                s.get("side") == side
+            ):
+                return True
     return False
 
 #######################
-def flushReports(side):
-
-    global reports
-    #start = len(reports)
-    reports[:] = [r for r in reports if r.get("side") != side]
+def flushReports(context, side):
+    with context.lock:
+        context.reports[:] = [r for r in context.reports if r.get("side") != side]
     #end = len(reports)
 
     #print(f"flushReports: {start} -> {end}")
@@ -1551,9 +2263,11 @@ def resetWindow(name = ""):
     return window
 
 #######################
-def countReports():
+def countReports(context):
     fc = 0
     sc = 0
+    with context.lock:
+        reports = list(context.reports)
     for r in reports:
         if r['side'] == ANTENNA_FAST:
             fc = fc +1
@@ -1563,7 +2277,7 @@ def countReports():
     return fc, sc
 
 #######################
-def debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass):
+def debugMass(context, massTrip, massMain, massRear, fastWindow, slowWindow, lastMass):
 
     fc = 0
     sc = 0
@@ -1577,7 +2291,7 @@ def debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass):
     #print(f"FAST b:{fastBegin} e:{fastEnd} u:{fastUpdated} l:{fastWindow['locked']} r:{fastWindow['reading']}")
     #print(f"SLOW b:{slowBegin} e:{slowEnd} u:{slowUpdated} l:{slowWindow['locked']} r:{slowWindow['reading']}")
 
-    out = str(massTrip) + " " + str(massMain) + " " + str(massRear) + " "
+    out = f"lane:{context.lane} " + str(massTrip) + " " + str(massMain) + " " + str(massRear) + " "
     if fastWindow['reading']:
         #print(f"{fastWindow['end']} {datetime.now()}")
         if fastWindow['end'] > datetime.now():
@@ -1603,84 +2317,256 @@ def debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass):
     else:
         out = out + "-"
 
-    fc, sc = countReports()
+    fc, sc = countReports(context)
     out = out + " " + str(fc).rjust(3) + " " + str(sc).rjust(3) + " " + str(datetime.now().time())
     out = out + f" ({fastBegin}-{fastEnd} {slowBegin}-{slowEnd})"
     print(out)
 
     if LOG_STATS:
-        sidraCore.appendFile(LOG_STATS_FILE,out + '\n')
+        akiraCore.appendFile(LOG_STATS_FILE,out + '\n')
 
     if LOG_EVENTS:
-        sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
+        akiraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
 
     if massTrip == 0 and massMain == 0 and massRear == 0:
         print('')
 
 #######################
-def cleanOldRf(side, maxAge):
-
-    global reports
-
+def cleanOldRf(context, side, maxAge):
     cutoff = datetime.now() - timedelta(milliseconds=maxAge)
-
-    reports[:] = [
-        r for r in reports
-        if not (
-            r.get("side") == side and
-            isinstance(r.get("date"), datetime) and
-            r["date"] < cutoff
-        )
-    ]
+    with context.lock:
+        context.reports[:] = [
+            r for r in context.reports
+            if not (
+                r.get("side") == side and
+                isinstance(r.get("date"), datetime) and
+                r["date"] < cutoff
+            )
+        ]
 
 #######################
-def lockoutBreak(fastWindow, slowWindow, lastMass):
-
-
-    #global fastWindow
-    #global slowWindow
-
+def lockoutBreak(
+    fastWindow,
+    slowWindow,
+    lastMass,
+    clearDebounceMs=massSensor.DEFAULT_CLEAR_DEBOUNCE_MS,
+):
     changed = False
 
-    #print(f"{lastMass['trip']} {lastMass['main']}")
-    if int(lastMass['trip']) == 0 and int(lastMass['main']) == 0 and int(lastMass['rear']) == 0 and lastMass['unlockLockout'] == True:
-
-        unlockAt = lastMass['lastUnlocked'] + timedelta(milliseconds=UNLOCK_LOCKOUT)
-        #print(f"{lastMass['lastUnlocked']} {unlockAt}")
-        if datetime.now() > unlockAt:
-            #print(fastWindow)
-            #print(slowWindow)
-            fastWindow = resetWindow("fast - lane clear")
-            slowWindow = resetWindow("slow - lane clear")
-            lastMass['unlockLockout'] = False
-            lastMass["lastUnlocked"] = datetime.now()
-            #print("lock break")
-            changed = True
+    if lastMass["unlockLockout"] and massClearReady(lastMass, clearDebounceMs):
+        fastWindow = resetWindow("fast - lane clear")
+        slowWindow = resetWindow("slow - lane clear")
+        lastMass["unlockLockout"] = False
+        lastMass["lastUnlocked"] = datetime.now()
+        changed = True
 
     return changed, fastWindow, slowWindow
+
+
+############################################
+def normalizedLane(value):
+    return str(value).strip()
+
+
+#######################
+def configureReader(reader_name):
+    global readerName
+    global readerIp
+    global readerLanes
+    global laneContexts
+    global antennaMap
+    global antennas
+    global tagFilter
+    global power
+    global frequency
+    global auth
+    global authWait
+    global tidWait
+    global mode
+    global region
+    global fastMaxReportAge
+    global fastMinReads
+    global slowMaxReportAge
+    global slowMinReads
+    global fastPre
+    global fastPost
+    global slowPre
+    global slowPost
+    global massReconnectSeconds
+    global readerReconnectFatalSeconds
+    global tagArbiter
+
+    configuredReaders = akiraCore.backupReaders if getSwitchFile() else akiraCore.readers
+    matches = [reader for reader in configuredReaders if reader.get('name') == reader_name]
+    if len(matches) != 1:
+        source = "backupReaders" if getSwitchFile() else "readers"
+        raise ValueError(
+            f"reader {reader_name!r} must appear exactly once in {source}; found {len(matches)}"
+        )
+
+    reader = matches[0]
+    configuredLanes = reader.get('lanes')
+    if configuredLanes is None:
+        configuredLanes = [reader.get('lane')]
+    readerLanes = [normalizedLane(value) for value in configuredLanes if normalizedLane(value)]
+    if not readerLanes or len(readerLanes) != len(set(readerLanes)):
+        raise ValueError(f"reader {reader_name} has missing or duplicate lanes: {readerLanes}")
+
+    antennas = reader.get('antennas', [])
+    antennaMap = {}
+    laneSides = {lane: set() for lane in readerLanes}
+    for antenna in antennas:
+        number = str(antenna.get('number', '')).strip()
+        antennaLane = normalizedLane(antenna.get('lane', ''))
+        side = str(antenna.get('side', '')).strip().lower()
+        if not number or number in antennaMap:
+            raise ValueError(f"reader {reader_name} has a missing or duplicate antenna number {number!r}")
+        if antennaLane not in laneSides:
+            raise ValueError(f"antenna {number} maps to unconfigured lane {antennaLane!r}")
+        if side not in (ANTENNA_FAST, ANTENNA_SLOW):
+            raise ValueError(f"antenna {number} has invalid side {side!r}")
+        antennaMap[number] = {"lane": antennaLane, "side": side}
+        laneSides[antennaLane].add(side)
+
+    for configuredLane, sides in laneSides.items():
+        missingSides = {ANTENNA_FAST, ANTENNA_SLOW} - sides
+        if missingSides:
+            raise ValueError(
+                f"reader {reader_name} lane {configuredLane} lacks antenna side(s): "
+                + ", ".join(sorted(missingSides))
+            )
+
+    massByLane = {}
+    for mass in akiraCore.massSensors:
+        massLane = normalizedLane(mass.get('lane', ''))
+        if massLane in readerLanes:
+            if massLane in massByLane:
+                raise ValueError(f"reader {reader_name} has more than one mass sensor for lane {massLane}")
+            for required in ('name', 'ip'):
+                if str(mass.get(required, '')).strip() == '':
+                    raise ValueError(f"mass sensor for lane {massLane} lacks {required}")
+            try:
+                massByLane[massLane] = massSensor.normalizeConfig(mass)
+            except ValueError as ex:
+                raise ValueError(f"invalid mass sensor for lane {massLane}: {ex}") from ex
+
+    missingMass = [configuredLane for configuredLane in readerLanes if configuredLane not in massByLane]
+    if missingMass:
+        raise ValueError(f"reader {reader_name} lacks mass sensors for lanes: {', '.join(missingMass)}")
+
+    laneContexts = {
+        configuredLane: LaneContext(configuredLane, massByLane[configuredLane])
+        for configuredLane in readerLanes
+    }
+
+    readerName = reader_name
+    readerIp = str(reader.get('ip', '')).strip()
+    if not readerIp:
+        raise ValueError(f"reader {reader_name} lacks ip")
+    tagFilter = reader.get("tagFilter", "")
+    power = str(reader.get('power', '')).strip()
+    frequency = str(reader.get('frequency', '')).strip()
+    if not power:
+        raise ValueError(f"reader {reader_name} lacks power")
+    if not frequency:
+        raise ValueError(f"reader {reader_name} lacks frequency")
+    frequencyTokens = frequency.split()
+    if any(not token.isdigit() for token in frequencyTokens):
+        raise ValueError(
+            f"reader {reader_name} frequency must be a space-separated list of kHz values"
+        )
+    if len(frequencyTokens) != len(set(frequencyTokens)):
+        raise ValueError(f"reader {reader_name} frequency contains duplicate values")
+    profileName = str(reader.get("profileName", "AkiraSLFF"))
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", profileName) is None:
+        raise ValueError(f"reader {reader_name} has invalid profileName {profileName!r}")
+    auth = reader.get("auth", True)
+    authWait = reader.get("authWait", True)
+    tidWait = reader.get("tidWait", True)
+    mode = reader.get("mode", "C1G2_MODE_640_MILLER2")
+    region = str(reader.get("region", "")).strip()
+    if not region:
+        raise ValueError(f"reader {reader_name} lacks region")
+    fastMaxReportAge = int(reader.get("fastMaxReportAge", "5000"))
+    fastMinReads = int(reader.get("fastMinReads", "5"))
+    slowMaxReportAge = int(reader.get("slowMaxReportAge", "5000"))
+    slowMinReads = int(reader.get("slowMinReads", "5"))
+    fastPre = int(reader.get("fastPre", "0"))
+    fastPost = int(reader.get("fastPost", "0"))
+    slowPre = int(reader.get("slowPre", "0"))
+    slowPost = int(reader.get("slowPost", "0"))
+    massReconnectSeconds = max(1, int(reader.get("massReconnectSeconds", "10")))
+    readerReconnectFatalSeconds = max(
+        10,
+        int(reader.get("readerReconnectFatalSeconds", "60")),
+    )
+
+    if fastMinReads < 1 or slowMinReads < 1:
+        raise ValueError("reader minimum read counts must be positive")
+    if fastMaxReportAge < 1 or slowMaxReportAge < 1:
+        raise ValueError("reader maximum report ages must be positive")
+    if fastPost <= fastPre:
+        raise ValueError("reader fastPost must be greater than fastPre")
+    if slowPost <= slowPre:
+        raise ValueError("reader slowPost must be greater than slowPre")
+
+    try:
+        arbitrationMs = int(reader.get("crossLaneArbitrationMs", 150))
+        assignmentMs = int(reader.get("crossLaneSquelchMs", SQUELCH_TIME))
+        massToleranceMs = int(reader.get("crossLaneMassToleranceMs", 10))
+    except (TypeError, ValueError) as ex:
+        raise ValueError("reader cross-lane timing values must be integers") from ex
+    if arbitrationMs < 0 or assignmentMs < 1 or massToleranceMs < 0:
+        raise ValueError("reader cross-lane timing values are outside their valid range")
+    tagArbiter = CrossLaneArbiter(
+        arbitrationMs,
+        assignmentMs,
+        massToleranceMs,
+    )
+    return reader
 
 ############################################
 # thread control
 
 #######################
-def startThreads():
+def startThreads(initialEventConnection, linkHealth):
 
     stop_event = threading.Event()
 
-    tRecv = threading.Thread(target=rfThread, args=(stop_event,), name="rfThread", daemon=True)
-    tMass = threading.Thread(target=massThread, args=(stop_event,), name="massThread", daemon=True)
-    tLane = threading.Thread(target=laneThread, args=(stop_event,), name="laneThread", daemon=True)
+    tRecv = threading.Thread(
+        target=rfThread,
+        args=(stop_event, initialEventConnection, linkHealth),
+        name="rfThread",
+        daemon=True,
+    )
+    tDispatch = threading.Thread(target=rfDispatchThread, args=(stop_event,), name="rfDispatchThread", daemon=True)
+    tResponses = threading.Thread(target=driverResponseThread, args=(stop_event,), name="driverResponseThread", daemon=True)
 
-    tRecv.start()
-    tMass.start()
-    tLane.start()
+    threads = [tRecv, tDispatch, tResponses]
+    for context in laneContexts.values():
+        threads.append(threading.Thread(
+            target=massThread,
+            args=(context, stop_event),
+            name=f"massThread-{context.lane}",
+            daemon=True,
+        ))
+        threads.append(threading.Thread(
+            target=laneThread,
+            args=(context, stop_event),
+            name=f"laneThread-{context.lane}",
+            daemon=True,
+        ))
 
-    return stop_event, (tRecv, tMass, tLane)
+    for thread in threads:
+        thread.start()
+
+    return stop_event, tuple(threads)
 
 #######################
 def stopThreads(stop_event, threads):
 
     stop_event.set()
+    closeActiveEventConnection()
 
     # unblock queues
     try:
@@ -1688,51 +2574,687 @@ def stopThreads(stop_event, threads):
     except Exception:
         pass
 
-    try:
-        massQ.put_nowait(STOP)
-    except Exception:
-        pass
+    for context in laneContexts.values():
+        try:
+            context.massQ.put_nowait(STOP)
+        except Exception:
+            pass
+        try:
+            context.responseQ.put_nowait(STOP)
+        except Exception:
+            pass
 
+    shutdownDeadline = time.monotonic() + 6.0
     for t in threads:
-        t.join(timeout=2.0)
+        remaining = shutdownDeadline - time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
+    remainingWorkers = [thread.name for thread in threads if thread.is_alive()]
+    if remainingWorkers:
+        akiraCore.log(
+            "reader shutdown left worker(s) running: " + ", ".join(remainingWorkers)
+        )
+
+
+def deadWorkerNames(threads):
+    return [thread.name for thread in threads if not thread.is_alive()]
+
+
+############################################
+def runSelfTests():
+    global DEBUG
+    global LOG_EVENTS
+    global LOG_STATS
+    DEBUG = False
+    LOG_EVENTS = False
+    LOG_STATS = False
+
+    if not readerLanes or set(readerLanes) != set(laneContexts):
+        raise AssertionError("configured lanes and lane contexts differ")
+    if not antennaMap:
+        raise AssertionError("reader has no configured antennas")
+
+    laneFastAntennas = {}
+    for lane in readerLanes:
+        fastAntennas = [
+            number
+            for number, assignment in antennaMap.items()
+            if assignment == {"lane": lane, "side": ANTENNA_FAST}
+        ]
+        if not fastAntennas:
+            raise AssertionError(f"lane {lane} has no fast antenna")
+        laneFastAntennas[lane] = sorted(fastAntennas)[0]
+        context = laneContexts[lane]
+        if context.lane != lane:
+            raise AssertionError(f"lane context identity mismatch for {lane}")
+        try:
+            numericLane = int(lane)
+        except ValueError:
+            numericLane = None
+        if numericLane is not None and getLaneContext(numericLane) is not context:
+            raise AssertionError(f"numeric lane {numericLane} did not resolve to {lane}")
+
+    for context in laneContexts.values():
+        context.reports = []
+    for index, lane in enumerate(readerLanes):
+        antenna = laneFastAntennas[lane]
+        tid = f"ROUTE{index}"
+        parseEvent(
+            f"event.tag.report tag_id=0xEPC{index}, time=0, antenna={antenna}, "
+            f"rssi={-500 + index}, tid=0x{tid}, user_data=, "
+            "tid_authentic=AUTHENTIC, pw_authentic=AUTHENTIC, freq=919250"
+        )
+        routedTids = [report.get("tid") for report in laneContexts[lane].reports]
+        if routedTids != [tid]:
+            raise AssertionError(
+                f"antenna {antenna} did not route exclusively to lane {lane}: {routedTids}"
+            )
+
+    now = datetime.now()
+
+    def makeReport(lane, tid, rssi=-500):
+        return {
+            "date": now,
+            "reader": readerName,
+            "lane": lane,
+            "side": ANTENNA_FAST,
+            "antenna": laneFastAntennas[lane],
+            "rssi": rssi,
+            "epc": "EPC-" + tid,
+            "tid": tid,
+            "userData": "",
+            "tidAuthentic": AUTH_AUTHENTIC,
+            "pwAuthentic": AUTH_AUTHENTIC,
+        }
+
+    for index, lane in enumerate(readerLanes):
+        context = laneContexts[lane]
+        laneReport = makeReport(lane, f"LANE{index}")
+        context.reports = [laneReport, dict(laneReport)]
+        window = readWindow(
+            resetWindow("self test"),
+            now - timedelta(milliseconds=10),
+            now + timedelta(milliseconds=10),
+            "self test",
+        )
+        candidate = checkReads(context, window, ANTENNA_FAST, 2)
+        if candidate is None or candidate.get("lane") != lane:
+            raise AssertionError(f"lane {lane} candidate pool was not isolated")
+        if candidate.get("reads") != 2:
+            raise AssertionError(f"candidate read count was not propagated: {candidate}")
+
+    # A losing cross-read must not destroy the lane's own second candidate or
+    # close its mass window. Accepting a winner must not squelch unrelated TIDs.
+    testLane = readerLanes[-1]
+    testContext = laneContexts[testLane]
+    crossReport = makeReport(testLane, "CROSS", rssi=-430)
+    ownReport = makeReport(testLane, "OWN", rssi=-520)
+    testContext.reports = [
+        crossReport,
+        dict(crossReport),
+        dict(crossReport),
+        ownReport,
+        dict(ownReport),
+    ]
+    testContext.squelch = []
+    mixedWindow = readWindow(
+        resetWindow("mixed pool self test"),
+        now - timedelta(milliseconds=10),
+        now + timedelta(milliseconds=1000),
+        "mixed pool self test",
+    )
+    firstMixedCandidate = checkReads(
+        testContext, mixedWindow, ANTENNA_FAST, 2
+    )
+    if firstMixedCandidate is None or firstMixedCandidate.get("tid") != "CROSS":
+        raise AssertionError("mixed pool did not select the strongest first candidate")
+    if "OWN" not in firstMixedCandidate.get("otherTids", []):
+        raise AssertionError("mixed pool did not preserve alternate candidate metadata")
+    rejectCrossLaneCandidate(testContext, firstMixedCandidate)
+    secondMixedCandidate = checkReads(
+        testContext, mixedWindow, ANTENNA_FAST, 2
+    )
+    if secondMixedCandidate is None or secondMixedCandidate.get("tid") != "OWN":
+        raise AssertionError("losing cross-read destroyed the lane's own candidate")
+    if not mixedWindow["reading"]:
+        raise AssertionError("losing cross-read closed the lane's mass window")
+    testContext.squelch = []
+    accepted = dict(secondMixedCandidate, otherTids=["NEXT-TID"])
+    acceptCandidate(testContext, accepted)
+    if isSquelched(testContext, "NEXT-TID", ANTENNA_FAST):
+        raise AssertionError("accepting one tag squelched an unrelated fast tag")
+    if isSquelched(testContext, "NEXT-TID", ANTENNA_SLOW):
+        raise AssertionError("accepting one tag squelched an unrelated slow tag")
+    testContext.squelch = [{
+        "tid": "EXPIRED-TID",
+        "side": ANTENNA_FAST,
+        "end": datetime.now() - timedelta(milliseconds=1),
+    }]
+    if isSquelched(testContext, "EXPIRED-TID", ANTENNA_FAST):
+        raise AssertionError("expired squelch remained active until lane maintenance")
+
+    if len(readerLanes) >= 2:
+        laneA, laneB = readerLanes[:2]
+
+        # With only one mass-gated lane active, a qualified candidate should
+        # claim its lane immediately instead of paying the arbitration delay.
+        hybridArbiter = CrossLaneArbiter(arbitration_ms=250, assignment_ms=1000)
+        hybridArbiter.setLaneWindowActivity(laneA, True, False)
+        hybridArbiter.setLaneWindowActivity(laneB, False, False)
+        hybridRead = {
+            "tid": "HYBRID-TID",
+            "lane": laneA,
+            "side": ANTENNA_FAST,
+            "reads": 5,
+            "rssi": -500,
+        }
+        hybridStarted = time.monotonic()
+        if not hybridArbiter.submit(hybridRead):
+            raise AssertionError("uncontested hybrid lane claim was rejected")
+        hybridElapsed = time.monotonic() - hybridStarted
+        if hybridElapsed >= 0.1:
+            raise AssertionError(
+                f"uncontested hybrid lane claim blocked for {hybridElapsed:.3f}s"
+            )
+
+        # A later observation in the same lane must renew ownership from the
+        # newer sighting so a long passage cannot switch lanes mid-vehicle.
+        firstHybridExpiry = hybridArbiter.assignments["HYBRID-TID"][1]
+        time.sleep(0.002)
+        hybridArbiter.setLaneWindowActivity(laneA, False, True)
+        if not hybridArbiter.submit(dict(hybridRead, side=ANTENNA_SLOW)):
+            raise AssertionError("owning lane's later hybrid read was rejected")
+        if hybridArbiter.assignments["HYBRID-TID"][1] <= firstHybridExpiry:
+            raise AssertionError("owning lane's later read did not renew TID ownership")
+        if hybridArbiter.submit(dict(hybridRead, lane=laneB)):
+            raise AssertionError("hybrid ownership did not suppress the other lane")
+
+        arbiter = CrossLaneArbiter(arbitration_ms=25, assignment_ms=1000)
+        arbiter.setLaneWindowActivity(laneA, True, False)
+        arbiter.setLaneWindowActivity(laneB, True, False)
+        barrier = threading.Barrier(3)
+        results = {}
+
+        def submitCandidate(lane, reads, rssi, massOffsetMs):
+            barrier.wait()
+            results[lane] = arbiter.submit(
+                {
+                    "tid": "SHARED-TID",
+                    "lane": lane,
+                    "side": ANTENNA_FAST,
+                    "reads": reads,
+                    "rssi": rssi,
+                },
+                {
+                    "massActive": True,
+                    "massOffsetMs": massOffsetMs,
+                    "reads": reads,
+                    "rssi": rssi,
+                },
+            )
+
+        arbitrationThreads = [
+            threading.Thread(target=submitCandidate, args=(laneA, 5, -520, 30)),
+            threading.Thread(target=submitCandidate, args=(laneB, 8, -430, 10)),
+        ]
+        for thread in arbitrationThreads:
+            thread.start()
+        barrier.wait()
+        for thread in arbitrationThreads:
+            thread.join(timeout=2)
+        if results != {laneA: False, laneB: True}:
+            raise AssertionError(f"cross-lane arbitration chose incorrectly: {results}")
+        if arbiter.submit({"tid": "SHARED-TID", "lane": laneA}):
+            raise AssertionError("losing lane was not suppressed")
+        if not arbiter.submit(
+            {"tid": "SHARED-TID", "lane": laneB, "side": ANTENNA_SLOW}
+        ):
+            raise AssertionError("winning lane's later slow read was incorrectly suppressed")
+
+        # When the two lanes' mass timing differs by less than the configured
+        # tolerance, RF strength must not break the tie: antenna bleed can make
+        # the wrong lane's read count and RSSI look better.
+        nearTieArbiter = CrossLaneArbiter(
+            arbitration_ms=25,
+            assignment_ms=1000,
+            mass_tolerance_ms=10,
+        )
+        nearTieArbiter.setLaneWindowActivity(laneA, True, False)
+        nearTieArbiter.setLaneWindowActivity(laneB, True, False)
+        nearTieBarrier = threading.Barrier(3)
+        nearTieResults = {}
+
+        def submitNearTie(lane, reads, rssi, massOffsetMs):
+            nearTieBarrier.wait()
+            nearTieResults[lane] = nearTieArbiter.submit(
+                {
+                    "tid": "NEAR-TIE-TID",
+                    "lane": lane,
+                    "side": ANTENNA_FAST,
+                    "reads": reads,
+                    "rssi": rssi,
+                },
+                {
+                    "massActive": True,
+                    "massOffsetMs": massOffsetMs,
+                    "reads": reads,
+                    "rssi": rssi,
+                },
+            )
+
+        nearTieThreads = [
+            threading.Thread(target=submitNearTie, args=(laneA, 5, -520, 10)),
+            threading.Thread(target=submitNearTie, args=(laneB, 12, -350, 17)),
+        ]
+        for thread in nearTieThreads:
+            thread.start()
+        nearTieBarrier.wait()
+        for thread in nearTieThreads:
+            thread.join(timeout=2)
+        if nearTieResults != {laneA: False, laneB: False}:
+            raise AssertionError(
+                f"near-equal cross-lane mass evidence did not fail closed: "
+                f"{nearTieResults}"
+            )
+
+        # Fast and slow submissions share one global TID arbitration. Opposite
+        # sides must not independently accept the same cross-read.
+        oppositeArbiter = CrossLaneArbiter(arbitration_ms=25, assignment_ms=1000)
+        oppositeArbiter.setLaneWindowActivity(laneA, True, False)
+        oppositeArbiter.setLaneWindowActivity(laneB, False, True)
+        oppositeBarrier = threading.Barrier(3)
+        oppositeResults = {}
+
+        def submitOpposite(lane, side, massOffsetMs):
+            oppositeBarrier.wait()
+            oppositeResults[(lane, side)] = oppositeArbiter.submit(
+                {
+                    "tid": "OPPOSITE-SIDE-TID",
+                    "lane": lane,
+                    "side": side,
+                    "reads": 5,
+                    "rssi": -500,
+                },
+                {
+                    "massActive": True,
+                    "massOffsetMs": massOffsetMs,
+                    "reads": 5,
+                    "rssi": -500,
+                },
+            )
+
+        oppositeThreads = [
+            threading.Thread(
+                target=submitOpposite,
+                args=(laneA, ANTENNA_FAST, 40),
+            ),
+            threading.Thread(
+                target=submitOpposite,
+                args=(laneB, ANTENNA_SLOW, 5),
+            ),
+        ]
+        for thread in oppositeThreads:
+            thread.start()
+        oppositeBarrier.wait()
+        for thread in oppositeThreads:
+            thread.join(timeout=2)
+        expectedOpposite = {
+            (laneA, ANTENNA_FAST): False,
+            (laneB, ANTENNA_SLOW): True,
+        }
+        if oppositeResults != expectedOpposite:
+            raise AssertionError(
+                f"opposite-side arbitration chose incorrectly: {oppositeResults}"
+            )
+        if oppositeArbiter.assignedLane("OPPOSITE-SIDE-TID") != laneB:
+            raise AssertionError("opposite-side TID ownership did not match its winner")
+
+        # Global arbitration must not serialize unrelated traffic. Different
+        # TIDs in opposite lane/side slots can both be accepted.
+        independentArbiter = CrossLaneArbiter(arbitration_ms=25, assignment_ms=1000)
+        independentBarrier = threading.Barrier(3)
+        independentResults = {}
+
+        def submitIndependent(lane, side, tid):
+            independentBarrier.wait()
+            independentResults[(lane, side)] = independentArbiter.submit(
+                {
+                    "tid": tid,
+                    "lane": lane,
+                    "side": side,
+                    "reads": 5,
+                    "rssi": -500,
+                },
+                {
+                    "massActive": True,
+                    "massOffsetMs": 5,
+                    "reads": 5,
+                    "rssi": -500,
+                },
+            )
+
+        independentThreads = [
+            threading.Thread(
+                target=submitIndependent,
+                args=(laneA, ANTENNA_FAST, "INDEPENDENT-A"),
+            ),
+            threading.Thread(
+                target=submitIndependent,
+                args=(laneB, ANTENNA_SLOW, "INDEPENDENT-B"),
+            ),
+        ]
+        for thread in independentThreads:
+            thread.start()
+        independentBarrier.wait()
+        for thread in independentThreads:
+            thread.join(timeout=2)
+        if independentResults != {
+            (laneA, ANTENNA_FAST): True,
+            (laneB, ANTENNA_SLOW): True,
+        }:
+            raise AssertionError(
+                f"unrelated opposite-side tags were blocked: {independentResults}"
+            )
+
+        # Reciprocal mixed pools must be solved together. Mass timing outranks
+        # misleading cross-lane read count and produces one tag per lane.
+        poolArbiter = CrossLaneArbiter(arbitration_ms=25, assignment_ms=1000)
+        poolBarrier = threading.Barrier(3)
+        poolResults = {}
+        tagA = "POOL-A"
+        tagB = "POOL-B"
+        pools = {
+            laneA: [
+                dict(makeReport(laneA, tagA, -500), reads=4, count=4),
+                dict(makeReport(laneA, tagB, -420), reads=6, count=6),
+            ],
+            laneB: [
+                dict(makeReport(laneB, tagA, -420), reads=6, count=6),
+                dict(makeReport(laneB, tagB, -500), reads=4, count=4),
+            ],
+        }
+        poolEvidence = {
+            laneA: {
+                tagA: {"massActive": True, "massOffsetMs": 5, "reads": 4, "rssi": -500},
+                tagB: {"massActive": True, "massOffsetMs": 80, "reads": 6, "rssi": -420},
+            },
+            laneB: {
+                tagA: {"massActive": True, "massOffsetMs": 80, "reads": 6, "rssi": -420},
+                tagB: {"massActive": True, "massOffsetMs": 5, "reads": 4, "rssi": -500},
+            },
+        }
+
+        def submitPool(lane):
+            poolBarrier.wait()
+            winner = poolArbiter.submitPool(
+                lane, ANTENNA_FAST, pools[lane], poolEvidence[lane]
+            )
+            poolResults[lane] = winner.get("tid") if winner else None
+
+        poolThreads = [
+            threading.Thread(target=submitPool, args=(lane,))
+            for lane in (laneA, laneB)
+        ]
+        for thread in poolThreads:
+            thread.start()
+        poolBarrier.wait()
+        for thread in poolThreads:
+            thread.join(timeout=2)
+        if poolResults != {laneA: tagA, laneB: tagB}:
+            raise AssertionError(f"passage-level arbitration swapped tags: {poolResults}")
+
+        # Do not sacrifice the strongest mutual lane/TID choice just to fill a
+        # second lane. Here lane A clearly owns X; lane B's cross-read of X must
+        # not force lane A onto its weak fallback Y.
+        asymmetricArbiter = CrossLaneArbiter(
+            arbitration_ms=25,
+            assignment_ms=1000,
+            mass_tolerance_ms=10,
+        )
+        asymmetricArbiter.setLaneWindowActivity(laneA, True, False)
+        asymmetricArbiter.setLaneWindowActivity(laneB, True, False)
+        asymmetricBarrier = threading.Barrier(3)
+        asymmetricResults = {}
+        asymmetricX = "ASYMMETRIC-X"
+        asymmetricY = "ASYMMETRIC-Y"
+        asymmetricPools = {
+            laneA: [
+                dict(makeReport(laneA, asymmetricX, -350), reads=20, count=20),
+                dict(makeReport(laneA, asymmetricY, -650), reads=5, count=5),
+            ],
+            laneB: [
+                dict(makeReport(laneB, asymmetricX, -650), reads=5, count=5),
+            ],
+        }
+        asymmetricEvidence = {
+            laneA: {
+                asymmetricX: {
+                    "massActive": True,
+                    "massOffsetMs": 5,
+                    "reads": 20,
+                    "rssi": -350,
+                },
+                asymmetricY: {
+                    "massActive": True,
+                    "massOffsetMs": 200,
+                    "reads": 5,
+                    "rssi": -650,
+                },
+            },
+            laneB: {
+                asymmetricX: {
+                    "massActive": True,
+                    "massOffsetMs": 180,
+                    "reads": 5,
+                    "rssi": -650,
+                },
+            },
+        }
+
+        def submitAsymmetricPool(lane):
+            asymmetricBarrier.wait()
+            winner = asymmetricArbiter.submitPool(
+                lane,
+                ANTENNA_FAST,
+                asymmetricPools[lane],
+                asymmetricEvidence[lane],
+            )
+            asymmetricResults[lane] = winner.get("tid") if winner else None
+
+        asymmetricThreads = [
+            threading.Thread(target=submitAsymmetricPool, args=(lane,))
+            for lane in (laneA, laneB)
+        ]
+        for thread in asymmetricThreads:
+            thread.start()
+        asymmetricBarrier.wait()
+        for thread in asymmetricThreads:
+            thread.join(timeout=2)
+        if asymmetricResults != {laneA: asymmetricX, laneB: None}:
+            raise AssertionError(
+                f"asymmetric arbitration displaced the strongest match: "
+                f"{asymmetricResults}"
+            )
+
+        ambiguousArbiter = CrossLaneArbiter(arbitration_ms=25, assignment_ms=1000)
+        ambiguousBarrier = threading.Barrier(3)
+        ambiguousResults = {}
+        ambiguousEvidence = {
+            lane: {
+                tid: dict(evidence, massOffsetMs=0)
+                for tid, evidence in poolEvidence[lane].items()
+            }
+            for lane in (laneA, laneB)
+        }
+
+        def submitAmbiguousPool(lane):
+            ambiguousBarrier.wait()
+            winner = ambiguousArbiter.submitPool(
+                lane, ANTENNA_FAST, pools[lane], ambiguousEvidence[lane]
+            )
+            ambiguousResults[lane] = winner.get("tid") if winner else None
+
+        ambiguousThreads = [
+            threading.Thread(target=submitAmbiguousPool, args=(lane,))
+            for lane in (laneA, laneB)
+        ]
+        for thread in ambiguousThreads:
+            thread.start()
+        ambiguousBarrier.wait()
+        for thread in ambiguousThreads:
+            thread.join(timeout=2)
+        if ambiguousResults != {laneA: None, laneB: None}:
+            raise AssertionError(
+                f"ambiguous reciprocal tags were not rejected: {ambiguousResults}"
+            )
+
+    class FragmentedSocket:
+        def __init__(self, chunks):
+            self.chunks = list(chunks)
+
+        def settimeout(self, timeout):
+            pass
+
+        def recv(self, size):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            pass
+
+    frames = [
+        b"event.tag.report antenna=1 tid=ONE\r\n",
+        b"\r\nevent.tag.report antenna=3 tid=TWO\r\n\r\n",
+    ]
+    framedConnection = DelimitedReaderConnection(
+        "test",
+        0,
+        socket_factory=lambda address, timeout: FragmentedSocket(frames),
+    )
+    if framedConnection.readFrame() != "event.tag.report antenna=1 tid=ONE":
+        raise AssertionError("fragmented reader event was not reassembled")
+    if framedConnection.readFrame() != "event.tag.report antenna=3 tid=TWO":
+        raise AssertionError("combined reader events were not separated")
+
+    class SilentSocket(FragmentedSocket):
+        def __init__(self):
+            super().__init__([])
+
+        def recv(self, size):
+            raise socket.timeout()
+
+    silentConnection = DelimitedReaderConnection(
+        "silent-test",
+        0,
+        socket_factory=lambda address, timeout: SilentSocket(),
+    )
+    try:
+        silentConnection.readFrame(timeout=0.02)
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("silent reader handshake did not honor its deadline")
+
+    lockName = "self-test-" + str(uuid.uuid4())
+    firstLock = acquireReaderProcessLock(lockName)
+    try:
+        try:
+            acquireReaderProcessLock(lockName)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("duplicate reader process lock was accepted")
+    finally:
+        firstLock.close()
+
+    gpioState = parseGpio("gpio readall = FF8E")
+    if gpioState is None or len(gpioState) != 16:
+        raise AssertionError("Numato readall state was not parsed")
+    fragmentedReplyState = parseGpio("Logged in successfully\r\n\r\n>FF80\x00\r\n>")
+    if fragmentedReplyState != parseGpio("FF80"):
+        raise AssertionError("Numato fragmented readall response was not parsed")
+    if parseGpio("Logged in successfully") is not None:
+        raise AssertionError("Numato response text was incorrectly parsed as GPIO state")
+    sensorConfig = laneContexts[readerLanes[0]].mass_config
+    getMassStates(gpioState, sensorConfig)
+
+    clearValue = 1 - sensorConfig["activeState"]
+    rawClear = {str(port + 100): clearValue for port in range(16)}
+    clearState = massSensor.logicalState(rawClear, sensorConfig)
+    if any(clearState[key] for key in ("fast", "mid", "slow", "occupied")):
+        raise AssertionError("clear GPIO inputs produced occupied logical mass state")
+
+    compatibilityRole = {"fast": "trip", "mid": "main", "slow": "rear"}
+    for role, ports in sensorConfig["ports"].items():
+        for port in ports:
+            rawActive = dict(
+                rawClear,
+                **{str(port + 100): sensorConfig["activeState"]},
+            )
+            activeState = massSensor.logicalState(rawActive, sensorConfig)
+            if activeState[role] != 1 or activeState[compatibilityRole[role]] != 1:
+                raise AssertionError(
+                    f"configured physical port {port} did not trigger {role}"
+                )
+
+    clearTracking = {
+        "trip": 0,
+        "main": 0,
+        "rear": 0,
+        "clearSince": now,
+    }
+    if massClearReady(clearTracking, sensorConfig["clearDebounceMs"], now=now):
+        raise AssertionError("lane cleared before mass debounce elapsed")
+    afterDebounce = now + timedelta(milliseconds=sensorConfig["clearDebounceMs"] + 1)
+    if not massClearReady(clearTracking, sensorConfig["clearDebounceMs"], now=afterDebounce):
+        raise AssertionError("lane did not clear after mass debounce elapsed")
+    clearTracking["main"] = 1
+    if massClearReady(clearTracking, sensorConfig["clearDebounceMs"], now=afterDebounce):
+        raise AssertionError("active middle sensor incorrectly allowed lane clear")
+
+    print("PASS: reader isolation, passage arbitration, framing, and mass mapping")
 
 ############################################################################################
 # main
 
 CONFIGURE = True
 
+if len(sys.argv) < 2:
+    print(f"Usage: {sys.argv[0]} <reader-name> [--validate-config]", file=sys.stderr)
+    raise SystemExit(2)
+
 readerName = sys.argv[1]
 
-sidraCore.log("Reader " + readerName + " Starting")
+try:
+    reader = configureReader(readerName)
+except Exception as ex:
+    akiraCore.log(f"Reader {readerName} configuration error: {ex}")
+    print(f"Reader {readerName} configuration error: {ex}", file=sys.stderr)
+    raise SystemExit(2)
 
-readers = sidraCore.readers
+if "--validate-config" in sys.argv:
+    print(
+        f"VALID reader {readerName}: lanes={','.join(readerLanes)} "
+        f"antennas={len(antennaMap)} massSensors={len(laneContexts)}"
+    )
+    raise SystemExit(0)
 
-# if switch is enabled, use backup readers
-if getSwitchFile():
-    readers = sidraCore.backupReaders
+if "--self-test" in sys.argv:
+    runSelfTests()
+    raise SystemExit(0)
 
-for reader in readers:
-    #print(reader['name'])
-    if reader['name'] == readerName:
-        readerIp = reader['ip']
-        tagFilter = reader.get("tagFilter","")
-        antennas = reader['antennas']
-        power = reader['power']
-        frequency = reader['frequency']
-        auth = reader.get("auth", True)
-        authWait = reader.get("authWait", True)
-        tidWait = reader.get("tidWait", True)
-        mode = reader.get("mode", "C1G2_MODE_640_MILLER2")
-        lane = reader.get("lane","")
-        fastMaxReportAge = int(reader.get("fastMaxReportAge","5000"))
-        fastMinReads = int(reader.get("fastMinReads","5"))
-        slowMaxReportAge = int(reader.get("slowMaxReportAge","5000"))
-        slowMinReads = int(reader.get("slowMinReads","5"))
-        slowTrigger = reader.get("slowTrigger","main")
-        fastPre = int(reader.get("fastPre","0"))
-        fastPost = int(reader.get("fastPost","0"))
-        slowPre = int(reader.get("slowPre","0"))
-        slowPost = int(reader.get("slowPost","0"))
+try:
+    acquireReaderProcessLock(readerName)
+except RuntimeError as ex:
+    akiraCore.log(str(ex))
+    print(str(ex), file=sys.stderr)
+    raise SystemExit(3)
+
+akiraCore.log("Reader " + readerName + " Starting")
 
 print(fastPre)
 print(fastPost)
@@ -1742,139 +3264,171 @@ print(slowPost)
 if DEBUG:
         print("Reader " + readerName + " Starting")
         print("IP: " + str(readerIp))
-        print("Lane: " + str(lane))
+        print("Lanes: " + ",".join(readerLanes))
 
-#init command connection
-command_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-command_socket.connect((readerIp, READER_COMMAND_PORT))
-
-# init event connection
-event_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-event_socket.connect((readerIp, READER_EVENT_PORT))
-
-
-#login
-ret = xrCmd("reader.login(admin, admin)")
-
-if CONFIGURE:
-    #setup
-    ret = xrCmd("reader.login(admin, admin)")
-    ret = xrCmd("setup.operating_mode=standby")
-    #ret = xrCmd("version.detail")
-    ret = xrCmd("antennas.detected")
-    ret = xrCmd("reader.timestamp_all_events=True")
-    ret = xrCmd("com.network.ntp.enabled=1")
-    #ret = xrCmd("com.network.ntp_servers=time.google.com")
-    #ret - xrCmd("com.network.force_ntp_sync()")
-    #ret = xrCmd("com.network.ntp_servers")
-    ret = xrCmd("com.network.tcpkeepalive=1")
-    ret = xrCmd("tag.reporting.depart_time=250") # operational setting was 1000
-    ret = xrCmd("tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid")
-    ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic")
-    ret = xrCmd("tag.reporting.taglist_fields=tag_id time tid user_data time antenna repeat pw_authentic tid_authentic")
-    ret = xrCmd("tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic")
-    ret = xrCmd("tag.reporting.report_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic freq")
-    ret = xrCmd("setup.advanced.do_opspecs_once=1") # operational setting was 0
-    ret = xrCmd("antennas.mux_sequence=0")
-    ret = xrCmd("modem.control.cognitive.auto_mux=0")
-
-    ret = xrCmd("modem.protocol.isoc.control.user_data_length=8")
-    ret = xrCmd("modem.protocol.isoc.control.tid_data_length=6")
-    ret = xrCmd("modem.protocol.isoc.filter.1.action=ASSERT_DEASSERT")
-    ret = xrCmd("modem.protocol.isoc.filter.1.length=8")
-    ret = xrCmd("modem.protocol.isoc.filter.1.mask=B000")
-    ret = xrCmd("modem.protocol.isoc.filter.1.mem_bank=membank_epc")
-    ret = xrCmd("modem.protocol.isoc.filter.1.offset=32")
-    ret = xrCmd("modem.protocol.isoc.filter.1.session=NOT_USED")
-    ret = xrCmd("modem.protocol.isoc.filtering.use_session=false")
-    ret = xrCmd("modem.protocol.isoc.filtering.enabled=1")
-    ret = xrCmd("modem.protocol.isoc.filter.1.enabled=true")
-    ret = xrCmd("modem.protocol.isoc.control.use_block_write=false")
-
-    ret = xrCmd("modem.protocol.isoc.control.auto_mac.enable=false")
-    ret = xrCmd("modem.protocol.isoc.control.inventory_both_targets=true")
-    ret = xrCmd("modem.protocol.isoc.control.query_sel=0")
-    ret = xrCmd("modem.protocol.isoc.control.query_session=0")
-    ret = xrCmd("modem.protocol.isoc.control.session_id=SESSION_1")
-
-    #monday messing around
-    ret = xrCmd("modem.protocol.isoc.control.number_slots_q=2")
-    ret = xrCmd("modem.protocol.isoc.control.failsafe=31")
-
-    #ret = xrCmd("modem.protocol.isoc.control.query_target=TGT_A")
-
-    #authentication
-    if auth:
-        ret = xrCmd("tag.security.password_authentication_enable=1")
-        ret = xrCmd("tag.security.tid_authentication_enable=1")
-    else:
-        ret = xrCmd("tag.security.password_authentication_enable=0")
-        ret = xrCmd("tag.security.tid_authentication_enable=0")
-
-    ret = xrCmd("tag.security.tid_mask.enable=0")
-
-    #frequency
-    ret = xrCmd("setup.advanced.preferred_frequencies=" + str(frequency))
-    #ret = xrCmd("setup.advanced.preferred_frequencies=919250,919750,920250,920750,921250,921750,922250,922750")
+initialEventConnection = None
+stop_event = None
+threads = ()
+linkHealth = ReaderLinkHealth()
+shutdownRequested = threading.Event()
+exitCode = 0
 
 
-    #HOPPING MODE config
-    ret = xrCmd("modem.control.cognitive.lbt_max_hops=8")
+def requestShutdown(signum, frame):
+    shutdownRequested.set()
 
 
-    #antenna power config
-    thisAntenna = 0
-    for antenna in antennas:
-        thisAntenna = antenna['number']
-        thisPower = antenna.get('power',"")
-        if thisPower == "":
-            thisPower = power
-        thisCmd = "antennas." + str(thisAntenna) + ".conducted_power=" + thisPower
-        ret = xrCmd(thisCmd)
+signal.signal(signal.SIGINT, requestShutdown)
+signal.signal(signal.SIGTERM, requestShutdown)
 
-    #mode
-    ret = xrCmd("modem.protocol.isoc.physical.mode=" + str(mode))
+def configureReaderHardware(saveProfile=True):
+    connectCommandSocket()
+    xrCmd("reader.login(admin, admin)")
+    if not CONFIGURE:
+        return
 
-    #wait for auth/tid on arrival
-    if authWait:
-        ret = xrCmd("tag.reporting.arrive_generation=wait_for_all")
-    else:
-        if tidWait:
-            ret = xrCmd("tag.reporting.arrive_generation=wait_for_tid")
+    placedInStandby = False
+    try:
+        xrCmd("reader.login(admin, admin)")
+        xrCmd("setup.operating_mode=standby")
+        placedInStandby = True
 
-    ret = xrCmd("reader.profile.save(MalaysiaSLFF)")
+        detectedResponse = xrCmd("antennas.detected")
+        detectedAntennas = set(re.findall(r"\d+", detectedResponse[2:]))
+        missingAntennas = set(antennaMap) - detectedAntennas
+        if missingAntennas:
+            raise ReaderCommandError(
+                "configured antennas were not detected: "
+                + ", ".join(sorted(missingAntennas))
+            )
 
-    #antenna diag
-    antennas_diag = xrCmd("antennas.diag")
-    antennas_diag = antennas_diag.replace('\n','|')
-    antennas_diag = antennas_diag.replace('\r','')
-    sidraCore.log(f"{datetime.now()} reader {readerName} connected to {readerIp} antennas.diag: {antennas_diag.replace('\n','|')}")
+        regionResponse = xrCmd("setup.region")
+        actualRegion = regionResponse[2:].strip()
+        if actualRegion != region:
+            raise ReaderCommandError(
+                f"reader region mismatch: configured {region!r}, hardware {actualRegion!r}"
+            )
 
-    #killswitch
-    if READER_ENABLED:
-        ret = xrCmd("setup.operating_mode=active")
+        commands = [
+            "reader.timestamp_all_events=True",
+            "com.network.ntp.enabled=1",
+            "com.network.tcpkeepalive=1",
+            "tag.reporting.depart_time=250",
+            "tag.reporting.raw_arrive_fields=tag_id time antenna audit_record rssi tid",
+            "tag.reporting.arrive_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic",
+            "tag.reporting.depart_fields=tag_id tid user_data time antenna repeat tid_authentic pw_authentic",
+            "tag.reporting.taglist_fields=tag_id time tid user_data time antenna repeat pw_authentic tid_authentic",
+            "tag.reporting.report_fields=tag_id tid user_data time antenna rssi tid_authentic pw_authentic freq",
+            "setup.advanced.do_opspecs_once=1",
+            "antennas.mux_sequence=0",
+            "modem.control.cognitive.auto_mux=0",
+            "modem.protocol.isoc.control.user_data_length=8",
+            "modem.protocol.isoc.control.tid_data_length=6",
+            "modem.protocol.isoc.filter.1.action=ASSERT_DEASSERT",
+            "modem.protocol.isoc.filter.1.length=8",
+            "modem.protocol.isoc.filter.1.mask=B000",
+            "modem.protocol.isoc.filter.1.mem_bank=membank_epc",
+            "modem.protocol.isoc.filter.1.offset=32",
+            "modem.protocol.isoc.filter.1.session=NOT_USED",
+            "modem.protocol.isoc.filtering.use_session=false",
+            "modem.protocol.isoc.filtering.enabled=1",
+            "modem.protocol.isoc.filter.1.enabled=true",
+            "modem.protocol.isoc.control.use_block_write=false",
+            "modem.protocol.isoc.control.auto_mac.enable=false",
+            "modem.protocol.isoc.control.inventory_both_targets=true",
+            "modem.protocol.isoc.control.query_sel=0",
+            "modem.protocol.isoc.control.query_session=0",
+            "modem.protocol.isoc.control.session_id=SESSION_1",
+            "modem.protocol.isoc.control.number_slots_q=2",
+            "modem.protocol.isoc.control.failsafe=31",
+        ]
+        for command in commands:
+            xrCmd(command)
 
-#ret = xrCmd("reader.profile.show_running_config()")
+        authValue = 1 if auth else 0
+        xrCmd(f"tag.security.password_authentication_enable={authValue}")
+        xrCmd(f"tag.security.tid_authentication_enable={authValue}")
+        xrCmd("tag.security.tid_mask.enable=0")
+        xrCmd("setup.advanced.preferred_frequencies=" + frequency)
+        xrCmd("modem.control.cognitive.lbt_max_hops=8")
 
-#get the event channel
-event = recvEvent()
-i1 = event.find('event.connection id =') + len('event.connection id =')
-id = int(event[i1:])
+        for antenna in antennas:
+            antennaNumber = str(antenna['number'])
+            antennaPower = str(antenna.get('power', '') or power)
+            xrCmd(f"antennas.{antennaNumber}.conducted_power={antennaPower}")
 
-#ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.raw_arrive)")
-ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.arrive)")
-ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.report)")
-ret = xrCmd("reader.events.register(" + str(id) + ",event.tag.depart)")
-#ret = xrCmd("reader.events.register(" + str(id) + ",event.status.return_loss)")
-print("----------------------------------------")
+        xrCmd("modem.protocol.isoc.physical.mode=" + str(mode))
+        if authWait:
+            xrCmd("tag.reporting.arrive_generation=wait_for_all")
+        elif tidWait:
+            xrCmd("tag.reporting.arrive_generation=wait_for_tid")
 
-####################
-#start threads
-stop_event, threads = startThreads()
+        if saveProfile:
+            profileName = str(reader.get("profileName", "AkiraSLFF"))
+            xrCmd(f"reader.profile.save({profileName})")
+
+        antennasDiag = xrCmd("antennas.diag").replace('\n', '|').replace('\r', '')
+        akiraCore.log(
+            f"{datetime.now()} reader {readerName} connected to {readerIp} "
+            f"antennas.diag: {antennasDiag}"
+        )
+
+        if READER_ENABLED:
+            xrCmd("setup.operating_mode=active")
+            placedInStandby = False
+    except Exception:
+        if placedInStandby and READER_ENABLED:
+            try:
+                xrCmd("setup.operating_mode=active")
+            except Exception as recoveryError:
+                akiraCore.log(
+                    f"reader {readerName} failed to restore active mode: {recoveryError}"
+                )
+        raise
+
+
+def reconnectReaderEvent(stop_event):
+    """Restore an event socket without rewriting a healthy reader profile."""
+    connectCommandSocket()
+    xrCmd("reader.login(admin, admin)")
+    modeResponse = xrCmd("setup.operating_mode")
+    modeValue = modeResponse[2:].strip().lower()
+
+    if modeValue != "active":
+        # A rebooted or standby reader needs its checked runtime configuration,
+        # but the already-saved profile does not need another persistent write.
+        configureReaderHardware(saveProfile=False)
+
+    return connectEventConnection(stop_event=stop_event)
+
+
 try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    stopThreads(stop_event, threads)
+    configureReaderHardware()
+    initialEventConnection = connectEventConnection(stop_event=shutdownRequested)
+    setActiveEventConnection(initialEventConnection)
+    linkHealth.markConnected()
+    print("----------------------------------------")
 
+    stop_event, threads = startThreads(initialEventConnection, linkHealth)
+    while not shutdownRequested.wait(0.5):
+        deadWorkers = deadWorkerNames(threads)
+        if deadWorkers:
+            raise RuntimeError("reader worker stopped: " + ", ".join(deadWorkers))
+        disconnectedSeconds = linkHealth.disconnectedFor()
+        if disconnectedSeconds >= readerReconnectFatalSeconds:
+            raise RuntimeError(
+                f"RF link unavailable for {disconnectedSeconds:.1f}s: {linkHealth.error()}"
+            )
+except Exception as ex:
+    exitCode = 1
+    msg = f"Reader {readerName} fatal error: {ex}"
+    print(msg, file=sys.stderr)
+    akiraCore.log(msg)
+finally:
+    if stop_event is not None:
+        stopThreads(stop_event, threads)
+    else:
+        closeActiveEventConnection()
+    closeCommandSocket()
+
+raise SystemExit(exitCode)

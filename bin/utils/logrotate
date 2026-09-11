@@ -1,27 +1,57 @@
-/var/sidra/log/transactions.log {
+/var/akira/log/transactions.log {
+  su james james
   daily
   rotate 20
   compress
+  missingok
   notifempty
 }
 
-/var/sidra/log/sidra.log {
+/var/akira/log/akira.log {
+  su james james
   daily
   rotate 20
   compress
+  missingok
   notifempty
 }
 
-/var/sidra/log/mcp.log {
+/var/akira/log/mcp.log {
+  su james james
   daily
   rotate 20
   compress
+  missingok
   notifempty
 }
 
-/var/sidra/log/errors.log {
+/var/akira/log/errors.log {
+  su james james
   daily
   rotate 20
   compress
+  missingok
   notifempty
+}
+
+/var/akira/log/events.log /var/akira/log/stats.log {
+  su james james
+  daily
+  rotate 20
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0664 james james
+}
+
+/var/akira/log/lidarErrors.log /var/akira/log/reads.log /var/akira/log/rtsDebug.log /var/akira/log/startup.log /var/akira/log/restart.log {
+  su james james
+  daily
+  rotate 20
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0664 james james
 }

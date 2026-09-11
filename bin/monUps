@@ -1,6 +1,9 @@
 #!/bin/bash
-upsc apc1@127.0.0.1 2>/dev/null > /var/sidra/mon/ups-1
-upsc apc2@127.0.0.1 2>/dev/null > /var/sidra/mon/ups-2
-#upsc apc1@127.0.0.1 2>/dev/null | grep battery.charge: >> /var/sidra/mon/ups
-#upsc apc2@127.0.0.1 2>/dev/null | grep ups.status >> /var/sidra/mon/ups
-#upsc apc2@127.0.0.1 2>/dev/null | grep battery.charge: >> /var/sidra/mon/ups
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
+mkdir -p "$AKIRA_ROOT/mon"
+upsc apc1@127.0.0.1 2>/dev/null > "$AKIRA_ROOT/mon/ups-1"
+upsc apc2@127.0.0.1 2>/dev/null > "$AKIRA_ROOT/mon/ups-2"
+#upsc apc1@127.0.0.1 2>/dev/null | grep battery.charge: >> "$AKIRA_ROOT/mon/ups"
+#upsc apc2@127.0.0.1 2>/dev/null | grep ups.status >> "$AKIRA_ROOT/mon/ups"
+#upsc apc2@127.0.0.1 2>/dev/null | grep battery.charge: >> "$AKIRA_ROOT/mon/ups"

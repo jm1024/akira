@@ -1,0 +1,4 @@
+telnetlib3==5.0.0 \
+    --hash=sha256:64073b9c1ce8c084d3b400cbff00e627eda53fdc67cbdb700dca5de811ecacac
+wcwidth==0.8.3 \
+    --hash=sha256:d5b73dba6158a595ec9370350e7f2637bcac8d6c5e4fde34f30fcffb6103a5e4

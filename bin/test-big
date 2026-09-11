@@ -1,3 +1,5 @@
 #!/bin/bash
-cp /var/sidra/trn/done/* /var/sidra/trn
-chown james /var/sidra/trn/*
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
+cp "$AKIRA_ROOT"/trn/done/* "$AKIRA_ROOT/trn"
+chown james "$AKIRA_ROOT"/trn/*

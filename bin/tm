@@ -1,9 +1,11 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
 #if [$1 -eq 0]
 #then
 #    echo no lane
-#    tail -f /var/sidra/log/sidra.log
+#    tail -f "$AKIRA_ROOT/log/akira.log"
 #else
 #    echo lane
-    tail -f /var/sidra/log/mcp.log 
+    tail -f "$AKIRA_ROOT/log/mcp.log"
 #fi

@@ -1,4 +1,98 @@
 #!/bin/bash
-apt install python3-psutil
-apt install python3-ping
-apt install fping
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: setup must run as root." >&2
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="$(dirname -- "$SCRIPT_DIR")"
+CODE_USER="${AKIRA_CODE_USER:-james}"
+CODE_GROUP="${AKIRA_CODE_GROUP:-james}"
+
+if [ ! -f "$AKIRA_ROOT/bin/akiraCore.py" ] || [ ! -d "$AKIRA_ROOT/.git" ]; then
+    echo "ERROR: $AKIRA_ROOT is not an Akira checkout." >&2
+    exit 1
+fi
+
+if ! id "$CODE_USER" >/dev/null 2>&1; then
+    echo "ERROR: code owner $CODE_USER does not exist." >&2
+    exit 1
+fi
+
+if ! getent group "$CODE_GROUP" >/dev/null 2>&1; then
+    echo "ERROR: code group $CODE_GROUP does not exist." >&2
+    exit 1
+fi
+
+apt-get update
+apt-get install -y \
+    fping \
+    logrotate \
+    nut-client \
+    python3-icmplib \
+    python3-paramiko \
+    python3-pip \
+    python3-psutil \
+    python3-requests
+
+# Keep non-Ubuntu Python dependencies inside this checkout. This avoids
+# modifying the distro-managed Python environment while preserving the
+# existing /usr/bin/python3 launchers.
+install -d -m 2775 "$AKIRA_ROOT/lib"
+python3 -m pip install \
+    --disable-pip-version-check \
+    --no-compile \
+    --only-binary=:all: \
+    --require-hashes \
+    --upgrade \
+    --target "$AKIRA_ROOT/lib" \
+    --requirement "$AKIRA_ROOT/requirements.txt"
+
+# The source checkout belongs to the operator. Runtime processes are supervised
+# from root cron, while group-write access keeps lane operations manageable.
+chown -R "$CODE_USER:$CODE_GROUP" "$AKIRA_ROOT"
+
+for path in \
+    log \
+    img \
+    anpr \
+    tmp \
+    trn \
+    trn/working \
+    trn/done \
+    trn/tmp \
+    xmit \
+    xmit/state \
+    xmit/bad \
+    mass \
+    stream \
+    mon \
+    drv \
+    rts \
+    synergy
+do
+    install -d -o "$CODE_USER" -g "$CODE_GROUP" -m 2775 "$AKIRA_ROOT/$path"
+done
+
+AKIRA_CODE_USER="$CODE_USER" AKIRA_CODE_GROUP="$CODE_GROUP" \
+    "$AKIRA_ROOT/bin/utils/logrotate-setup"
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$AKIRA_ROOT/bin" python3 - <<'PY'
+from importlib.metadata import version
+
+import akiraCore
+import telnetlib3
+
+assert akiraCore.PROJECT_ROOT == "/var/akira", akiraCore.PROJECT_ROOT
+assert akiraCore.sidraApiList(), "sidraApi is not configured"
+assert version("telnetlib3") == "5.0.0"
+print("Akira setup verified")
+print("root:", akiraCore.PROJECT_ROOT)
+print("sidraApi:", akiraCore.sidraApiList())
+print("telnetlib3:", version("telnetlib3"))
+PY
+
+echo "Setup complete. Review root cron, then start Akira with $AKIRA_ROOT/bin/up."

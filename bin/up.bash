@@ -1,7 +1,8 @@
 #!/bin/bash
-/var/sidra/bin/cam &
-/var/sidra/bin/readerInit &
-/var/sidra/bin/massInit &
-/var/sidra/bin/lidar &
-/var/sidra/bin/mcp &
-/var/sidra/bin/xmit &
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+"$SCRIPT_DIR/cam" &
+"$SCRIPT_DIR/readerInit" &
+"$SCRIPT_DIR/massInit" &
+"$SCRIPT_DIR/lidar" &
+"$SCRIPT_DIR/mcp" &
+"$SCRIPT_DIR/xmit" &

@@ -1,26 +1,23 @@
-# Codex Bootstrap
+Muninn Bootstrap
+Before doing project work, ensure Muninn is available and current:
 
-Before doing project work, sync Iris:
+if [[ ! -d "$HOME/muninn/.git" ]]; then
+  git clone https://github.com/jm1024/muninn.git "$HOME/muninn"
+else
+  git -C "$HOME/muninn" fetch origin
+  if git -C "$HOME/muninn" show-ref --verify --quiet refs/heads/main; then
+    git -C "$HOME/muninn" pull --ff-only
+  elif git -C "$HOME/muninn" show-ref --verify --quiet refs/remotes/origin/main; then
+    git -C "$HOME/muninn" checkout --track origin/main
+  fi
+fi
 
-```bash
-test -d /home/james/iris || git clone https://github.com/jm1024/iris.git /home/james/iris
-cd /home/james/iris
-git pull --ff-only
-```
-
+muninn_key="$HOME/.config/muninn/git-crypt-key"
+if command -v git-crypt >/dev/null 2>&1 && [[ -f "$muninn_key" ]]; then
+  git -C "$HOME/muninn" crypt unlock "$muninn_key"
+fi
 Then read:
 
-- `/home/james/iris/AGENTS.md`
-- `/home/james/iris/Iris/Meta/AGENTS.md`
-- `/home/james/iris/Iris/Communication/shared/codex-startup.md`
-
-Check this host's mailbox:
-
-```bash
-host=$(hostname -s)
-ls "/home/james/iris/Iris/Communication/codex-${host}" 2>/dev/null
-```
-
-If the mailbox exists, read `inbox.md` before starting project work. If project work creates durable decisions, operational findings, or handoff notes, update Iris and sync it back with `/home/james/iris/bin/sync`.
-
-After the Iris startup check, continue with the user's task in the current project directory.
+$HOME/muninn/AGENTS.md
+After loading Muninn's instructions, continue with the user's task in the
+original project directory.

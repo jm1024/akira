@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Offline TCP lane-isolation regressions. Uses only temporary paths and localhost."""
+import contextlib
+import io
+import json
+import queue
+import runpy
+import socket
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+from synergyProtocol import lane_endpoints
+
+BIN = Path(__file__).resolve().parent
+
+
+def wait_until(condition, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition did not become true")
+
+
+class Peer:
+    def __init__(self, port, lane, omit_lane=False, wrong_lane=None):
+        self.lane = lane
+        self.omit_lane = omit_lane
+        self.wrong_lane = wrong_lane
+        self.commands = queue.Queue()
+        self.hold = threading.Event()
+        self.stopped = threading.Event()
+        self.socket = socket.create_connection(("127.0.0.1", port), timeout=1)
+        self.socket.settimeout(0.1)
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        buffer = b""
+        try:
+            while not self.stopped.is_set():
+                try:
+                    data = self.socket.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    return
+                buffer += data
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    command = json.loads(raw)
+                    self.commands.put(command)
+                    if self.hold.is_set():
+                        continue
+                    state = dict(laneState=1, gateState=1, queueCount=1, signMsg="TEST")
+                    if not self.omit_lane:
+                        state["laneID"] = self.wrong_lane or self.lane
+                    self.socket.sendall(json.dumps(state).encode() + b"\n")
+        except OSError:
+            pass
+
+    def stop(self):
+        self.stopped.set()
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.socket.close()
+        self.thread.join(timeout=1)
+
+    def seen(self):
+        values = []
+        while True:
+            try:
+                values.append(self.commands.get_nowait())
+            except queue.Empty:
+                return values
+
+
+def check_config():
+    with tempfile.TemporaryDirectory() as root:
+        root = Path(root)
+        (root / "etc").mkdir()
+        config = {"lanes": [{"number": "06"}, {"number": "07"}],
+                  "driverConfig": {"serverSynergy": {
+                      "bind": "127.0.0.1", "lanePorts": {"06": 2070, "07": 2071}}}}
+        path = root / "etc/akira.cfg"
+        path.write_text(json.dumps(config))
+        assert lane_endpoints(root, ("06", "07")) == ("127.0.0.1", {"06": 2070, "07": 2071})
+        assert lane_endpoints(root, ("07",))[1] == {"07": 2071}
+        assert lane_endpoints(root, ("06",), port_override=3001)[1] == {"06": 3001}
+        for mapping in ({"06": 2070}, {"06": 2070, "07": 2070}, {"06": 2070, "99": 2071},
+                        {"06": 0, "07": 2071}, {"06": True, "07": 2071}, {"06": "2070", "07": 2071}):
+            config["driverConfig"]["serverSynergy"]["lanePorts"] = mapping
+            path.write_text(json.dumps(config))
+            try:
+                lane_endpoints(root, ("06", "07"))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted invalid lane ports: {mapping}")
+        for kwargs in ({"port_override": 3000}, {"mapping_override": "06=3000,06=3001"},
+                       {"mapping_override": "06=3000,07=3001", "port_override": 3002}):
+            try:
+                lane_endpoints(root, ("06", "07"), **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted ambiguous override: {kwargs}")
+
+
+def check_single_port_client():
+    module = runpy.run_path(str(BIN / "clientSynergyTest.py"))
+    config = json.loads((BIN.parent / "etc/akira.cfg").read_text())
+    ports = config["driverConfig"]["serverSynergy"]["lanePorts"]
+    parsed = [module["parse_args"](["--port", str(port)]) for port in ports.values()]
+    for args, (lane, port) in zip(parsed, ports.items()):
+        assert args.lanes == (lane,) and args.lane_ports == {lane: port}
+    assert len({args.lock_file for args in parsed}) == len(ports)
+    assert len({args.status_file for args in parsed}) == len(ports)
+    lanes = list(ports)
+    invalid = [[], ["--port", "0"], ["--port", "65536"],
+               ["--port", str(ports[lanes[0]]), "--lane", ",".join(lanes)]]
+    if len(lanes) > 1:
+        invalid.append(["--port", str(ports[lanes[0]]), "--lane", lanes[1]])
+    for argv in invalid:
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                module["parse_args"](argv)
+            except SystemExit as error:
+                assert error.code == 2
+            else:
+                raise AssertionError(f"client accepted invalid single-port arguments: {argv}")
+
+
+def check_connections():
+    module = runpy.run_path(str(BIN / "serverSynergy"))
+    with tempfile.TemporaryDirectory(prefix="akira-lane-ports-") as root, contextlib.redirect_stdout(io.StringIO()):
+        probes = [socket.socket(), socket.socket()]
+        for probe in probes:
+            probe.bind(("127.0.0.1", 0))
+        ports = {lane: probe.getsockname()[1] for lane, probe in zip(("06", "07"), probes)}
+        mapping = ",".join(f"{lane}={port}" for lane, port in ports.items())
+        args = module["parse_args"](["--lanes", "06,07", "--lane-ports", mapping,
+                                     "--bind", "127.0.0.1", "--data-dir", root,
+                                     "--retry-ms", "100", "--dispatch-timeout-ms", "800"])
+        # If any bind fails, no local dispatch or partial lane service is enabled.
+        probes[0].close()
+        failed = module["AkiraServer"](args)
+        try:
+            failed.serve()
+        except OSError:
+            pass
+        else:
+            raise AssertionError("server accepted an occupied lane port")
+        assert not Path(args.dispatch_socket).exists()
+        probes[1].close()
+
+        server = module["AkiraServer"](args)
+        errors = []
+        def serve():
+            try:
+                server.serve()
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        peers = []
+        try:
+            wait_until(lambda: Path(args.dispatch_socket).exists())
+            def dispatch(lane, label):
+                command = dict(op="setSignMsg", laneID=lane, signMsg=label,
+                               dateTime=datetime.now(timezone.utc).isoformat())
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    sock.connect(args.dispatch_socket)
+                    sock.sendall(json.dumps(command).encode() + b"\n")
+                    return json.loads(sock.makefile("rb").readline())
+
+            # A wrong-lane handshake cannot enable lane 06; lane 07 works alone.
+            wrong = Peer(ports["06"], "06", wrong_lane="07")
+            p07 = Peer(ports["07"], "07", omit_lane=True)
+            peers += [wrong, p07]
+            wait_until(lambda: server.channels["07"].partner_ready.is_set())
+            wait_until(lambda: server.status.data["lanes"]["06"]["invalidResponses"] > 0)
+            assert not server.channels["06"].partner_ready.is_set()
+            assert dispatch("06", "OFFLINE")["notSent"]
+            result = dispatch("07", "ONLY-07")
+            assert result["ok"] and result["response"]["laneID"] == "07"
+            assert server.status.data["anyConnected"] and not server.status.data["connected"]
+            wrong.stop()
+            wait_until(lambda: server.channels["06"].client_socket is None)
+            p06 = Peer(ports["06"], "06")
+            peers.append(p06)
+            wait_until(lambda: server.status.data["connected"])
+            assert server.status.data["lanes"]["06"]["port"] == ports["06"]
+            assert dispatch("99", "UNMAPPED")["code"] == "INVALID_COMMAND"
+            # A second client cannot take over an already-connected lane.
+            with socket.create_connection(("127.0.0.1", ports["06"]), timeout=1) as extra:
+                extra.settimeout(1)
+                assert extra.recv(1) == b""
+            assert dispatch("06", "ONLY-06")["ok"]
+            assert all(c["laneID"] == "06" for c in p06.seen())
+            assert all(c["laneID"] == "07" for c in p07.seen())
+
+            # Stall one active command and queue another, then disconnect.
+            # Lane 07 must finish while lane 06 is still awaiting its ACK.
+            p06.hold.set()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                active = pool.submit(dispatch, "06", "ACTIVE-06")
+                wait_until(lambda: server.status.data["lanes"]["06"]["currentOp"] == "setSignMsg")
+                queued = pool.submit(dispatch, "06", "QUEUED-06")
+                wait_until(lambda: server.channels["06"].dispatch_queue.qsize() == 1)
+                assert dispatch("07", "WHILE-06-STALLED")["ok"]
+                assert not active.done(), "lane 07 waited for lane 06 to finish"
+                p06.stop()
+                assert not active.result()["ok"]
+                rejected = queued.result()
+                assert not rejected["ok"] and rejected["notSent"]
+            wait_until(lambda: not server.channels["06"].partner_ready.is_set())
+            assert server.channels["07"].partner_ready.is_set()
+            assert dispatch("06", "NEVER-REPLAY")["code"] == "DISCONNECTED"
+            assert dispatch("07", "AFTER-06-DISCONNECT")["ok"]
+            p06new = Peer(ports["06"], "06", omit_lane=True)
+            peers.append(p06new)
+            wait_until(lambda: server.channels["06"].partner_ready.is_set())
+            assert dispatch("06", "AFTER-RECONNECT")["ok"]
+            non_nops = [c["signMsg"] for c in p06new.seen() if c["op"] != "NOP"]
+            assert non_nops == ["AFTER-RECONNECT"], non_nops
+            # Exercise the reverse direction too: lane 06 survives loss of 07.
+            p07.stop()
+            wait_until(lambda: not server.channels["07"].partner_ready.is_set())
+            assert dispatch("06", "AFTER-07-DISCONNECT")["ok"]
+            assert dispatch("07", "OFFLINE-07")["notSent"]
+        finally:
+            for peer in peers:
+                peer.stop()
+            server.request_stop()
+            thread.join(timeout=3)
+        assert not thread.is_alive() and not errors, errors
+        assert not Path(args.dispatch_socket).exists()
+
+
+def main():
+    check_config()
+    check_single_port_client()
+    check_connections()
+    print("Synergy per-lane port checks passed")
+
+
+if __name__ == "__main__":
+    main()

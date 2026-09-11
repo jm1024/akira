@@ -1,13 +1,24 @@
 #!/bin/bash
-echo "enabling mon in cron"
-if crontab -l | grep --quiet "/var/sidra/bin/monCron"; then
-  echo " - cron already configured"
-else
-  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/monCron"; } | crontab -
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: enableMon must run as root so it updates the live Akira crontab." >&2
+  exit 1
 fi
 
-if crontab -l | grep --quiet "/var/sidra/bin/monUps"; then
-  echo " - cron already configured"
-else
-  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/monUps"; } | crontab -
-fi
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CRON_FILE="$(mktemp)"
+trap 'rm -f -- "$CRON_FILE"' EXIT
+
+crontab -l 2>/dev/null > "$CRON_FILE" || true
+
+echo "enabling mon in cron"
+for command in monCron monUps; do
+  entry="*/1 * * * * $SCRIPT_DIR/$command"
+  if grep --fixed-strings --line-regexp --quiet -- "$entry" "$CRON_FILE"; then
+    echo " - $command already configured"
+  else
+    printf '%s\n' "$entry" >> "$CRON_FILE"
+  fi
+done
+
+crontab "$CRON_FILE"

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 import subprocess
+import sys
 import time
-import sidraCore
+import akiraCore
 import os
 
 processes = ["serverRts"]
-BASE_DIR = "/var/sidra/bin"
+BASE_DIR = akiraCore.BIN_DIR
 SLEEP_SECONDS = 0.5
 
 #############################
-def runPkill(signalOption):
+def runPkill(signalOption, dryRun=False):
 	for name in processes:
 		pattern = f"{BASE_DIR}/{name}"
+		if dryRun:
+			print(f"DRY RUN: pkill {signalOption} -f {pattern}")
+			continue
+
 		try:
 			subprocess.run(
 				["pkill", signalOption, "-f", pattern],
@@ -24,19 +29,26 @@ def runPkill(signalOption):
 
 #############################
 def main():
+	dryRun = "--dry-run" in sys.argv
+
 	# Try graceful shutdown first (SIGINT so mass can do gpio notify off)
-	runPkill("-INT")
+	runPkill("-INT", dryRun=dryRun)
 
 	# Give them a moment to handle signals and close sockets
-	time.sleep(SLEEP_SECONDS)
+	if not dryRun:
+		time.sleep(SLEEP_SECONDS)
 
 	# Anything still alive gets a TERM
-	runPkill("-TERM")
+	runPkill("-TERM", dryRun=dryRun)
 	
-	time.sleep(SLEEP_SECONDS)
+	if not dryRun:
+		time.sleep(SLEEP_SECONDS)
 	
 	# Restart serverRts
 	server = f"{BASE_DIR}/serverRts"
+	if dryRun:
+		print(f"DRY RUN: exec {server}")
+		return
 	os.execv(server, [server])
 
 

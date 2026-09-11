@@ -12,7 +12,7 @@ def process_status(process_name):
 def cp(process_name):
     if process_status(process_name):
         print(process_name + " up")
-    else
+    else:
         print(process_name + " down")
 
 
@@ -24,4 +24,3 @@ while True:
     cp("mcp")
 
     time.sleep(.5)
-

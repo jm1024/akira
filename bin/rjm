@@ -1,6 +1,7 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 clear
 pkill -f mass
 pkill -f reader
 echo "------------ start rjm -----------"
-/var/sidra/bin/readerInit
+"$SCRIPT_DIR/readerInit"

@@ -1,3 +1,32 @@
 #!/bin/bash
-cp /var/sidra/bin/utils/logrotate /etc/logrotate.d/sidra
-logrotate /etc/logrotate.conf --debug
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: logrotate-setup must run as root." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CODE_USER="${AKIRA_CODE_USER:-james}"
+CODE_GROUP="${AKIRA_CODE_GROUP:-james}"
+
+if ! id "$CODE_USER" >/dev/null 2>&1; then
+  echo "ERROR: logrotate user $CODE_USER does not exist." >&2
+  exit 1
+fi
+
+if ! getent group "$CODE_GROUP" >/dev/null 2>&1; then
+  echo "ERROR: logrotate group $CODE_GROUP does not exist." >&2
+  exit 1
+fi
+
+generatedConfig="$(mktemp)"
+trap 'rm -f "$generatedConfig"' EXIT
+sed \
+  -e "s/^  su james james$/  su $CODE_USER $CODE_GROUP/" \
+  -e "s/^  create 0664 james james$/  create 0664 $CODE_USER $CODE_GROUP/" \
+  "$SCRIPT_DIR/logrotate" > "$generatedConfig"
+
+install -m 0644 "$generatedConfig" /etc/logrotate.d/akira
+logrotate --debug /etc/logrotate.d/akira

@@ -1,3 +1,3 @@
 #!/bin/bash
-cp /var/sidra/trn/done/* /var/sidra/trn
-chown james /var/sidra/trn/*
+cp /var/akira/trn/done/* /var/akira/trn
+chown james /var/akira/trn/*

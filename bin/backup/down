@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 import subprocess
 import time
-import sidraCore
+import akiraCore
 
 processes = ["cam", "reader", "mass", "lidar", "mcp", "xmit"]
-BASE_DIR = "/var/sidra/bin"
+BASE_DIR = "/var/akira/bin"
 SLEEP_SECONDS = 0.5
 
-for driverXmit in sidraCore.driversXmit:
+for driverXmit in akiraCore.driversXmit:
 	processes.append(driverXmit)
 	
-for driverServer in sidraCore.driversServer:
+for driverServer in akiraCore.driversServer:
 	processes.append(driverServer)
 
 #############################

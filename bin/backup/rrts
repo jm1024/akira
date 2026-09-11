@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import subprocess
 import time
-import sidraCore
+import akiraCore
 import os
 
 processes = ["serverRts"]
-BASE_DIR = "/var/sidra/bin"
+BASE_DIR = "/var/akira/bin"
 SLEEP_SECONDS = 0.5
 
 #############################

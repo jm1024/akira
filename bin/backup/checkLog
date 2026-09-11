@@ -6,7 +6,7 @@ from collections import defaultdict
 PATTERN = re.compile(r"<<<\s+(fast|slow):\s+([0-9A-Fa-f]+)\b")
 
 def main() -> int:
-    log_path = sys.argv[1] if len(sys.argv) > 1 else "/var/sidra/log/events.log"
+    log_path = sys.argv[1] if len(sys.argv) > 1 else "/var/akira/log/events.log"
 
     # tid -> {"fast": int, "slow": int}
     counts = defaultdict(lambda: {"fast": 0, "slow": 0})

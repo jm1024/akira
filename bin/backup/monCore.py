@@ -10,10 +10,10 @@ import glob
 import subprocess
 import shutil
 
-import sidraCore
+import akiraCore
 
-MON_FILE = "/var/sidra/mon/current"
-MON_PATH = "/var/sidra/mon/"
+MON_FILE = "/var/akira/mon/current"
+MON_PATH = "/var/akira/mon/"
 
 intervals = (
     ('w', 604800),  # 60 * 60 * 24 * 7
@@ -116,7 +116,7 @@ def getEventCounts():
     countLastMin = 0
 
     try:
-        dir_entries = os.scandir('/var/sidra/trn/done')
+        dir_entries = os.scandir('/var/akira/trn/done')
         for entry in dir_entries:
             if entry.is_file():
                 last_modified = datetime.datetime.fromtimestamp(entry.stat().st_mtime)
@@ -169,7 +169,7 @@ def getUps():
             upsNum = upsNum +1
             thisUps = {}
             thisUps['number'] = upsNum
-            contents = sidraCore.readFile(file)
+            contents = akiraCore.readFile(file)
             lines = contents.split('\n')
             for line in lines:
                 #print(line)
@@ -205,10 +205,10 @@ def getAll(ipList):
         ip['state'] = isUp(ip['address'])
 
     #get stats
-    xmitQ = countFiles("/var/sidra/xmit")
-    mcpQ = countFiles("/var/sidra/trn")
-    img = countFiles("/var/sidra/img")
-    du = getDirSize("/var/sidra/img")
+    xmitQ = countFiles("/var/akira/xmit")
+    mcpQ = countFiles("/var/akira/trn")
+    img = countFiles("/var/akira/img")
+    du = getDirSize("/var/akira/img")
     df = getDiskFree()
     cpu = getCpu()
     epm, eph = getEventCounts()
@@ -216,9 +216,9 @@ def getAll(ipList):
 
     #mass sensor states
     massSensors = []
-    for mass in sidraCore.massSensors:
+    for mass in akiraCore.massSensors:
         print(mass.get("lane"))
-        thisState = sidraCore.massState(mass.get("lane"))
+        thisState = akiraCore.massState(mass.get("lane"))
         massSensors.append(thisState)
 
     data = {

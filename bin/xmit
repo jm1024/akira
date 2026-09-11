@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 
-import sidraCore
+import akiraCore
 
 DEBUG = False
 DEBUG_LOAD = False
@@ -16,7 +16,7 @@ DEBUG_LOAD = False
 
 ########################################
 def xmitStatePath(file):
-    return sidraCore.XMIT_STATE_DIR + "/" + file + ".state"
+    return akiraCore.XMIT_STATE_DIR + "/" + file + ".state"
 
 
 ########################################
@@ -24,17 +24,17 @@ def loadXmitState(file):
     path = xmitStatePath(file)
     state = {"delivered": [], "failures": {}}
 
-    if not sidraCore.fileExists(path):
+    if not akiraCore.fileExists(path):
         return state
 
     try:
-        data = json.loads(sidraCore.readFile(path))
+        data = json.loads(akiraCore.readFile(path))
     except Exception as ex:
-        sidraCore.log("xmit: invalid state file " + str(file) + " - " + str(ex), True)
+        akiraCore.log("xmit: invalid state file " + str(file) + " - " + str(ex), True)
         return state
 
     if not isinstance(data, dict):
-        sidraCore.log("xmit: invalid state file " + str(file) + " - not an object", True)
+        akiraCore.log("xmit: invalid state file " + str(file) + " - not an object", True)
         return state
 
     delivered = data.get("delivered", [])
@@ -69,20 +69,20 @@ def saveXmitState(file, state):
 ########################################
 def deleteXmitState(file):
     path = xmitStatePath(file)
-    if sidraCore.fileExists(path):
-        sidraCore.deleteFile(path)
+    if akiraCore.fileExists(path):
+        akiraCore.deleteFile(path)
 
 
 ########################################
 def cleanupOrphanedXmitStates():
-    for stateFile in sidraCore.fileList(sidraCore.XMIT_STATE_DIR):
+    for stateFile in akiraCore.fileList(akiraCore.XMIT_STATE_DIR):
         if not stateFile.endswith(".state"):
             continue
 
         queueFile = stateFile[: -len(".state")]
-        queuePath = sidraCore.XMIT_DIR + "/" + queueFile
-        if not sidraCore.fileExists(queuePath):
-            sidraCore.deleteFile(sidraCore.XMIT_STATE_DIR + "/" + stateFile)
+        queuePath = akiraCore.XMIT_DIR + "/" + queueFile
+        if not akiraCore.fileExists(queuePath):
+            akiraCore.deleteFile(akiraCore.XMIT_STATE_DIR + "/" + stateFile)
 
 
 ########################################
@@ -106,14 +106,14 @@ def isFileLocked(path):
 
 ########################################
 def rejectXmitFile(file, reason):
-    src = sidraCore.XMIT_DIR + "/" + file
-    dst = sidraCore.XMIT_BAD_DIR + "/" + file
+    src = akiraCore.XMIT_DIR + "/" + file
+    dst = akiraCore.XMIT_BAD_DIR + "/" + file
 
-    if sidraCore.fileExists(dst):
+    if akiraCore.fileExists(dst):
         stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        dst = sidraCore.XMIT_BAD_DIR + "/" + file + "." + stamp
+        dst = akiraCore.XMIT_BAD_DIR + "/" + file + "." + stamp
 
-    sidraCore.log(
+    akiraCore.log(
         "ERROR: xmit rejecting queue file "
         + str(file)
         + " - "
@@ -122,10 +122,10 @@ def rejectXmitFile(file, reason):
     )
 
     try:
-        sidraCore.moveFile(src, dst)
+        akiraCore.moveFile(src, dst)
         deleteXmitState(file)
     except Exception as ex:
-        sidraCore.log(
+        akiraCore.log(
             "ERROR: xmit failed to move bad queue file "
             + str(file)
             + " - "
@@ -137,7 +137,7 @@ def rejectXmitFile(file, reason):
 ##############################################################################################
 # main
 
-# sidraCore.log("mcp Starting")
+# akiraCore.log("mcp Starting")
 
 run = True
 
@@ -147,19 +147,19 @@ if "-d" in sys.argv:
 if DEBUG:
     print("debug on")
 
-sidraCore.makeDir(sidraCore.XMIT_STATE_DIR)
-sidraCore.makeDir(sidraCore.XMIT_BAD_DIR)
+akiraCore.makeDir(akiraCore.XMIT_STATE_DIR)
+akiraCore.makeDir(akiraCore.XMIT_BAD_DIR)
 cleanupOrphanedXmitStates()
 
 events = []
 
 while run:
-    # sidraCore.log("mcp L-1")
+    # akiraCore.log("mcp L-1")
     # if DEBUG:
     #    print("LOAD: init")
 
     # get list of new files
-    files = sidraCore.fileList(sidraCore.XMIT_DIR, newestFirst=True, max=100)
+    files = akiraCore.fileList(akiraCore.XMIT_DIR, newestFirst=True, max=100)
 
     # let files finish writing out to disk
     time.sleep(
@@ -178,12 +178,12 @@ while run:
 
         if file.endswith(".state"):
             baseFile = file[: -len(".state")]
-            if not sidraCore.fileExists(sidraCore.XMIT_DIR + "/" + baseFile):
-                sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+            if not akiraCore.fileExists(akiraCore.XMIT_DIR + "/" + baseFile):
+                akiraCore.deleteFile(akiraCore.XMIT_DIR + "/" + file)
             continue
 
-        fullPath = sidraCore.XMIT_DIR + "/" + file
-        if not sidraCore.fileExists(fullPath):
+        fullPath = akiraCore.XMIT_DIR + "/" + file
+        if not akiraCore.fileExists(fullPath):
             continue
 
         # if not isFileStable(fullPath):
@@ -196,8 +196,8 @@ while run:
         xmitResp = False
 
         # load contents
-        # data = json.loads(sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file))
-        data = sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file)
+        # data = json.loads(akiraCore.readFile(akiraCore.XMIT_DIR + "/" + file))
+        data = akiraCore.readFile(akiraCore.XMIT_DIR + "/" + file)
 
         fileCount = fileCount + 1
 
@@ -212,9 +212,9 @@ while run:
             continue
 
         try:
-            apis = sidraCore.sidraApiList()
+            apis = akiraCore.sidraApiList()
             if not apis:
-                sidraCore.log("xmit: no sidraApi configured", True)
+                akiraCore.log("xmit: no sidraApi configured", True)
                 time.sleep(1)
                 continue
 
@@ -233,7 +233,7 @@ while run:
 
                 if DEBUG:
                     print(api)
-                xmitResp = sidraCore.xmitEvent(api, data)
+                xmitResp = akiraCore.xmitEvent(api, data)
                 if xmitResp:
                     okTargets.append(api)
                     deliveredTargets.add(api)
@@ -259,7 +259,7 @@ while run:
                         + " targets: "
                         + str(len(okTargets) + len(skippedTargets))
                     )
-                sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+                akiraCore.deleteFile(akiraCore.XMIT_DIR + "/" + file)
                 deleteXmitState(file)
             else:
                 msg = (
@@ -276,10 +276,10 @@ while run:
                 )
                 if DEBUG:
                     print(msg)
-                sidraCore.log((msg))
+                akiraCore.log((msg))
                 time.sleep(0.5)
         except Exception as ex:
-            sidraCore.log("xmit: error: " + str(ex), True)
+            akiraCore.log("xmit: error: " + str(ex), True)
 
     if DEBUG:
         if fileCount > 0:

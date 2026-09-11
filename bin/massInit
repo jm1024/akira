@@ -3,11 +3,11 @@ import subprocess
 import sys
 from datetime import datetime
 
-import sidraCore
+import akiraCore
 
-print(sidraCore.massSensors)
+print(akiraCore.massSensors)
 
-for mass in sidraCore.massSensors:
-    cmd = sidraCore.BIN_DIR + "/mass"
+for mass in akiraCore.massSensors:
+    cmd = akiraCore.BIN_DIR + "/mass"
     subprocess.Popen([cmd, mass['name']])
 

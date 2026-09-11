@@ -5,7 +5,7 @@ import json
 import sys
 from datetime import datetime
 
-import sidraCore
+import akiraCore
 
 import importlib
 
@@ -14,7 +14,7 @@ import importlib
 
 #dynamically load all read drivers
 readDrivers = {}
-for driver in sidraCore.driversRead:
+for driver in akiraCore.driversRead:
     readDrivers[driver] = importlib.import_module(driver)
     print("Loaded read driver: " + driver)
 
@@ -109,7 +109,7 @@ def parseEvent(event):
         for val in vals:
             d = val.split('=')
             if d[0] == "first":
-                #dt = sidraCore.rfStrToDt(d[1].strip(','))
+                #dt = akiraCore.rfStrToDt(d[1].strip(','))
                 date = d[1].strip(',')
             if d[0] == "tag_id":
                 epc = d[1][2:]
@@ -313,13 +313,13 @@ def parseEvent(event):
             if userData == "":
                 userData = arrivals[epc].get('userData')
             #print(arrivals)
-            arrivals = sidraCore.removeDictKey(arrivals, epc)
+            arrivals = akiraCore.removeDictKey(arrivals, epc)
             #print(arrivals)
         else:
             print("NO ARRIVAL DATA")
             if DEBUG_ARRIVAL_MATCH:
                 print("NO ARRIVAL DATA")
-            sidraCore.log("NO ARRIVAL DATA: " + str(epc))
+            akiraCore.log("NO ARRIVAL DATA: " + str(epc))
             
 
         #print(epc)
@@ -340,11 +340,11 @@ def parseEvent(event):
 def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userData, tidAuthentic, pwAuthentic):
 
     # get plate and class from userData
-    tagPlate, tagClass = sidraCore.decodeUserData(userData)
+    tagPlate, tagClass = akiraCore.decodeUserData(userData)
 
     trnId = str(uuid.uuid4())
 
-    trn = sidraCore.trnPrefix() + trnId
+    trn = akiraCore.trnPrefix() + trnId
     tDate = str(date) #datetime.now()
     #print(" ------>DT " + str(dt))
     #print("RSSI trans: " + str(rssi))
@@ -378,7 +378,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    driver.read(tData)
     #driverRts.read(tData)
     
-    tDate = sidraCore.rfStrToDt(tDate)
+    tDate = akiraCore.rfStrToDt(tDate)
     #sAuth = "n"
     #if pwAuthentic == "AUTHENTIC":
     #    sAuth = "y"
@@ -404,7 +404,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    if hasattr(driverModule, "read"):
     #        driverModule.read(tData)
     
-    sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
+    akiraCore.saveTransaction(trn + akiraCore.TRN_EXTENSION_READER, json.dumps(tData, default=akiraCore.jsonConverter))
 
 
 
@@ -420,7 +420,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #output = output + " tagP: " + str(tagPlate)
     #output = output + " date: " + str(dt)
 
-    sidraCore.log(output)
+    akiraCore.log(output)
     
 
 
@@ -431,9 +431,9 @@ CONFIGURE = True
 
 readerName = sys.argv[1]
 
-sidraCore.log("Reader " + readerName + " Starting")
+akiraCore.log("Reader " + readerName + " Starting")
 
-for reader in sidraCore.readers:
+for reader in akiraCore.readers:
     #print(reader['name'])
     if reader['name'] == readerName:
         readerIp = reader['ip']

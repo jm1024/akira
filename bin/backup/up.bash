@@ -1,7 +1,7 @@
 #!/bin/bash
-/var/sidra/bin/cam &
-/var/sidra/bin/readerInit &
-/var/sidra/bin/massInit &
-/var/sidra/bin/lidar &
-/var/sidra/bin/mcp &
-/var/sidra/bin/xmit &
+/var/akira/bin/cam &
+/var/akira/bin/readerInit &
+/var/akira/bin/massInit &
+/var/akira/bin/lidar &
+/var/akira/bin/mcp &
+/var/akira/bin/xmit &

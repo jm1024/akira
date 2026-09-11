@@ -1,9 +1,11 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
 STATE=$1
-RELAY_IP="10.3.1.80"
-STATE_FILE="/var/sidra/tmp/readerSwitch"
-FLAG_FILE="/var/sidra/tmp/restart"
+RELAY_IP="10.3.2.163"
+STATE_FILE="$AKIRA_ROOT/tmp/readerSwitch"
+FLAG_FILE="$AKIRA_ROOT/tmp/restart"
 
 if [ -z "$STATE" ]; then
     echo "ERROR: Missing arguments. Usage: $0 <state>"
@@ -12,7 +14,7 @@ fi
 
 echo "Switching reader relay at $RELAY_IP to $STATE..."
 
-/var/sidra/bin/readerSwitch "$RELAY_IP" "$STATE"
+"$SCRIPT_DIR/readerSwitch" "$RELAY_IP" "$STATE"
 SWITCH_STATUS=$?
 
 if [ $SWITCH_STATUS -ne 0 ]; then

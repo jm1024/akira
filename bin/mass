@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import telnetlib
 import time
 import argparse
 import sys
@@ -9,7 +8,9 @@ import signal
 import traceback
 from datetime import datetime, timedelta
 
-import sidraCore
+import akiraCore
+import massSensor
+from numatoTelnet import NumatoConnection
 
 PORT = 23
 
@@ -18,9 +19,6 @@ PASSWORD = "admin"
 
 WINDOW_FAST_PRE = -1
 WINDOW_FAST_POST = 1 #.5 # set to 1?
-UNLOCK_LOCKOUT = 1.5
-
-DELAY_FAST = 0.1
 
 DEBUG = False
 DEBUG_STATE = True
@@ -28,8 +26,7 @@ DEBUG_STATE = True
 name = ""
 lane = ""
 ip = ""
-pinTrip = ""
-pinMain = ""
+massConfig = {}
 state = {}
 
 locked = False
@@ -51,31 +48,6 @@ tnConn = None
 
 
 #############################
-def massRules(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime):
-
-    delay = 0
-    
-    #give the read time to finish
-    if tripState == 1 and mainState == 0:
-        print("sleeping fast " + str(DELAY_FAST))
-        time.sleep(DELAY_FAST)
-        
-    if tripState == 1 and lastTripState == 0 and previousTripState == 1:
-        diffMs = int((previousTime - stateTime).total_seconds() * 1000)
-        print("tailgate threshold: " + str(diffMs))
-    
-    return delay
-
-#############################
-def getStates(current):
-    
-    #print(current)
-    trip = current[pinTrip]
-    main = current[pinMain]
-    
-    return trip, main
-    
-#############################
 def monitorNotifications(tn):
     
     global state
@@ -90,10 +62,10 @@ def monitorNotifications(tn):
     try:
         while True:
             # read one line-ish at a time
-            data = tn.read_until(b"\n", timeout=1)
+            data = tn.readline(timeout=1)
             if not data:
                 continue
-            text = data.decode(errors="ignore").strip()
+            text = data.strip()
             if not text:
                 continue
             
@@ -102,6 +74,8 @@ def monitorNotifications(tn):
             #lastState = state
             #lastTime = stateTime
             state = parseGpio(text)
+            if state is None:
+                continue
             
             #massRules(tripState, mainState, stateTime, lastTripState, lastMainState, lastTime, previousTripState, previousMainState, previousTime)
             updateMass(state)
@@ -114,25 +88,21 @@ def monitorNotifications(tn):
 
 #############################
 def readUntil(tn, marker, timeout=.5):
-    """Read until marker bytes are seen or timeout expires."""
+    """Read until a text marker is seen or timeout expires."""
     if DEBUG:
         print(f"readUntil({marker!r})")
-    data = tn.read_until(marker.encode("ascii"), timeout)
+    data = tn.read_until(marker, timeout=timeout)
     if DEBUG and data:
-        try:
-            print("<<", data.decode(errors="ignore"))
-        except Exception:
-            print("<<", data)
+        print("<<", data)
     return data
 
 
 #############################
 def sendLine(tn, line):
     """Send a line terminated with CRLF."""
-    msg = (line + "\r\n").encode("ascii")
     if DEBUG:
-        print(">>", msg)
-    tn.write(msg)
+        print(">>", line)
+    tn.write_line(line)
 
 
 #############################
@@ -151,8 +121,7 @@ def login(tn):
 
     # Read a little bit of what comes next
     time.sleep(0.2)
-    data = tn.read_very_eager()
-    text = data.decode(errors="ignore") if data else ""
+    text = tn.read_available(timeout=0.2)
 
     if DEBUG and text:
         print("LOGIN RESPONSE RAW:\n", text)
@@ -177,95 +146,38 @@ def setAllInputsAndNotify(tn):
 
     # iomask: affect all 16 bits
     sendLine(tn, "gpio iomask ffff")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
     # iodir: 1 = input, so ffff = all inputs
     sendLine(tn, "gpio iodir ffff")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
     # initial read
     sendLine(tn, "gpio readall")
-    time.sleep(0.1)
-    resp = tn.read_very_eager()
+    resp = tn.read_available(timeout=0.2)
 
     if resp:
-        text = resp.decode(errors="ignore").strip()
+        text = resp.strip()
         if DEBUG:
             print("READALL:\n", text)
 
         parsed = parseGpio(text)
         if parsed is not None:
             state = parsed
-            #updateMass(parsed)
+            updateMass(parsed)
             if DEBUG:
                 print(state)
 
     # enable notifications
     sendLine(tn, "gpio notify on")
-    time.sleep(0.1)
-    tn.read_very_eager()
+    tn.read_available(timeout=0.2)
 
 #############################
 def parseGpio(text):
-    text = text.strip()
-    if not text:
-        return None
-
-    #if DEBUG:
-    #    print(text)
-
-    parts = text.split()
-    if not parts:
-        return None
-
-    hexChars = "0123456789ABCDEFabcdef"
-    hexVal = None
-
-    # Case 1: notification line like '# FEFF FEFE FFFF'
-    # You believe the first hex after '#' is the current state,
-    # so use parts[1].
-    if parts[0] == "#" and len(parts) >= 2:
-        candidate = "".join(c for c in parts[1] if c in hexChars)
-        if candidate:
-            hexVal = candidate
-
-    # Case 2: readall or anything else: first token that has any hex in it
-    if hexVal is None:
-        for p in parts:
-            candidate = "".join(c for c in p if c in hexChars)
-            if candidate:
-                hexVal = candidate
-                break
-
-    if hexVal is None:
-        if DEBUG:
-            print("parseGpio: no hex found in:", repr(text))
-        return None
-
-    try:
-        value = int(hexVal, 16)
-    except ValueError:
-        if DEBUG:
-            print("parseGpio: bad hex:", hexVal)
-        return None
-
-    # 16-bit, LSB = io100
-    bits = f"{value:016b}"[::-1]
-
-    result = {}
-    for i in range(16):
-        pin = i + 100
-        result[f"{pin}"] = int(bits[i])
-
-    #updateMass(result)
-
-    return result
+    return massSensor.parseGpio(text)
         
 #############################
 def updateMass(current):
-    
     global locked
     global lastLock
     global lastLockState
@@ -273,18 +185,25 @@ def updateMass(current):
     global lastEnd
     global lastTripState
     global lastMassState
-    
-    tripState = -1
-    massState = -1
 
-    current["date"] = datetime.now()
-    tripState, massState = getStates(current)
-    lastLockState = sidraCore.massLock(name)
-    
-    
+    logicalState = massSensor.logicalState(current, massConfig)
+    massEvent = {
+        "name": name,
+        "lane": lane,
+        "date": datetime.now(),
+        **logicalState,
+    }
+    tripState = logicalState["fast"]
+    massState = logicalState["mid"]
+    slowState = logicalState["slow"]
+    try:
+        lastLockState = akiraCore.massLock(name)
+    except Exception:
+        lastLockState = {"locked": False, "begin": "", "end": "", "count": 0}
+
     #if DEBUG_STATE:
-    #    print(str(current['date']) + " trip: " + str(tripState) + "  mass: " + str(massState))
-        
+    #    print(str(massEvent['date']) + " fast: " + str(tripState) + " mid: " + str(massState))
+
     newLock = {}
     newLock['locked'] = "ERR"
     newLock['begin'] = ""
@@ -297,22 +216,19 @@ def updateMass(current):
         
     lastTripState = tripState
     lastMassState = massState
-    
+
     unlockLockout = False
     updateLock = False
     if not locked:
-        #not locked, should it be?
-        if tripState == 1 or massState == 1:
+        if logicalState["occupied"]:
             locked = True
             lastLock = datetime.now()
             updateLock = True
     else:
-        if tripState == 0 and massState == 0:
-            #check for lockout
-            
-            unlockAt = lastLock + timedelta(seconds=UNLOCK_LOCKOUT)
-            #print("cur: " + str(current['date']) + " ua: " + str(unlockAt))
-            if current['date'] < unlockAt:
+        if not logicalState["occupied"]:
+            clearDelaySeconds = massConfig["clearDebounceMs"] / 1000.0
+            unlockAt = lastLock + timedelta(seconds=clearDelaySeconds)
+            if massEvent['date'] < unlockAt:
                 unlockLockout = True
                 print("LOCKED too recently - not unlocking")
             else:
@@ -324,21 +240,23 @@ def updateMass(current):
     if not unlockLockout:
         newLock['locked'] = locked
         
-        #if this was a lock triggered by trip set the window
+        # If this was a lock triggered by fast, set the legacy lock window.
         if locked == True and tripState == 1:
             updateLock = True
-            #if mass state has been hit too preserve the last begin and end
-            if massState == 1:
+            if massState == 1 or slowState == 1:
                 newLock['begin'] = lastLockState['begin'] #lastBegin
                 newLock['end'] = lastLockState['end'] #lastEnd
             else:
-                newLock['begin'] = current['date'] + timedelta(seconds=WINDOW_FAST_PRE)
-                newLock['end'] = current['date'] + timedelta(seconds=WINDOW_FAST_POST)
+                newLock['begin'] = massEvent['date'] + timedelta(seconds=WINDOW_FAST_PRE)
+                newLock['end'] = massEvent['date'] + timedelta(seconds=WINDOW_FAST_POST)
                 lastBegin = newLock['begin']
                 lastEnd = newLock['end']
-                
+
         #see if the lane is already locked by something else - dont set window
-        fileMass = sidraCore.massLock(name)
+        try:
+            fileMass = akiraCore.massLock(name)
+        except Exception:
+            fileMass = lastLockState
         if  fileMass['locked']:
             print("override lock set") 
             newLock['end'] = ""
@@ -346,18 +264,22 @@ def updateMass(current):
             #updateLock = False
 
     if updateLock:
-        sidraCore.massLockSet(name, newLock)
-        debugMsg = "updateMass " + str(datetime.now()) + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
-        debugMsg = "updateMass " + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
-                
+        akiraCore.massLockSet(name, newLock)
+        debugMsg = (
+            "updateMass "
+            + " c: " + str(newLock['count'])
+            + " f: " + str(tripState)
+            + " m: " + str(massState)
+            + " s: " + str(slowState)
+            + " locked: " + str(newLock['locked'])
+        )
+
         if not newLock['end'] == "" and locked == True:
             debugMsg = debugMsg + " window:" + str(newLock['end'])
         print(debugMsg)
-        
-        
-    output = json.dumps(current, default=sidraCore.jsonConverter)
-    fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
-    sidraCore.writeFile(fileName, output)
+    output = json.dumps(massEvent, default=akiraCore.jsonConverter)
+    fileName = akiraCore.MASS_DIR + "/" + str(lane) + akiraCore.STATE_EXTENSION_MASS
+    akiraCore.writeFile(fileName, output)
 
 #############################
 def handleSignal(signum, frame):
@@ -403,7 +325,7 @@ if __name__ == "__main__":
 
     name = args.name
 
-    for mass in sidraCore.massSensors:
+    for mass in akiraCore.massSensors:
         #print(name)
         #print(mass["name"])
         #print(mass["ip"])
@@ -412,11 +334,13 @@ if __name__ == "__main__":
             name = mass["name"]
             lane = mass["lane"]
             ip = mass["ip"]
-            pinTrip = mass['trip']
-            pinMain = mass['main']
-            #print("PT:" + str(pinTrip))
+            massConfig = massSensor.normalizeConfig(mass)
             #if DEBUG:
             #    print(mass)
+
+    if not massConfig:
+        print(f"Unknown mass sensor: {name}", file=sys.stderr)
+        raise SystemExit(2)
 
     if DEBUG:
         print(f"Connecting to Numato GPIO @ {ip}:23")
@@ -424,7 +348,7 @@ if __name__ == "__main__":
     tnConn = None
 
     try:
-        tnConn = telnetlib.Telnet(ip, PORT, timeout=5)
+        tnConn = NumatoConnection(ip, PORT, timeout=5)
 
         # explicitly own both SIGINT (^C) and SIGHUP
         signal.signal(signal.SIGINT, handleSignal)

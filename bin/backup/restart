@@ -1,3 +1,3 @@
 #!/bin/bash
-/var/sidra/bin/down
-/var/sidra/bin/up
+/var/akira/bin/down
+/var/akira/bin/up

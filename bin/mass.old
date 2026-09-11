@@ -7,7 +7,7 @@ import os
 import json
 import signal
 
-import sidraCore
+import akiraCore
 
 PORT = 23
 
@@ -199,8 +199,8 @@ def parseGpio(text):
 def updateMass(current):
 
     output = json.dumps(current)
-    fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
-    sidraCore.writeFile(fileName, output)
+    fileName = akiraCore.MASS_DIR + "/" + name + akiraCore.STATE_EXTENSION_MASS
+    akiraCore.writeFile(fileName, output)
 
 #############################
 def handleSignal(signum, frame):
@@ -246,7 +246,7 @@ if __name__ == "__main__":
 
     name = args.name
 
-    for mass in sidraCore.massSensors:
+    for mass in akiraCore.massSensors:
         #print(name)
         #print(mass["name"])
         #print(mass["ip"])

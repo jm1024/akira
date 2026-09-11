@@ -7,7 +7,7 @@ import psutil
 import json
 import uuid
 
-import sidraCore
+import akiraCore
 import monCore
 
 INTERVAL = 5
@@ -16,14 +16,14 @@ INTERVAL = 5
 
 while True:
 
-    data = monCore.getAll(sidraCore.ipList)
+    data = monCore.getAll(akiraCore.ipList)
 
-    sidraCore.writeFile(monCore.MON_FILE, json.dumps(data, indent=2))
+    akiraCore.writeFile(monCore.MON_FILE, json.dumps(data, indent=2))
 
     data['id'] = str(uuid.uuid4())
-    data['plaza'] = sidraCore.plazaId
+    data['plaza'] = akiraCore.plazaId
     data['op'] = "addMon"
-    sidraCore.queueXmit(json.dumps(data, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_MON)
+    akiraCore.queueXmit(json.dumps(data, default=akiraCore.jsonConverter), akiraCore.QUEUE_EXTENSION_MON)
 
     monCore.clear()
 

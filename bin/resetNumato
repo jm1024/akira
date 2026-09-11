@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Inventory, check, or remotely reset Numato boards in akira.cfg.
+
+The boards do not expose a true software-controlled power cycle. Their web UI
+does provide a firmware reset by resubmitting the board's current network
+settings. This utility uses that reset path and never sends the Telnet
+``reboot`` command, which can enter configuration mode on some Numato firmware.
+"""
+
+import argparse
+import base64
+import http.client
+from html.parser import HTMLParser
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from urllib.parse import urlencode
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = ROOT / "etc" / "akira.cfg"
+READER_PATTERN = f"{ROOT}/bin/reader "
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = "admin"
+
+
+class SettingsParser(HTMLParser):
+    """Extract the current host, DHCP, and IP fields from Numato settings."""
+
+    def __init__(self):
+        super().__init__()
+        self.inputs = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "input":
+            return
+        values = {str(key).lower(): value for key, value in attrs}
+        name = values.get("name")
+        if name:
+            self.inputs[name.lower()] = values
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Find Numato boards in akira.cfg and reset them safely.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="read each board's web settings without changing anything",
+    )
+    mode.add_argument(
+        "--execute",
+        action="store_true",
+        help="gracefully stop the reader, reset reachable boards, and restart it",
+    )
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--name",
+        action="append",
+        default=[],
+        help="limit operation to this configured board name; may be repeated",
+    )
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--recovery-seconds",
+        type=float,
+        default=10.0,
+        help="delay after reset requests before web verification and reader restart",
+    )
+    parser.add_argument(
+        "--verify-seconds",
+        type=float,
+        default=60.0,
+        help="wait for fresh GPIO mass payloads after restarting the reader",
+    )
+    return parser.parse_args()
+
+
+def duplicate_key_hook(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def load_config(path):
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle, object_pairs_hook=duplicate_key_hook)
+
+
+def find_boards(value, location="root"):
+    """Return config objects explicitly tagged with a numato mapping."""
+    found = []
+    if isinstance(value, dict):
+        metadata = value.get("numato")
+        if isinstance(metadata, dict):
+            name = str(value.get("name", "")).strip()
+            address = str(value.get("ip", value.get("address", ""))).strip()
+            board_type = str(metadata.get("type", "unknown")).strip().lower()
+            if not name or not address:
+                raise ValueError(f"{location} Numato entry requires name and ip/address")
+            found.append(
+                {
+                    "name": name,
+                    "address": address,
+                    "type": board_type,
+                    "port": int(metadata.get("webPort", 80)),
+                    "lane": str(value.get("lane", "")).strip(),
+                    "location": location,
+                }
+            )
+        for key, child in value.items():
+            found.extend(find_boards(child, f"{location}.{key}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(find_boards(child, f"{location}[{index}]"))
+    return found
+
+
+def unique_boards(config):
+    boards = []
+    seen_names = {}
+    seen_endpoints = {}
+    for board in find_boards(config):
+        endpoint = (board["address"], board["port"])
+        if board["name"] in seen_names:
+            raise ValueError(f"duplicate Numato board name {board['name']!r}")
+        if endpoint in seen_endpoints:
+            raise ValueError(
+                f"Numato boards {seen_endpoints[endpoint]!r} and {board['name']!r} "
+                f"share endpoint {endpoint[0]}:{endpoint[1]}"
+            )
+        seen_names[board["name"]] = endpoint
+        seen_endpoints[endpoint] = board["name"]
+        boards.append(board)
+    return boards
+
+
+def auth_header():
+    username = os.environ.get("NUMATO_USERNAME", DEFAULT_USERNAME)
+    password = os.environ.get("NUMATO_PASSWORD", DEFAULT_PASSWORD)
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def request(board, method, path, timeout, body=None):
+    connection = http.client.HTTPConnection(
+        board["address"], board["port"], timeout=timeout
+    )
+    headers = {
+        "Authorization": auth_header(),
+        "Connection": "close",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        headers["Content-Length"] = str(len(body))
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        payload = response.read()
+        return response.status, payload
+    finally:
+        connection.close()
+
+
+def read_settings(board, timeout):
+    status, payload = request(board, "GET", "/settings.htm", timeout)
+    if status != 200:
+        raise RuntimeError(f"HTTP {status} reading settings")
+    text = payload.decode("utf-8", errors="replace")
+    if "Numato" not in text:
+        raise RuntimeError("settings page is not identified as a Numato device")
+
+    parser = SettingsParser()
+    parser.feed(text)
+    host = (parser.inputs.get("host") or {}).get("value", "").strip()
+    ip = (parser.inputs.get("ip") or {}).get("value", "").strip()
+    dhcp_input = parser.inputs.get("dhcp")
+    if not host or not ip or dhcp_input is None:
+        raise RuntimeError("Numato settings page lacks host, DHCP, or IP fields")
+    return {
+        "host": host,
+        "ip": ip,
+        "dhcp": "checked" in dhcp_input,
+    }
+
+
+def reset_board(board, settings, timeout):
+    fields = {"host": settings["host"]}
+    if settings["dhcp"]:
+        fields["dhcp"] = "1"
+    else:
+        fields["ip"] = settings["ip"]
+    body = urlencode(fields).encode("ascii")
+    status, _ = request(board, "POST", "/settings.htm", timeout, body=body)
+    if status not in (200, 302, 303):
+        raise RuntimeError(f"HTTP {status} submitting unchanged network settings")
+
+
+def reader_pids():
+    result = subprocess.run(
+        ["pgrep", "-f", READER_PATTERN],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return [int(line) for line in result.stdout.splitlines() if line.strip().isdigit()]
+
+
+def stop_readers():
+    pids = reader_pids()
+    if not pids:
+        return False
+    if os.geteuid() != 0:
+        raise PermissionError("a reader is running; rerun with sudo for --execute")
+
+    print("Stopping reader gracefully:", ", ".join(map(str, pids)))
+    for pid in pids:
+        os.kill(pid, signal.SIGINT)
+
+    deadline = time.monotonic() + 3.0
+    while reader_pids() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    remaining = reader_pids()
+    if remaining:
+        print("Reader did not stop within 3 seconds; sending SIGTERM", file=sys.stderr)
+        for pid in remaining:
+            os.kill(pid, signal.SIGTERM)
+        time.sleep(1.0)
+    if reader_pids():
+        raise RuntimeError("old reader is still running; refusing to continue")
+    return True
+
+
+def start_readers():
+    print("Starting configured readers")
+    result = subprocess.run([str(ROOT / "bin" / "readerInit")], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"readerInit failed with status {result.returncode}")
+
+
+def verify_mass_payloads(boards, newer_than, timeout):
+    """Require a fresh state file from every selected GPIO board with a lane."""
+    gpio_boards = [
+        board for board, _ in boards if board["type"] == "gpio" and board["lane"]
+    ]
+    if not gpio_boards:
+        return []
+
+    pending = {board["name"]: board for board in gpio_boards}
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for name, board in list(pending.items()):
+            state_file = ROOT / "mass" / f"{board['lane']}.ms"
+            try:
+                fresh = state_file.stat().st_mtime > newer_than
+            except OSError:
+                fresh = False
+            if fresh:
+                print(
+                    f"COMMAND RECOVERED {name} {board['address']} "
+                    f"payload={state_file}"
+                )
+                pending.pop(name)
+        if pending:
+            time.sleep(0.5)
+
+    return [
+        (board, f"no fresh mass/{board['lane']}.ms payload within {timeout:g} seconds")
+        for board in pending.values()
+    ]
+
+
+def describe(board, settings=None):
+    base = f"{board['name']} ({board['type']}) {board['address']}:{board['port']}"
+    if settings is None:
+        return base
+    mode = "DHCP" if settings["dhcp"] else "static"
+    return f"{base} host={settings['host']} network={mode} configured_ip={settings['ip']}"
+
+
+def main():
+    args = parse_args()
+    if args.timeout <= 0 or args.recovery_seconds < 0 or args.verify_seconds < 0:
+        print("ERROR: timeouts must be positive/non-negative", file=sys.stderr)
+        return 2
+
+    try:
+        boards = unique_boards(load_config(args.config))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as ex:
+        print(f"ERROR: cannot load Numato inventory: {ex}", file=sys.stderr)
+        return 2
+
+    if args.name:
+        selected = set(args.name)
+        known = {board["name"] for board in boards}
+        unknown = sorted(selected - known)
+        if unknown:
+            print("ERROR: unknown Numato name(s): " + ", ".join(unknown), file=sys.stderr)
+            return 2
+        boards = [board for board in boards if board["name"] in selected]
+    if not boards:
+        print("ERROR: no Numato boards are tagged in the config", file=sys.stderr)
+        return 2
+
+    print(f"Found {len(boards)} Numato board(s) in {args.config}:")
+    for board in boards:
+        print(" -", describe(board))
+    if not args.check and not args.execute:
+        print("Inventory only. Use --check for read-only validation or --execute to reset.")
+        return 0
+
+    reachable = []
+    failures = []
+    for board in boards:
+        try:
+            settings = read_settings(board, args.timeout)
+            reachable.append((board, settings))
+            print("READY", describe(board, settings))
+        except Exception as ex:
+            failures.append((board, str(ex)))
+            print(f"UNREACHABLE {board['name']} {board['address']}: {ex}", file=sys.stderr)
+
+    if args.check:
+        return 1 if failures else 0
+    if not reachable:
+        print("ERROR: no reachable Numato boards to reset", file=sys.stderr)
+        return 1
+
+    reader_was_running = False
+    reader_restarted = False
+    reset_failures = list(failures)
+    reset_started_at = time.time()
+    operation_error = None
+    try:
+        reader_was_running = stop_readers()
+        for board, settings in reachable:
+            try:
+                reset_board(board, settings, args.timeout)
+                print(f"RESET REQUESTED {board['name']} {board['address']}")
+            except Exception as ex:
+                reset_failures.append((board, str(ex)))
+                print(f"RESET FAILED {board['name']} {board['address']}: {ex}", file=sys.stderr)
+
+        if args.recovery_seconds:
+            print(f"Waiting {args.recovery_seconds:g} seconds for board recovery")
+            time.sleep(args.recovery_seconds)
+
+        for board, _ in reachable:
+            try:
+                settings = read_settings(board, args.timeout)
+                print("WEB RECOVERED", describe(board, settings))
+            except Exception as ex:
+                if not any(item[0]["name"] == board["name"] for item in reset_failures):
+                    reset_failures.append((board, f"recovery check: {ex}"))
+                print(f"NOT RECOVERED {board['name']} {board['address']}: {ex}", file=sys.stderr)
+    except Exception as ex:
+        print(f"ERROR: {ex}", file=sys.stderr)
+        operation_error = ex
+    finally:
+        if reader_was_running:
+            try:
+                start_readers()
+                reader_restarted = True
+            except Exception as ex:
+                print(f"ERROR: could not restart reader: {ex}", file=sys.stderr)
+                reset_failures.append(({"name": "reader"}, str(ex)))
+
+    gpio_reachable = [
+        (board, settings)
+        for board, settings in reachable
+        if board["type"] == "gpio" and board["lane"]
+    ]
+    if reader_restarted:
+        reset_failures.extend(
+            verify_mass_payloads(gpio_reachable, reset_started_at, args.verify_seconds)
+        )
+    elif gpio_reachable:
+        for board, _ in gpio_reachable:
+            reset_failures.append(
+                (board, "reader was not running; port-23 command service was not verified")
+            )
+        print(
+            "WARNING: GPIO web recovery is not command-service recovery; "
+            "start the reader and verify a fresh mass payload.",
+            file=sys.stderr,
+        )
+
+    if operation_error is not None:
+        return 1
+
+    if reset_failures:
+        print("Completed with failures:", file=sys.stderr)
+        for board, error in reset_failures:
+            print(f" - {board['name']}: {error}", file=sys.stderr)
+        return 1
+    print("All selected Numato boards accepted reset and passed recovery checks.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

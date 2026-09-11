@@ -3,9 +3,9 @@ from datetime import datetime
 import uuid
 import json
 
-import sidraCore
+import akiraCore
 
-DATA_DIR = "/var/sidra/drv"
+DATA_DIR = "/var/akira/drv"
 
 ENABLE_FILE = "akiraEnabled.rts"
 
@@ -21,14 +21,14 @@ DEBUG_XMIT = True
 
 #############################
 def setEnable(state = True):
-	sidraCore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
+	akiraCore.writeFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
 	
 #############################
 def getEnable():
 
 	ret = True
 	try:
-		result = sidraCore.readFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE)
+		result = akiraCore.readFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE)
 		if result == "False":
 			ret = False
 	except Exception as ex:
@@ -50,7 +50,7 @@ def read(data):
 	# get sensor name for this lane
 	thisLane = data['lane']
 	thisDtS = data['date']
-	thisDt = sidraCore.rfStrToDt(thisDtS)
+	thisDt = akiraCore.rfStrToDt(thisDtS)
 	thisTID = data['tid']
 	shortTID = thisTID[-5:]
 	shortTime = thisDt.time()
@@ -60,7 +60,7 @@ def read(data):
 	debugInfo = str(shortTID) + " " + str(thisRSSI) + " " + str(shortTime)
 	
 	#print("LANE:" + str(thisLane))
-	for mass in sidraCore.massSensors:
+	for mass in akiraCore.massSensors:
 		if mass['lane'] == thisLane:
 			massName = mass['name']
 	
@@ -70,8 +70,8 @@ def read(data):
 		
 	#print("READS:" + str(data['reads']))
 	
-	#state = sidraCore.getMass(massName)
-	lockState = sidraCore.massLock(massName)
+	#state = akiraCore.getMass(massName)
+	lockState = akiraCore.massLock(massName)
 	if DEBUG:
 		print("driverRTS lock: " + str(lockState['locked']) + " end: " + str(lockState['end']))
 	
@@ -89,7 +89,7 @@ def read(data):
 			#lock the lane
 			# lockState['end'] = ""
 			# lockState['begin'] = ""
-			# sidraCore.massLockSet(massName, lockState)
+			# akiraCore.massLockSet(massName, lockState)
 			
 			if DEBUG_XMIT:
 				xmitDebug = "driverRTS: FAST unl SND " + debugInfo
@@ -102,7 +102,7 @@ def read(data):
 					lockState['lockked'] = True
 					lockState['end'] = ""
 					lockState['begin'] = ""
-					sidraCore.massLockSet(massName, lockState)
+					akiraCore.massLockSet(massName, lockState)
 					xmit = True
 				else:
 					xmit = False
@@ -125,11 +125,11 @@ def read(data):
 	
 	if DEBUG_XMIT:
 		print(xmitDebug)
-		sidraCore.appendFile("/var/sidra/log/rtsDebug.log", xmitDebug + "\n")
+		akiraCore.appendFile("/var/akira/log/rtsDebug.log", xmitDebug + "\n")
 	
 	#dt = datetime.now().isoformat()
 	thisDtS = data['date']
-	thisDt = sidraCore.rfStrToDt(thisDtS)
+	thisDt = akiraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
 	
 	authentic = data['tidAuthentic']
@@ -150,7 +150,7 @@ def read(data):
 		"body": {
 			"TxID": data['id'],
 			"TagID": data['tid'],
-			"PlazaID": sidraCore.plazaId,
+			"PlazaID": akiraCore.plazaId,
 			"LaneID": data['lane'],
 			"DetectedTime": dt,
 			"Antenna": side,
@@ -160,7 +160,7 @@ def read(data):
 		
 
 	if xmit:	
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+		akiraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
 		if DEBUG:
 			print("driverRTS sent: " + str(datetime.now()))
 	"""
@@ -216,7 +216,7 @@ def trans(data):
 			}
 	
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=akiraCore.jsonConverter))
 	
 	msg = ""
 	xmit = True
@@ -240,7 +240,7 @@ def trans(data):
 		}
 	
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=akiraCore.jsonConverter))
 	
 	"""
 	{

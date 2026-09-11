@@ -3,11 +3,11 @@ import subprocess
 import sys
 from datetime import datetime
 
-import sidraCore
+import akiraCore
 
-#print(sidraCore.readers)
+#print(akiraCore.readers)
 
-for reader in sidraCore.readers:
-    cmd = sidraCore.BIN_DIR + "/reader"
+for reader in akiraCore.readers:
+    cmd = akiraCore.BIN_DIR + "/reader"
     subprocess.Popen([cmd, reader['name']])
 

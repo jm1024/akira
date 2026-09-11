@@ -2,7 +2,7 @@
 import os
 import json
 import requests
-import sidraCore
+import akiraCore
 
 # Define file paths
 AKIRA_FILE = "akiraEnabled.rts"
@@ -10,12 +10,12 @@ AKIRA_FILE = "akiraEnabled.rts"
 #######################################
 def checkFile(file_path):
     try:
-        if sidraCore.readFile(file_path).strip() == "True":
+        if akiraCore.readFile(file_path).strip() == "True":
             return "True"
     except Exception as ex:
         msg = f"tmpCron checkFile() error: {ex}"
         print(msg)
-        sidraCore.log(msg)
+        akiraCore.log(msg)
         
     return "False"
 #######################################
@@ -35,13 +35,13 @@ def localXmitEvent(url, payload):
             op_name = json.loads(payload).get('op', 'Unknown')
             msg = f"ERROR xmit {url} {op_name} resp: {resp.status_code}"
             print(msg)
-            sidraCore.log(msg)
+            akiraCore.log(msg)
             return False
             
     except Exception as ex:
         msg = f"Error transmitting to API {url}: {ex}"
         print(msg)
-        sidraCore.log(msg)
+        akiraCore.log(msg)
         return False
 
 #######################################
@@ -49,7 +49,7 @@ def localXmitEvent(url, payload):
 def main():
     data = {}
     
-    akiraPath = os.path.join(sidraCore.TMP_DIR, AKIRA_FILE)
+    akiraPath = os.path.join(akiraCore.TMP_DIR, AKIRA_FILE)
     if os.path.exists(akiraPath):
         data['akiraEnabled'] = checkFile(akiraPath)
     
@@ -61,11 +61,11 @@ def main():
     payload = json.dumps(data)
     print(f"Transmitting data: {payload}")
     
-    apis = sidraCore.sidraApiList()
+    apis = akiraCore.sidraApiList()
     if not apis:
         msg = "xmit: no sidraApi configured"
         print(msg)
-        sidraCore.log(msg)
+        akiraCore.log(msg)
         return
         
     failedTargets = []
@@ -78,7 +78,7 @@ def main():
     if failedTargets:
         msg = f"Failed to transmit to these APIs: {failedTargets}"
         print(msg)
-        sidraCore.log(msg)
+        akiraCore.log(msg)
     else:
         print("Successfully updated all APIs.")
 

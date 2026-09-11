@@ -8,7 +8,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 
-import sidraCore
+import akiraCore
 import driverRts
 
 PORTS = [2060, 2061] # kill 2215
@@ -31,21 +31,21 @@ def logResponse(msg):
 
 	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
 
-	if not sidraCore.fileExist(responseFile):
+	if not akiraCore.fileExist(responseFile):
 		current = []
 	else:
-		current = json.loads(sidraCore.readFile(responseFile))
+		current = json.loads(akiraCore.readFile(responseFile))
 
 	current.append(msg)
 
-	sidraCore.writeFile(responseFile, json.dumps(current))
+	akiraCore.writeFile(responseFile, json.dumps(current))
 
 #############################
 def writeResponse(msg):
 
 	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + driverRts.EXT_RESPONSE
 	responseFile = driverRts.DATA_DIR + "/" + fileName
-	sidraCore.writeFile(responseFile, json.dumps(msg))
+	akiraCore.writeFile(responseFile, json.dumps(msg))
 
 #############################
 def sendAckAlive():
@@ -64,7 +64,7 @@ def sendAckAlive():
 		}
 	}
 
-	sidraCore.writeFile(responseFile, json.dumps(ack))
+	akiraCore.writeFile(responseFile, json.dumps(ack))
 
 #############################
 def sendAckInitialize():
@@ -83,7 +83,7 @@ def sendAckInitialize():
 		}
 	}
 
-	sidraCore.writeFile(responseFile, json.dumps(ack))
+	akiraCore.writeFile(responseFile, json.dumps(ack))
 
 #############################
 def sendAckAbort():
@@ -102,7 +102,7 @@ def sendAckAbort():
 		}
 	}
 
-	sidraCore.writeFile(responseFile, json.dumps(ack))
+	akiraCore.writeFile(responseFile, json.dumps(ack))
 
 
 #############################
@@ -115,7 +115,7 @@ def replaceTransId(fileName):
 	#print("serverRts.replaceTransId() - starting")
 
 	try:
-		contents = json.loads(sidraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
+		contents = json.loads(akiraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
 
 		#if it's an ANPR
 		if contents['header']['command'] == "ANPRInfo":
@@ -123,7 +123,7 @@ def replaceTransId(fileName):
 			newTransId = findTransId(contents['body']['TagID'])
 			contents['body']['AnprID'] = newTransId
 
-			sidraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
+			akiraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
 
 			if DEBUG:
 				c2 = contents
@@ -142,8 +142,8 @@ def findTransId(tid):
 
 	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
 
-	if sidraCore.fileExist(responseFile):
-		responses = json.loads(sidraCore.readFile(responseFile))
+	if akiraCore.fileExist(responseFile):
+		responses = json.loads(akiraCore.readFile(responseFile))
 	else:
 		print("serverRts.findTansId - no RTS response file")
 
@@ -169,10 +169,10 @@ def pruneResponses(maxAgeMinutes=10):
 	try:
 		responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
 
-		if not sidraCore.fileExist(responseFile):
+		if not akiraCore.fileExist(responseFile):
 			return True  # nothing to prune
 
-		raw = sidraCore.readFile(responseFile)
+		raw = akiraCore.readFile(responseFile)
 		if not raw:
 			return True  # empty file
 
@@ -206,7 +206,7 @@ def pruneResponses(maxAgeMinutes=10):
 				kept.append(msg)
 
 		if prunedCount:
-			sidraCore.writeFile(responseFile, json.dumps(kept))
+			akiraCore.writeFile(responseFile, json.dumps(kept))
 
 		log(f"pruneResponses(): pruned={prunedCount}, kept={len(kept)}")
 		return True
@@ -223,7 +223,7 @@ def broadcastFile(filePath, targetPorts=None):
 	"""
 
 	ret = True
-	data = sidraCore.readFile(filePath)
+	data = akiraCore.readFile(filePath)
 
 	if not data:
 		log(f"File {filePath} is empty, skipping broadcast")

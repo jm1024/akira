@@ -9,12 +9,12 @@ from datetime import date, datetime, timedelta
 import paramiko
 #from ftplib import FTP
 from ftplib import FTP, FTP_TLS, all_errors, error_perm
-import sidraCore
+import akiraCore
 
 #requires
 #apt install python3-paramiko
 
-errLog = "/var/sidra/log/lidarErrors.log"
+errLog = "/var/akira/log/lidarErrors.log"
 
 fileServer = "10.2.10.15"
 port = 2121
@@ -92,7 +92,7 @@ def ftpFile(host, username, password, remoteFile, localFile, port=21, timeout=10
 
                 except Exception as ex:
                     errString = "lidar.ftpFile error: " + str(ex) + " " + str(remoteFile)
-                    sidraCore.appendFile(errLog, errString)
+                    akiraCore.appendFile(errLog, errString)
                 finally:
                     # Try to send QUIT only if socket is still open
                     try:
@@ -129,12 +129,12 @@ def getPcd_X(data):
     #print(imgFile)
     #print(pcdFile)
 
-    localFile = sidraCore.TRN_TMP_DIR + "/" + data['id']
+    localFile = akiraCore.TRN_TMP_DIR + "/" + data['id']
 
     try:
         ftpFile(fileServer, login, password, pcdFile, localFile, port)
-        pcdData = sidraCore.readFile(localFile)
-        sidraCore.deleteFile(localFile)
+        pcdData = akiraCore.readFile(localFile)
+        akiraCore.deleteFile(localFile)
         fullData['pcd'] = pcdData
     except Exception as ex:
         print("lidar: missing file " + str(ex) + " " + pcdFile)
@@ -159,10 +159,10 @@ def getPcd(data):
         pcdFileName = (filePrefix + " " + pcdFileName).replace('_', '-', 2)
         pcdFile = pcdFilePath + pcdFileName
 
-        localFile = sidraCore.TRN_TMP_DIR + "/" + data['id']
+        localFile = akiraCore.TRN_TMP_DIR + "/" + data['id']
         ftpFile(fileServer, login, password, pcdFile, localFile, port)
-        pcdData = sidraCore.readFile(localFile)
-        sidraCore.deleteFile(localFile)
+        pcdData = akiraCore.readFile(localFile)
+        akiraCore.deleteFile(localFile)
         fullData['pcd'] = pcdData
         #print("gotPCD")
     except Exception as ex:
@@ -249,7 +249,7 @@ def convertData(data):
             thisInDt = datetime.strptime(thisInDtS, "%Y-%m-%d %H:%M.%S")
         except Exception as ex:
             print("lidar ERROR: convertData " + str(ex) + " " + str(data))
-            sidraCore.log("lidar ERROR: convertData " + str(ex) + " " + str(data))
+            akiraCore.log("lidar ERROR: convertData " + str(ex) + " " + str(data))
             return None
 
     thisOutDtS = data.get('OutTime', "")
@@ -267,7 +267,7 @@ def convertData(data):
                 except Exception as ex2:
                     msg = f"lidar ERROR: convertData outTime parse failed: {ex1}; {ex2}; data={data}"
                     print(msg)
-                    sidraCore.log(msg)
+                    akiraCore.log(msg)
                     return None
 
     # Numeric speed (abs of possibly-negative float/string)
@@ -301,8 +301,8 @@ def convertData(data):
     outData = {
         "id": data['id'],
         "date": str(inDate),
-        "type": sidraCore.EVENT_LIDAR,
-        "plaza": sidraCore.plazaId,
+        "type": akiraCore.EVENT_LIDAR,
+        "plaza": akiraCore.plazaId,
         "lane": data.get("InLane"),
         "class": sClass,
         "speed": thisSpeed,
@@ -352,8 +352,8 @@ def run_server(host='0.0.0.0', port=SERVER_PORT):
                   #"vjc:", vjClass)
 
         if SAVE_FILE:
-            fileName = sidraCore.trnPrefix() + thisId + sidraCore.TRN_EXTENSION_LIDAR
-            sidraCore.writeFile(sidraCore.TRN_DIR + "/" + fileName, json.dumps(cleanData))
+            fileName = akiraCore.trnPrefix() + thisId + akiraCore.TRN_EXTENSION_LIDAR
+            akiraCore.writeFile(akiraCore.TRN_DIR + "/" + fileName, json.dumps(cleanData))
 
     while run:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -436,14 +436,14 @@ def run_server(host='0.0.0.0', port=SERVER_PORT):
                                     handle_obj(item)
                                 except Exception as ex:
                                     msg = f"lidar handle_obj error: {ex}"
-                                    print(msg); sidraCore.log(msg)
+                                    print(msg); akiraCore.log(msg)
                         else:
                             #handle_obj(val)
                             try:
                                 handle_obj(val)
                             except Exception as ex:
                                 msg = f"lidar handle_obj error: {ex}"
-                                print(msg); sidraCore.log(msg)
+                                print(msg); akiraCore.log(msg)
 
                         # Advance buffer
                         buf = buf[idx:]

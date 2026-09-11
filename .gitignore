@@ -6,3 +6,7 @@ mon/*
 anpr/*
 mass/*
 drv/*
+lib/*
+synergy/*
+__pycache__/
+*.py[cod]

@@ -1,0 +1,1947 @@
+#!/usr/bin/env python3
+
+import ast
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+from importlib.metadata import version
+
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN_DIR = ROOT / "bin"
+CONFIG_PATH = ROOT / "etc" / "akira.cfg"
+LEGACY_ROOT = "/var/" + "sidra"
+
+
+def fail(message):
+    print("FAIL:", message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def source_files():
+    for top in (ROOT / "bin", ROOT / "etc", ROOT / "setup"):
+        for path in top.rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            yield path
+
+
+def check_legacy_paths():
+    stale = []
+    needle = LEGACY_ROOT.encode()
+    for path in source_files():
+        if needle in path.read_bytes():
+            stale.append(str(path.relative_to(ROOT)))
+    if stale:
+        fail("legacy root remains in: " + ", ".join(stale))
+
+
+def check_legacy_names():
+    stale = []
+    legacy_config = ("sidra" + ".cfg").encode()
+    legacy_log = ("sidra" + ".log").encode()
+    legacy_core = ("sidra" + "Core").encode()
+    for path in source_files():
+        source = path.read_bytes()
+        if legacy_config in source or legacy_log in source or legacy_core in source:
+            stale.append(str(path.relative_to(ROOT)))
+    if stale:
+        fail("legacy Akira filename remains in: " + ", ".join(stale))
+
+    for name, parent in (("sidra" + ".cfg", "etc"), ("sidra" + ".log", "log")):
+        path = ROOT / parent / name
+        if path.exists() or path.is_symlink():
+            fail("legacy Akira file remains: " + str(path.relative_to(ROOT)))
+
+    for path in ROOT.rglob("*"):
+        if "__pycache__" in path.parts:
+            continue
+        if ("sidra" + "Core") in path.name:
+            fail("legacy Akira module remains: " + str(path.relative_to(ROOT)))
+
+
+def check_python_syntax():
+    failures = []
+    for path in sorted(BIN_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        source = path.read_bytes()
+        if b"python" not in source.splitlines()[0]:
+            continue
+        try:
+            compile(source, str(path), "exec")
+        except Exception as ex:
+            failures.append(f"{path.name}: {type(ex).__name__}: {ex}")
+    if failures:
+        fail("Python syntax errors: " + "; ".join(failures))
+
+
+def check_shell_syntax():
+    failures = []
+    for top in (BIN_DIR, ROOT / "setup"):
+        for path in sorted(top.rglob("*")):
+            if not path.is_file() or "backup" in path.parts:
+                continue
+            first_line = path.open("rb").readline()
+            if b"bash" not in first_line:
+                continue
+            result = subprocess.run(
+                ["bash", "-n", str(path)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                failures.append(f"{path.relative_to(ROOT)}: {result.stderr.strip()}")
+    if failures:
+        fail("shell syntax errors: " + "; ".join(failures))
+
+
+def check_logrotate_setup():
+    rotation_config = (BIN_DIR / "utils" / "logrotate").read_text()
+    for log_name in (
+        "transactions.log",
+        "akira.log",
+        "mcp.log",
+        "errors.log",
+        "events.log",
+        "stats.log",
+        "lidarErrors.log",
+        "reads.log",
+        "rtsDebug.log",
+        "startup.log",
+        "restart.log",
+    ):
+        expected_path = f"/var/akira/log/{log_name}"
+        if expected_path not in rotation_config:
+            fail(f"logrotate configuration lacks {expected_path}")
+    if rotation_config.count("su james james") != 6:
+        fail("every logrotate stanza must declare the installation user/group")
+    if rotation_config.count("create 0664 james james") != 2:
+        fail("reader and auxiliary log rotation must recreate operator-writable logs")
+
+    setup_source = (ROOT / "setup" / "setup").read_text()
+    if '"$AKIRA_ROOT/bin/utils/logrotate-setup"' not in setup_source:
+        fail("main setup does not install the logrotate configuration")
+    if "logrotate" not in setup_source:
+        fail("main setup does not install the logrotate package")
+    if 'AKIRA_CODE_USER="$CODE_USER" AKIRA_CODE_GROUP="$CODE_GROUP"' not in setup_source:
+        fail("main setup does not pass its operator identity to logrotate setup")
+
+    helper_source = (BIN_DIR / "utils" / "logrotate-setup").read_text()
+    for expected in ("AKIRA_CODE_USER", "AKIRA_CODE_GROUP", "su james james"):
+        if expected not in helper_source:
+            fail(f"logrotate setup does not substitute {expected}")
+
+
+def check_configs():
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    failures = []
+    for path in sorted((ROOT / "etc").iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            json.loads(path.read_text(), object_pairs_hook=reject_duplicates)
+        except Exception as ex:
+            failures.append(f"{path.name}: {ex}")
+    if failures:
+        fail("invalid JSON config: " + "; ".join(failures))
+
+
+def check_reader_topology():
+    import massSensor
+
+    config = json.loads(CONFIG_PATH.read_text())
+    primary = {reader["name"]: reader for reader in config.get("readers", [])}
+    backup = {reader["name"]: reader for reader in config.get("backupReaders", [])}
+    if set(primary) != set(backup):
+        fail("primary and backup reader logical names differ")
+
+    mass_lanes = [str(sensor.get("lane")) for sensor in config.get("massSensors", [])]
+    for sensor in config.get("massSensors", []):
+        try:
+            massSensor.normalizeConfig(sensor)
+        except ValueError as ex:
+            fail(f"invalid mass sensor {sensor.get('name')}: {ex}")
+    for name, reader in primary.items():
+        lanes = [str(lane) for lane in reader.get("lanes", [reader.get("lane")])]
+        if len(lanes) != len(set(lanes)):
+            fail(f"reader {name} has duplicate lanes")
+        if any(mass_lanes.count(lane) != 1 for lane in lanes):
+            fail(f"reader {name} does not have exactly one mass sensor per lane")
+
+        primary_map = {
+            (str(antenna.get("number")), str(antenna.get("lane")), antenna.get("side"))
+            for antenna in reader.get("antennas", [])
+        }
+        backup_reader = backup[name]
+        backup_lanes = [str(lane) for lane in backup_reader.get("lanes", [backup_reader.get("lane")])]
+        backup_map = {
+            (str(antenna.get("number")), str(antenna.get("lane")), antenna.get("side"))
+            for antenna in backup_reader.get("antennas", [])
+        }
+        if lanes != backup_lanes or primary_map != backup_map:
+            fail(f"reader {name} backup topology differs from primary")
+
+
+def check_synergy_passage_delivery():
+    import threading
+    from unittest.mock import patch
+    import driverSynergy
+    config = json.loads(CONFIG_PATH.read_text())["driverConfig"]["driverSynergy"]
+    fields = {"TagStatus": 1, "AccountType": 3, "VehiclePlateNo": "TEST123", "EntryLane": 6,
+              "TcClass": 1, "VehicleClass": 1, "Fare": 350, "PaidAmount": 350}
+    with tempfile.TemporaryDirectory(prefix="akira-passage-delivery-") as temp_dir:
+        driver = driverSynergy.AkiraDriver(data_dir=temp_dir, driver_config=config)
+        calls = []
+        entered, release = threading.Event(), threading.Event()
+        def lookup(job, http):
+            calls.append(job["id"])
+            if job["id"] == "ENDING":
+                entered.set()
+                assert release.wait(2)
+            return dict(driver._local_failure(job, "00", "eligible"), valid=True, eligible=True,
+                        synergyFields=fields)
+        def finish():
+            deadline = time.monotonic() + 3
+            while driver.lookup_queues["06"].unfinished_tasks and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert driver.lookup_queues["06"].unfinished_tasks == 0
+            return driver.get_responses()[0]
+        def submit(attempt, passage, side):
+            driver.read({"id": attempt, "tid": "TEST", "passageID": passage, "lane": "06", "side": side})
+        with patch.object(driver, "_perform_lookup", side_effect=lookup), \
+                patch.object(driver, "_dispatch", return_value={"ok": False, "code": "TIMEOUT", "sendAttempted": True}) as dispatch:
+            submit("UNKNOWN-FAST", "UNCERTAIN", "fast")
+            assert finish()["deliveryUncertain"]
+            submit("UNKNOWN-SLOW", "UNCERTAIN", "slow")
+            result = finish()
+            assert result["code"] == "DELIVERY_UNKNOWN" and result["deliveryUncertain"]
+            assert calls == ["UNKNOWN-FAST"] and dispatch.call_count == 1, "slow retried uncertain gate delivery"
+            submit("ENDING", "LEFT-GATE", "slow")
+            assert entered.wait(1)
+            driver.passage_end("06", "LEFT-GATE")
+            release.set()
+            assert finish()["code"] == "PASSAGE_CANCELLED"
+            assert dispatch.call_count == 1, "slow authorization arrived after the car left"
+            driver.passage_state("06", "BOUNCE", False)
+            submit("PAUSED-SLOW", "BOUNCE", "slow")
+            assert finish()["code"] == "PASSAGE_PAUSED"
+            assert dispatch.call_count == 1
+            driver.passage_state("06", "BOUNCE", True)
+            submit("RESUMED-SLOW", "BOUNCE", "slow")
+            assert finish()["deliveryUncertain"]  # Mock dispatch times out, but the attempt is allowed again.
+            assert dispatch.call_count == 2
+
+
+def check_reader_passage_flow():
+    import contextlib
+    import io
+    import queue
+    import threading
+    import traceback
+    from types import SimpleNamespace
+    from lanePassage import LanePassages
+    import massSensor
+
+    # Sensor ordering and ID matching survive overlapping cars and late replies.
+    flow = LanePassages()
+    a = flow.fast_trigger(0, 0)
+    b = flow.fast_trigger(1, 0)
+    assert b.previous_id == a.id and a.clear_at_fast and not b.clear_at_fast
+    assert flow.slow_trigger() is a
+    release_at = datetime.now() + timedelta(milliseconds=50)
+    flow.pause_slow(release_at)
+    assert not flow.release_due(release_at - timedelta(milliseconds=1))
+    assert flow.slow_trigger() is a and list(flow.waiting) == [b], "slow bounce consumed the following car"
+    a.pending_id = "slow-a"
+    flow.response({"passageID": a.id, "id": "old-attempt", "gateAuthorized": True}, datetime.now())
+    assert not a.authorized, "late response authorized a different attempt"
+    flow.response({"passageID": a.id, "id": "slow-a", "gateAuthorized": True}, datetime.now())
+    assert a.authorized and flow.slow_clear() is a
+    assert flow.slow_trigger() is b and not b.authorized
+    flow.clear()
+    assert flow.slow_trigger() is not None, "startup car at the gate had no fallback passage"
+    flow = LanePassages()
+    flow.initialize_occupied(1, 1)
+    front = flow.slow
+    arriving = flow.fast_trigger(1, 1)
+    assert arriving.previous_id != front.id, "startup mid occupancy was treated as the validated front car"
+    flow.pause_slow(datetime.now() + timedelta(milliseconds=50))
+    assert not flow.fast_trigger(0, 0).clear_at_fast, "brief slow dropout falsely made the lane ahead clear"
+    flow = LanePassages()
+    flow.initialize_occupied(1, 0)
+    obsolete = flow.waiting[0].id
+    fresh = flow.fast_trigger(0, 0)
+    assert list(flow.waiting) == [fresh] and flow.retired == [obsolete], "clear approach retained phantom startup cars"
+
+    names = {"LaneContext", "laneThread", "resetWindow", "readWindow", "windowExpired",
+             "massClearReady", "lockoutBreak"}
+    tree = ast.parse((BIN_DIR / "reader").read_text())
+    module = ast.Module(body=[node for node in tree.body
+                             if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names],
+                        type_ignores=[])
+
+    for mode in ("miss", "fast", "pending"):
+        fast_success = mode != "miss"
+        sent, errors, ended, flows = [], [], [], []
+        allow_slow = threading.Event()
+        stopped = threading.Event()
+        class TrackedPassages(LanePassages):
+            def __init__(self):
+                super().__init__()
+                flows.append(self)
+        namespace = {
+            "datetime": datetime, "timedelta": timedelta, "time": time, "queue": queue,
+            "threading": threading, "traceback": traceback, "massSensor": massSensor,
+            "LanePassages": TrackedPassages, "STOP": object(), "ANTENNA_FAST": "fast", "ANTENNA_SLOW": "slow",
+            "fastMinReads": 5, "slowMinReads": 7, "fastPre": -20, "fastPost": 50,
+            "slowPre": -20, "slowPost": 50, "fastMaxReportAge": 500, "slowMaxReportAge": 2000,
+            "syncArbitrationWindowActivity": lambda *a: None,
+            "suppressCrossLaneAssignments": lambda *a: None,
+            "acceptCandidate": lambda *a: None,
+            "addSquelch": lambda *a, **k: None, "SQUELCH_TIME": 5000,
+            "arbitrateCandidates": lambda candidates, last: candidates[0] if candidates else None,
+            "cleanOldRf": lambda *a: None, "cleanSquelch": lambda *a: None,
+            "notifyLaneClear": lambda *a: None, "debugMass": lambda *a: None,
+            "akiraCore": SimpleNamespace(log=errors.append),
+            "readDrivers": {"test": SimpleNamespace(noTag=lambda *a: None, passageEnd=lambda lane, passage: ended.append(passage))},
+        }
+        for name in ("DEBUG_MASS", "DEBUG_DRIVER", "DEBUG_DRIVER_RESPONSES", "GEN_FAKE_TAG_RESPONSE",
+                     "LOG_STATS", "DEBUG_SQUELCH", "DEBUG_READ_MONITOR", "DEBUG_WINDOW"):
+            namespace[name] = False
+
+        def candidates(context, window, side, minimum):
+            if not window["reading"] or (side == "fast" and not fast_success) or (side == "slow" and not allow_slow.is_set()):
+                return []
+            now = datetime.now()
+            return [{"id": side + "-attempt", "tid": "CAR", "side": side, "lane": "07",
+                     "date": now, "lastSeen": now, "reads": minimum}]
+        namespace["checkReadCandidates"] = candidates
+        exec(compile(module, str(BIN_DIR / "reader"), "exec"), namespace)
+        context = namespace["LaneContext"]("07", {"ports": {"fast": [0], "mid": [1], "slow": [2]},
+                                                     "clearDebounceMs": 150})
+        def send(read):
+            sent.append(dict(read))
+            if mode != "pending":
+                context.responseQ.put(dict(type="tagResult", id=read["id"], passageID=read["passageID"],
+                                           tid=read["tid"], valid=True, gateAuthorized=True))
+        namespace["sendRead"] = send
+        def mass(fast, mid, slow):
+            context.massQ.put({"fast": fast, "mid": mid, "slow": slow, "date": datetime.now()})
+        def wait_until(condition):
+            deadline = time.monotonic() + 2
+            while not condition() and not errors and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert not errors, errors
+            assert condition(), "reader passage loop failed to progress"
+        with contextlib.redirect_stdout(io.StringIO()):
+            worker = threading.Thread(target=namespace["laneThread"], args=(context, stopped), daemon=True)
+            worker.start()
+            try:
+                mass(1, 0, 0)
+                wait_until(lambda: flows and flows[0].fast is not None)
+                passage_id = flows[0].fast.id
+                if mode == "pending":
+                    wait_until(lambda: bool(sent))
+                elif fast_success:
+                    wait_until(lambda: flows[0].fast.authorized)
+                else:
+                    time.sleep(0.08)  # Miss the entire fast opportunity.
+                clear_at = datetime.now()
+                context.massQ.put({"fast": 0, "mid": 0, "slow": 0, "date": clear_at})
+                context.massQ.put({"fast": 1, "mid": 0, "slow": 0, "date": clear_at + timedelta(milliseconds=1)})
+                time.sleep(0.01)
+                assert flows[0].fast.id == passage_id and not ended, "brief fast clear created a second car"
+                mass(0, 1, 1)
+                wait_until(lambda: flows[0].slow is not None)
+                # Remain stopped beyond several configured slow windows before
+                # RF becomes usable. The slow antenna must still authorize.
+                time.sleep(0.18)
+                allow_slow.set()
+                if fast_success:
+                    time.sleep(0.08)
+                    if mode == "pending":
+                        assert [r["side"] for r in sent] == ["fast"], "slow ran while fast validation was pending"
+                        context.responseQ.put(dict(type="tagResult", id=sent[0]["id"], passageID=passage_id, gateAuthorized=True))
+                        wait_until(lambda: flows[0].slow.authorized)
+                    assert [r["side"] for r in sent] == ["fast"], "authorized fast car was submitted again at slow"
+                else:
+                    wait_until(lambda: bool(sent))
+                    assert [r["side"] for r in sent] == ["slow"], "missed fast read never reached slow fallback"
+                assert sent[0]["passageID"] == passage_id, "slow lost its original sensor passage identity"
+                mass(0, 1, 0)
+                wait_until(lambda: flows[0].slow is not None and flows[0].slow.release_at is not None)
+                mass(0, 1, 1)
+                wait_until(lambda: flows[0].slow is not None and flows[0].slow.release_at is None)
+                assert flows[0].slow.id == passage_id and not ended, "brief slow clear split the car into two passages"
+                mass(0, 0, 0)
+                wait_until(lambda: passage_id in ended)
+                assert not errors, errors
+            finally:
+                stopped.set()
+                worker.join(2)
+                assert not worker.is_alive()
+
+
+def check_mass_transition_reporting():
+    import contextlib
+    import io
+    import queue
+    import threading
+    from types import SimpleNamespace
+    import massSensor
+
+    # Load only the production mass path, without starting reader hardware.
+    names = {"LaneContext", "publishMassState", "setAllInputsAndNotify",
+             "massClearReady", "lockoutBreak"}
+    tree = ast.parse((BIN_DIR / "reader").read_text())
+    module = ast.Module(body=[node for node in tree.body
+                             if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names],
+                        type_ignores=[])
+    snapshots, logged = {}, []
+    namespace = {
+        "queue": queue, "threading": threading, "massSensor": massSensor,
+        "datetime": datetime, "timedelta": timedelta, "json": json,
+        "LOG_READS": True, "LOG_READS_FILE": "test-reads.log", "DEBUG_MASS_DETAIL": False,
+        "sendLine": lambda *args: None, "parseGpio": massSensor.parseGpio,
+        "resetWindow": lambda reason: {"reading": False, "reason": reason},
+        "akiraCore": SimpleNamespace(
+            MASS_DIR="test-mass", STATE_EXTENSION_MASS=".ms", jsonConverter=lambda value: value.isoformat(),
+            writeFile=lambda path, value: snapshots.update({path: json.loads(value)}),
+            appendFile=lambda path, value: logged.append(json.loads(value))),
+    }
+    exec(compile(module, str(BIN_DIR / "reader"), "exec"), namespace)
+    config = {"ports": {"fast": [0], "mid": [1, 2, 3, 4, 5], "slow": [6]}, "activeState": 1}
+    lane = namespace["LaneContext"]("06", config)
+    other = namespace["LaneContext"]("07", config)
+    publish = namespace["publishMassState"]
+
+    def raw(*active):
+        return {str(port + 100): int(port in active) for port in range(16)}
+
+    for active, expected in (
+        ((), True), ((), False), ((15,), False),
+        ((0,), True), ((0, 1), True), ((0, 1, 2), False), ((0, 2), False),
+    ):
+        assert publish(lane, raw(*active)) is expected
+    assert snapshots["test-mass/06.ms"]["ports"]["1"] == 0
+    assert snapshots["test-mass/06.ms"]["ports"]["2"] == 1, "suppression hid latest raw mid state"
+    for active in ((2,), (2, 6), (6,), ()):
+        assert publish(lane, raw(*active)), "lost a fast/mid/slow transition"
+    states = []
+    while not lane.massQ.empty():
+        event = lane.massQ.get_nowait()
+        states.append(tuple(event[role] for role in massSensor.MASS_ROLES))
+    assert states == [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                      (0, 1, 1), (0, 0, 1), (0, 0, 0)]
+    assert len(logged) == len(states), "duplicate raw changes still generated passage logs"
+    assert publish(other, raw()), "one lane suppressed another lane's initial snapshot"
+
+    class Board:
+        def __init__(self, readall):
+            self.responses = iter(("", "", readall, ""))
+        def read_available(self, timeout):
+            return next(self.responses)
+
+    namespace["setAllInputsAndNotify"](Board("0000"), lane)
+    assert lane.massQ.qsize() == 1, "reconnect did not republish unchanged initial state"
+    lane.massQ.get_nowait()
+    assert not publish(lane, raw()), "initial snapshot was duplicated by first notification"
+    namespace["setAllInputsAndNotify"](Board(""), lane)
+    assert publish(lane, raw()), "empty readall suppressed first post-reconnect notification"
+
+    lane.massQ = queue.Queue(maxsize=1)
+    lane.massQ.put("occupied queue")
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert not publish(lane, raw(1))
+    lane.massQ.get_nowait()
+    assert publish(lane, raw(1)), "failed enqueue incorrectly advanced suppression state"
+
+    # No more GPIO reports are needed for the existing lane-loop clear timer.
+    now = datetime.now()
+    clear = {"trip": 0, "main": 0, "rear": 0, "clearSince": now,
+             "unlockLockout": True}
+    assert not namespace["lockoutBreak"]({}, {}, clear, 1500)[0]
+    clear["clearSince"] = now - timedelta(milliseconds=1600)
+    assert namespace["lockoutBreak"]({}, {}, clear, 1500)[0]
+    assert not clear["unlockLockout"]
+
+
+def check_mass_sensor_mapping():
+    import massSensor
+
+    config = massSensor.normalizeConfig({
+        "name": "test.m1",
+        "ports": {"fast": [0], "mid": [1, 2, 3, 4, 5], "slow": [6]},
+        "activeState": 1,
+    })
+    raw_clear = {str(port + 100): 0 for port in range(16)}
+
+    clear = massSensor.logicalState(raw_clear, config)
+    if clear["occupied"] != 0 or clear["ports"]["15"] != 0:
+        fail("clear physical ports did not map to a clear logical state")
+
+    fast_raw = dict(raw_clear, **{"100": 1})
+    fast = massSensor.logicalState(fast_raw, config)
+    if (fast["fast"], fast["mid"], fast["slow"], fast["trip"]) != (1, 0, 0, 1):
+        fail("port 0 did not map exclusively to fast")
+
+    for port in range(1, 6):
+        mid_raw = dict(raw_clear, **{str(port + 100): 1})
+        mid = massSensor.logicalState(mid_raw, config)
+        if (mid["fast"], mid["mid"], mid["slow"], mid["main"]) != (0, 1, 0, 1):
+            fail(f"port {port} did not map exclusively to combined mid occupancy")
+
+    # Switching between separately wired middle sensors must leave the
+    # aggregate occupied throughout the handoff.
+    mid_one = massSensor.logicalState(dict(raw_clear, **{"101": 1}), config)
+    mid_two = massSensor.logicalState(dict(raw_clear, **{"102": 1}), config)
+    if mid_one["mid"] != 1 or mid_two["mid"] != 1:
+        fail("middle-sensor handoff created a false logical clear")
+
+    slow = massSensor.logicalState(dict(raw_clear, **{"106": 1}), config)
+    if (slow["fast"], slow["mid"], slow["slow"], slow["rear"]) != (0, 0, 1, 1):
+        fail("port 6 did not map exclusively to slow")
+
+    legacy = massSensor.normalizeConfig({"trip": "108", "main": "100", "rear": "101"})
+    if legacy["ports"] != {"fast": [8], "mid": [0], "slow": [1]}:
+        fail("legacy trip/main/rear mass configuration was not normalized")
+
+    active_low = massSensor.normalizeConfig({
+        "ports": {"fast": [0], "mid": [1], "slow": [2]},
+        "activeState": 0,
+    })
+    low_raw = {str(port + 100): 1 for port in range(16)}
+    low_raw["101"] = 0
+    if massSensor.logicalState(low_raw, active_low)["mid"] != 1:
+        fail("active-low mass input was not honored")
+
+    invalid_configs = (
+        {"ports": {"fast": [0], "mid": [0], "slow": [6]}},
+        {"ports": {"fast": [0], "mid": [1], "slow": [16]}},
+        {"ports": {"fast": [0], "mid": [], "slow": [6]}},
+    )
+    for invalid in invalid_configs:
+        try:
+            massSensor.normalizeConfig(invalid)
+        except ValueError:
+            continue
+        fail("invalid mass sensor configuration was accepted: " + repr(invalid))
+
+
+def check_multilane_reader():
+    config = json.loads(CONFIG_PATH.read_text())
+    readers = config.get("readers", [])
+    if not readers:
+        fail("configuration has no readers to validate")
+
+    for configuredReader in readers:
+        readerName = str(configuredReader.get("name", "")).strip()
+        if not readerName:
+            fail("configured reader lacks a name")
+        for flag, expected in (
+            ("--validate-config", f"VALID reader {readerName}"),
+            ("--self-test", "PASS: reader isolation"),
+        ):
+            result = subprocess.run(
+                [str(BIN_DIR / "reader"), readerName, flag],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                fail(
+                    f"reader {readerName} {flag} failed: "
+                    f"{result.stderr.strip()} {result.stdout.strip()}"
+                )
+            if expected not in result.stdout:
+                fail(f"reader {readerName} {flag} did not report expected success")
+
+    # Prove the built-in checks follow configuration rather than this site's
+    # lane IDs, antenna numbers, polarity, or seven-port sensor layout.
+    with tempfile.TemporaryDirectory(prefix="akira-reader-config-") as tmp:
+        alternateRoot = Path(tmp)
+        (alternateRoot / "etc").mkdir()
+        alternateReader = {
+            "name": "future.r1",
+            "lanes": ["north", "south"],
+            "ip": "127.0.0.1",
+            "power": "300",
+            "frequency": "919250",
+            "region": "TEST_REGION",
+            "fastMinReads": "2",
+            "slowMinReads": "2",
+            "fastPre": "-100",
+            "fastPost": "500",
+            "slowPre": "-500",
+            "slowPost": "1000",
+            "antennas": [
+                {"number": 5, "lane": "north", "side": "fast"},
+                {"number": 6, "lane": "north", "side": "slow"},
+                {"number": 7, "lane": "south", "side": "fast"},
+                {"number": 8, "lane": "south", "side": "slow"},
+            ],
+        }
+        alternateConfig = {
+            "driversRead": [],
+            "readers": [alternateReader],
+            "backupReaders": [dict(alternateReader, ip="127.0.0.2")],
+            "massSensors": [
+                {
+                    "name": "north.m1",
+                    "ip": "127.0.0.3",
+                    "lane": "north",
+                    "ports": {"fast": [2], "mid": [3, 4], "slow": [5]},
+                    "activeState": 0,
+                    "clearDebounceMs": 20,
+                },
+                {
+                    "name": "south.m1",
+                    "ip": "127.0.0.4",
+                    "lane": "south",
+                    "ports": {"fast": [8], "mid": [9], "slow": [10]},
+                    "activeState": 0,
+                    "clearDebounceMs": 20,
+                },
+            ],
+        }
+        (alternateRoot / "etc" / "akira.cfg").write_text(json.dumps(alternateConfig))
+        environment = os.environ.copy()
+        environment["AKIRA_ROOT"] = str(alternateRoot)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [str(BIN_DIR / "reader"), "future.r1", "--self-test"],
+            cwd=str(ROOT),
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or "PASS: reader isolation" not in result.stdout:
+            fail(
+                "reader configuration-driven self-test failed: "
+                f"{result.stderr.strip()} {result.stdout.strip()}"
+            )
+
+
+def check_reader_reconnect_strategy():
+    source = (BIN_DIR / "reader").read_text()
+    tree = ast.parse(source, str(BIN_DIR / "reader"))
+    reconnectNode = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "reconnectReaderEvent"
+        ),
+        None,
+    )
+    if reconnectNode is None:
+        fail("reader reconnect strategy is missing")
+
+    module = ast.Module(body=[reconnectNode], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {}
+    exec(compile(module, str(BIN_DIR / "reader"), "exec"), namespace)
+
+    calls = []
+    namespace["connectCommandSocket"] = lambda: calls.append("command-connect")
+    namespace["configureReaderHardware"] = (
+        lambda saveProfile=True: calls.append(("configure", saveProfile))
+    )
+    namespace["connectEventConnection"] = (
+        lambda stop_event=None: ("event", stop_event)
+    )
+
+    marker = object()
+
+    def activeCommand(command):
+        calls.append(command)
+        return "ok active" if command == "setup.operating_mode" else "ok"
+
+    namespace["xrCmd"] = activeCommand
+    if namespace["reconnectReaderEvent"](marker) != ("event", marker):
+        fail("active reader reconnect did not restore its event connection")
+    if any(isinstance(call, tuple) and call[0] == "configure" for call in calls):
+        fail("active reader reconnect unnecessarily reapplied configuration")
+
+    calls.clear()
+
+    def standbyCommand(command):
+        calls.append(command)
+        return "ok standby" if command == "setup.operating_mode" else "ok"
+
+    namespace["xrCmd"] = standbyCommand
+    namespace["reconnectReaderEvent"](marker)
+    if ("configure", False) not in calls:
+        fail("standby reader reconnect did not restore runtime configuration")
+    if ("configure", True) in calls:
+        fail("reader reconnect performed an unnecessary persistent profile save")
+
+
+def check_numato_transport():
+    import akiraCore
+    from numatoTelnet import NumatoConnection
+
+    if version("telnetlib3") != "5.0.0":
+        fail("unexpected telnetlib3 version: " + version("telnetlib3"))
+    if version("wcwidth") != "0.8.3":
+        fail("unexpected wcwidth version: " + version("wcwidth"))
+    if not str(Path(akiraCore.LIB_DIR)).startswith(str(ROOT)):
+        fail("Akira dependency directory is outside the project root")
+
+    class FakeTelnet:
+        def __init__(self, host, port, **kwargs):
+            self.host = host
+            self.port = port
+            self.kwargs = kwargs
+            self.connected = False
+            self.closed = False
+            self.writes = []
+
+        def connect(self):
+            self.connected = True
+
+        def read_until(self, marker, timeout=None):
+            return b"User Name:"
+
+        def readline(self, timeout=None):
+            return "gpio readall = FF8E\r\n"
+
+        def read_some(self, timeout=None):
+            raise TimeoutError("no data ready")
+
+        def write(self, data):
+            self.writes.append(data)
+
+        def flush(self, timeout=None):
+            self.flush_timeout = timeout
+
+        def close(self):
+            self.closed = True
+
+    connection = NumatoConnection(
+        "127.0.0.1",
+        timeout=3,
+        connection_factory=FakeTelnet,
+    )
+    if not connection.connection.connected:
+        fail("Numato transport did not connect")
+    if connection.read_until("User Name:", timeout=1) != "User Name:":
+        fail("Numato transport did not normalize byte responses")
+    if connection.readline(timeout=1) != "gpio readall = FF8E\r\n":
+        fail("Numato transport did not return notification text")
+    if connection.read_available(timeout=0.01) != "":
+        fail("Numato transport did not normalize an idle read")
+    connection.write_line("gpio readall")
+    if connection.connection.writes != ["gpio readall\r\n"]:
+        fail("Numato transport did not write CRLF-terminated commands")
+    connection.close()
+    if not connection.connection.closed:
+        fail("Numato transport did not close")
+
+
+def check_mcp_restart_backlog():
+    with tempfile.TemporaryDirectory(prefix="akira-mcp-backlog-") as temp_dir:
+        root = Path(temp_dir)
+        for directory in ("etc", "img", "trn", "trn/working", "trn/tmp"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        config = json.loads(CONFIG_PATH.read_text())
+        config["driversTrans"] = []
+        config["laneMode"] = "single"
+        (root / "etc/akira.cfg").write_text(json.dumps(config))
+        (root / "img/test.jpg").write_bytes(b"test image")
+
+        def write_event(name, timestamp, lane, epc=None, working=False):
+            if epc is not None:
+                data = {
+                    "date": timestamp.isoformat(), "reader": "test-reader",
+                    "lane": lane, "side": "fast", "antenna": 1,
+                    "epc": epc, "tid": epc, "rssi": -40, "userData": "",
+                    "tagPlate": "", "tagClass": "",
+                    "tidAuthentic": "AUTHENTIC", "pwAuthentic": "AUTHENTIC",
+                }
+                suffix = ".tr"
+            else:
+                data = {
+                    "device": {"name": "test-cam", "lane": lane, "facing": "front"},
+                    "transit": {
+                        "timestamps": {"image": timestamp.strftime("%Y-%m-%d_%H:%M:%S.%f")},
+                        "plate": {"text": "TEST123", "score": 99},
+                        "image": "test.jpg", "image_plate": "",
+                        "class": "CAR", "speed": 0,
+                    },
+                }
+                suffix = ".tc"
+            temporary = root / "trn/tmp" / (name + suffix)
+            temporary.write_text(json.dumps(data))
+            temporary.replace(root / ("trn/working" if working else "trn") / (name + suffix))
+
+        now = datetime.now()
+        for number in range(20):
+            old = now - timedelta(days=1, seconds=number)
+            write_event(f"old-cam-{number}", old, "06", working=bool(number % 2))
+            write_event(f"old-rf-{number}", old, "06", f"OLD-{number}", working=bool(number % 2))
+        fresh = now - timedelta(seconds=3.5)
+        write_event("fresh-cam", fresh, "06")
+        write_event("fresh-rf", fresh, "06", "FRESH-RF")
+        write_event("waiting-rf", fresh, "07", "WAITING-RF")
+        env = os.environ.copy()
+        env["AKIRA_ROOT"] = str(root)
+        # The development MCP may have lock logging disabled. Exercise its
+        # optional once-only diagnostic in a copy without changing that setting.
+        test_mcp = root / "mcp-test.py"
+        test_mcp.write_text((BIN_DIR / "mcp").read_text().replace("DEBUG_LOCK = False", "DEBUG_LOCK = True", 1))
+        env["PYTHONPATH"] = str(BIN_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+        with (root / "mcp-output.log").open("w+") as output:
+            process = subprocess.Popen(
+                [sys.executable, "-u", str(test_mcp)],
+                env=env, stdout=output, stderr=subprocess.STDOUT,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        output.seek(0)
+                        fail("MCP exited during backlog test: " + output.read())
+                    if list((root / "xmit").glob("*.qe")):
+                        break
+                    time.sleep(0.05)
+                else:
+                    output.seek(0)
+                    fail("MCP did not process the fresh pair: " + output.read())
+                # Wait for the unmatched decision rather than racing MCP's
+                # age threshold with a fixed sleep on faster/slower hosts.
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if "UNABLE TO MATCH WAITING-RF" in (root / "mcp-output.log").read_text():
+                        break
+                    time.sleep(0.05)
+                else:
+                    fail("MCP did not report the waiting RF before late camera arrival")
+                write_event("late-cam", fresh, "07")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if len(list((root / "xmit").glob("*.qe"))) == 2:
+                        break
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                else:
+                    fail("MCP stopped reconsidering an unmatched RF event")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=3)
+            output.seek(0)
+            log = output.read()
+        if "skipped 40 expired events" not in log:
+            fail("MCP did not exclude the startup backlog before matching")
+        if any(message in log for message in ("NOT IN LANES", "NOT FRONT", "NO MATCH:")) or any(line.startswith("cam: ") for line in log.splitlines()):
+            fail("MCP still emits per-candidate matching spam")
+        if log.count("UNABLE TO MATCH WAITING-RF") != 1:
+            fail("MCP did not report the correct unmatched RF exactly once")
+        events = [json.loads(path.read_text()) for path in (root / "xmit").glob("*.qe")]
+        if len(events) != 2 or {event["epc"] for event in events} != {"FRESH-RF", "WAITING-RF"}:
+            fail("MCP lost live matching or produced historical transactions")
+        if len(list((root / "trn/done").iterdir())) != 44:
+            fail("MCP lost raw event archives while excluding stale matches")
+        if len(list((root / "xmit").glob("*.qc"))) != 22 or len(list((root / "xmit").glob("*.qr"))) != 22:
+            fail("MCP lost raw uploads while excluding stale matches")
+
+
+def check_synergy_transaction_fields():
+    from copy import deepcopy
+    from driverSynergy import AkiraDriver
+
+    config = {
+        "tagStatus": {
+            "endpoints": ["http://127.0.0.1:9"],
+            "request": {"op": "getTagStatus", "tidParameter": "tid", "plaza": "002"},
+        },
+        "eligibility": {"allowedStatuses": ["1"]},
+    }
+    response = {
+        "tag": {"tid": "TEST", "status": "1", "balance": "10.00",
+                "type": "03", "vehiclePlateNum": "TEST123"},
+        "fare": {"plazaCode": "002", "vehicleClass": 1, "fareValue": "3.50"},
+    }
+    job = {"id": "TEST", "tid": "TEST", "lane": "06"}
+    with tempfile.TemporaryDirectory(prefix="akira-synergy-fields-") as temp_dir:
+        driver = AkiraDriver(data_dir=temp_dir, driver_config=config)
+        for section, field, value in (
+            ("tag", "type", None), ("tag", "type", True),
+            ("tag", "type", "100"), ("tag", "balance", "NaN"),
+            ("tag", "vehiclePlateNum", None),
+            ("tag", "vehiclePlateNum", "X" * 25),
+            ("tag", "vehiclePlateNum", "TEST\n123"),
+            ("fare", "plazaCode", "003"),
+            ("fare", "vehicleClass", 0), ("fare", "vehicleClass", 9),
+            ("fare", "fareValue", "3.501"), ("fare", "fareValue", "-1"),
+            ("fare", "fareValue", "Infinity"), ("fare", "fareValue", None),
+        ):
+            bad_response = deepcopy(response)
+            bad_response[section][field] = value
+            try:
+                driver._evaluate_lookup(job, bad_response, "test", 1)
+            except ValueError:
+                pass
+            else:
+                fail(f"Synergy accepted invalid {section}.{field}: {value!r}")
+        for field, value in (("lane", ""), ("lane", "1000"),
+                             ("VehicleClass", 9), ("PaidAmount", True),
+                             ("PaidAmount", -1)):
+            try:
+                driver._evaluate_lookup(dict(job, **{field: value}), response, "test", 1)
+            except ValueError:
+                pass
+            else:
+                fail(f"Synergy accepted invalid reader field {field}: {value!r}")
+        for fare, expected in (("3.50", 350), ("0.29", 29), ("0.00", 0)):
+            valid_response = deepcopy(response)
+            valid_response["fare"]["fareValue"] = fare
+            valid_response["tag"]["vehiclePlateNum"] = "X" * 24
+            result = driver._evaluate_lookup(dict(job, PaidAmount=0), valid_response, "test", 1)
+            if result["synergyFields"]["Fare"] != expected or result["synergyFields"]["PaidAmount"] != 0:
+                fail("Synergy money conversion lost precision or replaced explicit zero payment")
+
+        for account_type in ("1", "2", "3"):
+            for status, balance, fare, expected in (
+                ("1", "3.49", "3.50", False),
+                ("1", "3.50", "3.50", True),
+                (1, "3.51", "3.50", True),
+                ("1", "0.01", "3.50", False),
+                ("1", "0.29", "0.29", True),
+                ("1", "0.00", "0.00", True),
+                ("1", "-0.01", "0.00", False),
+                ("0", "100.00", "3.50", False),
+                ("2", "100.00", "3.50", False),
+            ):
+                candidate = deepcopy(response)
+                candidate["tag"].update(status=status, balance=balance, type=account_type,
+                                        directDebit=True, entitlementFlag=True)
+                candidate["fare"]["fareValue"] = fare
+                result = driver._evaluate_lookup(dict(job, PaidAmount=0), candidate, "test", 1)
+                if result["eligible"] is not expected or result["valid"] is not expected:
+                    fail(f"wrong gate eligibility: status={status} balance={balance} fare={fare} type={account_type}")
+                if result["requiredBalance"] != float(fare):
+                    fail("eligibility did not record the actual required fare")
+                if not expected and "synergyFields" in result:
+                    fail("ineligible tag produced gate authorization fields")
+
+
+def check_synergy_lane_protocol():
+    import contextlib
+    import io
+    import runpy
+    from unittest.mock import patch
+    from driverSynergy import AkiraDriver
+
+    server_module = runpy.run_path(str(BIN_DIR / "serverSynergy"))
+    local_module = runpy.run_path(str(BIN_DIR / "clientSynergyTest.py"))
+    client_modules = [(local_module, "AkiraTestClient")]
+    portable_path = BIN_DIR / "clientSynergyStandalone.py"
+    if portable_path.exists():
+        client_modules.append((runpy.run_path(str(portable_path)), "AkiraStandaloneClient"))
+    state06 = {"laneID": "06", "laneState": 1, "gateState": 1, "queueCount": 1, "signMsg": "OK"}
+    state07 = dict(state06, laneID="07")
+
+    class Session:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.sent = []
+
+        def send(self, message, timeout):
+            self.sent.append(message)
+
+        def next_json(self, deadline):
+            return self.responses.pop(0) if self.responses else None
+
+    with tempfile.TemporaryDirectory(prefix="akira-synergy-lanes-") as temp_dir, contextlib.redirect_stdout(io.StringIO()):
+        args = server_module["parse_args"](["--data-dir", temp_dir, "--lanes", "06,07"])
+        server = server_module["AkiraServer"](args)
+        command = {"op": "NOP", "laneID": "06"}
+        acknowledged = server.exchange(Session([state07, state06]), command)
+        if acknowledged["response"]["laneID"] != "06" or server.status.data["invalidResponses"] != 1:
+            fail("server accepted a wrong-lane response instead of waiting for the requested lane")
+        try:
+            server.exchange(Session([state07]), command)
+        except server_module["NoResponse"]:
+            pass
+        else:
+            fail("wrong-lane response completed a Synergy exchange")
+        try:
+            server_module["validate_lane_state"]({key: value for key, value in state06.items() if key != "laneID"})
+        except ValueError:
+            pass
+        else:
+            fail("server accepted a lane-state response without laneID")
+
+        config = json.loads(CONFIG_PATH.read_text())["driverConfig"]["driverSynergy"]
+        driver = AkiraDriver(data_dir=temp_dir, driver_config=config)
+        job = {"id": "MISMATCH", "tid": "TEST", "lane": "06",
+               "generation": 0, "deadline": time.monotonic() + 2}
+        fields = {"TagStatus": 1, "AccountType": 3, "VehiclePlateNo": "TEST123", "EntryLane": 6,
+                  "TcClass": 1, "VehicleClass": 1, "Fare": 350, "PaidAmount": 350}
+        with patch.object(driver, "_dispatch", return_value={"ok": True, "response": state07}):
+            result = driver._authorize_read(job, {"code": "00", "synergyFields": fields})
+        if result.get("valid") or result.get("code") != "LANE_MISMATCH":
+            fail("driver authorized a response belonging to a different lane")
+
+        guarded = dict(fields, op="addQueue", laneID="06", txID="GUARDED", tagID="TEST",
+                       msgID="TEST", signMsg="WELCOME", dateTime=datetime.now(timezone.utc).isoformat())
+        for lane_state, gate_state, expected in ((1, 0, False), (0, 1, False), (1, 1, True)):
+            session = Session([dict(state06, laneState=lane_state, gateState=gate_state, queueCount=0), state06])
+            pending = server_module["PendingDispatch"](guarded, time.monotonic() + 1, require_open_gate=True)
+            result = server.exchange_dispatch(session, pending)
+            assert result["ok"] is expected
+            assert [c["op"] for c in session.sent] == (["NOP", "addQueue"] if expected else ["NOP"])
+            if not expected:
+                assert result["notSent"]
+
+        for module, class_name in client_modules:
+            if class_name == "AkiraTestClient":
+                clients = {lane: module[class_name](module["parse_args"]([
+                    "--lane", lane, "--port", str(32000 + int(lane)), "--passage-seconds", "30",
+                    "--status-file", str(Path(temp_dir) / f"client-{lane}.json")]))
+                    for lane in ("06", "07")}
+            else:
+                client = module[class_name](module["parse_args"](["--lanes", "06,07", "--passage-seconds", "30"]))
+                clients = {"06": client, "07": client}
+
+            def handle(command):
+                client = clients.get(command.get("laneID"), clients["06"])
+                result = client.handle_command(command)
+                return result[0] if isinstance(result, tuple) else result
+
+            for lane in ("06", "07"):
+                result = handle({"op": "addQueue", "laneID": lane, "txID": "SHARED-TXID", "signMsg": "WELCOME"})
+                if result["laneID"] != lane or result["queueCount"] != 1:
+                    fail(f"{class_name} mixed lane state or deduplication")
+            duplicate = handle({"op": "addQueue", "laneID": "06", "txID": "SHARED-TXID"})
+            if duplicate["queueCount"] != 1:
+                fail(f"{class_name} incremented a retransmitted transaction")
+            handle({"op": "setSignMsg", "laneID": "07", "signMsg": "ONLY 07"})
+            if handle({"op": "NOP", "laneID": "06"})["signMsg"] != "WELCOME":
+                fail(f"{class_name} changed the wrong lane's sign")
+            handle({"op": "closeGate", "laneID": "07", "signMsg": "CLOSED 07"})
+            if handle({"op": "NOP", "laneID": "06"})["queueCount"] != 1:
+                fail(f"{class_name} closed the wrong lane")
+            handle({"op": "addQueue", "laneID": "07", "txID": "NEW-07", "signMsg": "WELCOME"})
+            lanes = {lane: (client.simulators if hasattr(client, "simulators") else client.lanes)[lane]
+                     for lane, client in clients.items()}
+            lanes["06"].passage_deadlines[:] = [0.0]
+            clients["06"].process_passages()
+            if lanes["06"].gate_state != 0 or lanes["07"].gate_state != 1 or lanes["07"].queue_count != 1:
+                fail(f"{class_name} did not isolate vehicle passage by lane")
+            for lane in (None, "99"):
+                try:
+                    handle({"op": "setSignMsg", "laneID": lane, "signMsg": "INVALID"})
+                except ValueError:
+                    pass
+                else:
+                    fail(f"{class_name} accepted a missing/unknown lane")
+
+
+def check_synergy_deadlines_and_storage():
+    import contextlib
+    import io
+    import runpy
+    import threading
+    from unittest.mock import patch
+    import driverSynergy
+
+    config = json.loads(CONFIG_PATH.read_text())["driverConfig"]["driverSynergy"]
+    config["tagStatus"]["authorizationMaxAgeSeconds"] = 0.2
+    fields = {"TagStatus": 1, "AccountType": 3, "VehiclePlateNo": "TEST123", "EntryLane": 6,
+              "TcClass": 1, "VehicleClass": 1, "Fare": 350, "PaidAmount": 350}
+
+    def read(driver, tx_id, lane="06", **extra):
+        return driver.read(dict(id=tx_id, tid=tx_id, lane=lane, side="fast", **extra))
+
+    def finish(driver, lane):
+        deadline = time.monotonic() + 3
+        jobs = driver.lookup_queues[lane]
+        while jobs.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert jobs.unfinished_tasks == 0, "lookup worker lost a job or stopped"
+        return driver.get_responses()
+
+    with tempfile.TemporaryDirectory(prefix="akira-synergy-failures-") as temp_dir:
+        driver = driverSynergy.AkiraDriver(data_dir=temp_dir, driver_config=config)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        commands = []
+
+        def lookup(job, http):
+            calls.append(job["id"])
+            if job["id"] in ("BLOCKED", "SLOW", "CLEAR"):
+                entered.set()
+                assert release.wait(3)
+            return dict(driver._local_failure(job, "00", "eligible"), valid=True,
+                        eligible=True, synergyFields=fields)
+
+        def dispatch(command, job=None):
+            commands.append(command)
+            return {"ok": True, "response": {"laneID": command["laneID"],
+                    "laneState": 1, "gateState": 1, "queueCount": 1}}
+
+        with patch.object(driver, "_perform_lookup", side_effect=lookup), patch.object(driver, "_dispatch", side_effect=dispatch):
+            read(driver, "OLD", date=(datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat())
+            assert finish(driver, "06")[0]["code"] == "PASSAGE_EXPIRED"
+            assert calls == [] and commands == []
+
+            read(driver, "BLOCKED")
+            assert entered.wait(1)
+            read(driver, "QUEUED")
+            read(driver, "OTHER-LANE", lane="07")
+            assert finish(driver, "07")[0]["gateAuthorized"], "lane 06 blocked lane 07"
+            time.sleep(0.22)
+            release.set()
+            results = finish(driver, "06")
+            assert {r["id"] for r in results} == {"BLOCKED", "QUEUED"}
+            assert all(r["code"] == "PASSAGE_EXPIRED" for r in results)
+            assert "QUEUED" not in calls, "expired queued read reached API"
+            assert [c["txID"] for c in commands] == ["OTHER-LANE"], "expired work reached gate/sign"
+
+            entered.clear()
+            release.clear()
+            read(driver, "CLEAR")
+            assert entered.wait(1)
+            read(driver, "CLEAR-QUEUED")
+            driver.lane_clear("06")
+            release.set()
+            results = finish(driver, "06")
+            assert all(r["code"] == "PASSAGE_CANCELLED" for r in results)
+            assert "CLEAR-QUEUED" not in calls
+            read(driver, "NEW-PASSAGE")
+            assert finish(driver, "06")[0]["gateAuthorized"]
+            assert [c["txID"] for c in commands] == ["OTHER-LANE", "NEW-PASSAGE"]
+
+        # Failover cannot revive an expired request, even when an HTTP client
+        # returns after its configured timeout (e.g. a slowly streamed body).
+        class FailingHTTP:
+            def __init__(self):
+                self.calls = 0
+            def request(self, **kwargs):
+                self.calls += 1
+                assert 0 < kwargs["timeout"] <= 0.02
+                time.sleep(0.025)
+                raise TimeoutError("delayed HTTP failure")
+        http = FailingHTTP()
+        job = {"id": "FAILOVER", "tid": "TEST", "lane": "06",
+               "generation": driver.lane_generations["06"], "deadline": time.monotonic() + 0.02}
+        assert driver._perform_lookup(job, http)["code"] == "PASSAGE_EXPIRED"
+        assert http.calls == 1
+
+        # Exercise the real dispatch path, including its ACK read, while status
+        # and log writes fail. Transaction intents must still be recorded first.
+        config["tagStatus"]["authorizationMaxAgeSeconds"] = 2
+        driver = driverSynergy.AkiraDriver(data_dir=temp_dir, driver_config=config)
+        wire = []
+        class AckSocket:
+            def __init__(self, *args, **kwargs):
+                self.command = None
+            def settimeout(self, timeout):
+                pass
+            def connect(self, path):
+                pass
+            def sendall(self, payload):
+                self.command = json.loads(payload)
+                wire.append(self.command)
+            def recv(self, size):
+                return (json.dumps({"ok": True, "response": {
+                    "laneID": self.command["laneID"], "laneState": 1,
+                    "gateState": 1, "queueCount": 1}}) + "\n").encode()
+            def close(self):
+                pass
+
+        atomic_write = driverSynergy._atomic_write_json
+        fail_outcome = True
+        def failing_write(path, value):
+            if Path(path).parent.name == "transactions":
+                if fail_outcome and value.get("state") == "acknowledged":
+                    raise OSError("disk full after ACK")
+                return atomic_write(path, value)
+            raise OSError("status storage unavailable")
+
+        with patch.object(driver, "_perform_lookup", side_effect=lookup), \
+                patch.object(driverSynergy.socket, "socket", AckSocket), \
+                patch.object(driverSynergy, "_atomic_write_json", side_effect=failing_write), \
+                patch.object(driverSynergy.akiraCore, "log", side_effect=OSError("log full")), \
+                patch.object(driverSynergy.os, "write"):
+            read(driver, "ACK-DISK-FAIL")
+            result = finish(driver, "06")[0]
+            assert result["gateAuthorized"] and result["valid"], "status failure changed ACK result"
+            assert len(wire) == 1 and wire[0]["op"] == "addQueue", "status failure generated another command"
+            assert driver.workers["06"].is_alive()
+            assert len(driver.audit_pending) == 1
+            audit_path = next(iter(driver.audit_pending))
+            assert json.loads(audit_path.read_text())["state"] == "delivery_unknown"
+            fail_outcome = False
+            deadline = time.monotonic() + 3
+            while driver.audit_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not driver.audit_pending, "audit did not recover after storage returned"
+            assert json.loads(audit_path.read_text())["state"] == "acknowledged"
+            assert len(wire) == 1, "audit recovery replayed a gate command"
+            read(driver, "AFTER-DISK-FAIL")
+            assert finish(driver, "06")[0]["gateAuthorized"]
+            assert len(wire) == 2
+
+            with patch.object(driverSynergy, "_atomic_write_json", side_effect=OSError("all storage full")):
+                read(driver, "NO-INTENT")
+                result = finish(driver, "06")[0]
+                assert result["code"] == "AUDIT_UNAVAILABLE" and not result["gateAuthorized"]
+                assert len(wire) == 2, "sent unauditable gate authorization"
+
+            # A sign failure must also complete its job and leave the worker alive.
+            with patch.object(driver, "set_sign_msg", side_effect=OSError("sign failure")):
+                read(driver, "BAD-AUTH", tidAuthentic="INAUTHENTIC")
+                assert not finish(driver, "06")[0]["valid"]
+                assert driver.workers["06"].is_alive()
+
+            # Lane-clear/expiry can happen during the pre-send journal write.
+            # The final socket-send check must still prevent the command.
+            for trigger, expected_code in (("clear", "PASSAGE_CANCELLED"), ("delay", "PASSAGE_EXPIRED")):
+                def write_with_race(path, value):
+                    atomic_write(path, value)
+                    if Path(path).parent.name == "transactions" and value.get("state") == "delivery_unknown":
+                        if trigger == "clear":
+                            driver.lane_clear("06")
+                        else:
+                            time.sleep(0.03)
+                driver.authorization_max_age = 0.02 if trigger == "delay" else 2
+                with patch.object(driverSynergy, "_atomic_write_json", side_effect=write_with_race):
+                    read(driver, "PRE-SEND-" + trigger)
+                    result = finish(driver, "06")[0]
+                    assert result["code"] == expected_code and not result["gateAuthorized"]
+                    assert len(wire) == 2, "work expired/cancelled during journal write reached gate"
+                records = [json.loads(path.read_text()) for path in (Path(temp_dir) / "transactions").glob("*.json")]
+                record = next(r for r in records if r["command"]["txID"] == "PRE-SEND-" + trigger)
+                assert record["state"] == "not_sent"
+
+        # Disk-full plus broken stdout must not prevent server ACK delivery.
+        module = runpy.run_path(str(BIN_DIR / "serverSynergy"), run_name="synergy_failure_server")
+        state = {"laneID": "06", "laneState": 1, "gateState": 1, "queueCount": 1, "signMsg": "OK"}
+        class Session:
+            def __init__(self, respond=True):
+                self.sent = []
+                self.respond = respond
+            def send(self, command, timeout):
+                self.sent.append(command)
+            def next_json(self, deadline):
+                if self.respond:
+                    return state
+                time.sleep(max(0, deadline - time.monotonic()) + 0.005)
+                return None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            server = module["AkiraServer"](module["parse_args"](["--data-dir", temp_dir, "--lanes", "06,07"]))
+            with patch.dict(module["StatusTracker"].write.__globals__, {"atomic_write_json": lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))}), \
+                    patch("builtins.print", side_effect=BrokenPipeError("log closed")):
+                result = server.exchange(Session(), {"op": "NOP", "laneID": "06"}, is_command=True)
+                assert result["response"] == state
+                assert server.status.data["commandsCompleted"] == 1
+                assert server.status.data.get("statusWriteError")
+            pending = module["PendingDispatch"]({"op": "NOP", "laneID": "06"}, time.monotonic() - 1)
+            server.channels["06"].dispatch_queue.put(pending)
+            assert server.next_dispatch(server.channels["06"]) is None and pending.result["code"] == "TIMEOUT"
+            assert pending.result["notSent"], "expired queue item was reported as possibly delivered"
+            for budget, expected_sends in ((-1, 0), (0.02, 1)):
+                session = Session(respond=False)
+                try:
+                    server.exchange(session, {"op": "NOP", "laneID": "06"},
+                                    authorization_deadline=time.monotonic() + budget)
+                except module["NoResponse"]:
+                    pass
+                else:
+                    raise AssertionError("expired server exchange succeeded")
+                assert len(session.sent) == expected_sends, "server sent/retried an expired command"
+
+
+def check_synergy_live_dispatch():
+    import driverSynergy
+    from unittest.mock import patch
+    from driverSynergy import AkiraDriver
+
+    class FakeTagResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeTagSession:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, **kwargs):
+            self.calls.append(kwargs)
+            request_payload = kwargs.get("json") or kwargs.get("params") or {}
+            if request_payload.get("op") != "getTagStatus":
+                raise AssertionError("driverSynergy used the wrong tag-status operation")
+            if request_payload.get("plaza") != "002":
+                raise AssertionError("driverSynergy did not preserve its configured fare plaza")
+            tid = request_payload.get("tid")
+            balance = "3.49" if tid == "LOW-BALANCE" else "3.50" if tid == "TAG-1" else "10.00"
+            return FakeTagResponse({
+                "tag": {
+                    "tid": tid, "status": "2" if tid == "INACTIVE" else "1", "balance": balance,
+                    "type": "3", "vehiclePlateNum": "TEST123",
+                    "vehicleClass": "01", "vehicleClassSP": "02",
+                },
+                "fare": None if tid == "NO-FARE" else {
+                    "plazaCode": "002", "vehicleClass": 1,
+                    "fareValue": "3.50", "fareVersion": 2,
+                },
+            })
+
+    def wait_for_result(driver, transaction_id, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for result in driver.get_responses():
+                if result.get("id") == transaction_id:
+                    return result
+            time.sleep(0.01)
+        fail(f"driverSynergy did not return tag result {transaction_id}")
+
+    driver_config = {
+        "tagStatus": {
+            "endpoints": ["http://127.0.0.1:9"],
+            "request": {"op": "getTagStatus", "tidParameter": "tid", "plaza": "002"},
+        },
+        "eligibility": {"allowedStatuses": ["1"]},
+        "dispatch": {"timeoutSeconds": 0.5, "maxResponseBytes": 65536},
+    }
+
+    with tempfile.TemporaryDirectory(prefix="akira-synergy-live-") as temp_dir:
+        data_dir = Path(temp_dir)
+        probes = [socket.socket(), socket.socket()]
+        for probe in probes:
+            probe.bind(("127.0.0.1", 0))
+        ports = {lane: probe.getsockname()[1] for lane, probe in zip(("06", "07"), probes)}
+        lane_ports = ",".join(f"{lane}={port}" for lane, port in ports.items())
+        for probe in probes:
+            probe.close()
+        dispatch_socket = data_dir / "live.sock"
+        server_log = (data_dir / "server.log").open("w+")
+        client_logs = {lane: (data_dir / f"client-{lane}.log").open("w+") for lane in ports}
+        def client_status():
+            return {"lanes": {lane: json.loads((data_dir / f"client-status-{lane}.json").read_text())["lanes"][lane]
+                              for lane in ports}}
+        server = subprocess.Popen(
+            [
+                str(BIN_DIR / "serverSynergy"),
+                "--bind", "127.0.0.1",
+                "--lane-ports", lane_ports,
+                "--data-dir", str(data_dir),
+                "--dispatch-socket", str(dispatch_socket),
+            ],
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+        )
+        clients = []
+        try:
+            deadline = time.monotonic() + 3
+            while not dispatch_socket.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not dispatch_socket.exists():
+                fail("serverSynergy live dispatch socket did not start")
+
+            tag_session = FakeTagSession()
+            driver = AkiraDriver(
+                data_dir=data_dir,
+                driver_config=driver_config,
+                http_session=tag_session,
+            )
+            disconnected_read = {
+                "id": "DISCONNECTED-FAST",
+                "tid": "TAG-OFFLINE",
+                "lane": "06",
+                "side": "fast",
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "AUTHENTIC",
+                "date": datetime.now(timezone.utc).isoformat(),
+            }
+            driver.read(disconnected_read)
+            disconnected = wait_for_result(driver, disconnected_read["id"])
+            if disconnected.get("valid") or disconnected.get("code") != "DISCONNECTED":
+                fail(f"disconnected fast read was not rejected: {disconnected}")
+            if list(data_dir.glob("commands/*.json")):
+                fail("disconnected Synergy command was persisted")
+
+            for lane, port in ports.items():
+                clients.append(subprocess.Popen(
+                    [str(BIN_DIR / "clientSynergyTest.py"), "--host", "127.0.0.1",
+                     "--port", str(port), "--lane", lane,
+                     "--status-file", str(data_dir / f"client-status-{lane}.json"),
+                     "--lock-file", str(data_dir / f"client-{lane}.lock"),
+                     "--passage-seconds", "30"],
+                    stdout=client_logs[lane], stderr=subprocess.STDOUT))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    status = json.loads((data_dir / "status.json").read_text())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    status = {}
+                if status.get("connected"):
+                    time.sleep(0.05)
+                    break
+                time.sleep(0.01)
+            else:
+                fail("Synergy simulator did not connect")
+
+            fast_read = {
+                "id": "LIVE-TEST-1",
+                "tid": "TAG-1",
+                "lane": "06",
+                "side": "fast",
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "UNKNOWN",
+                "date": datetime.now(timezone.utc).isoformat(),
+            }
+            driver.read(fast_read)
+            acknowledged = wait_for_result(driver, fast_read["id"])
+            dispatch = acknowledged.get("dispatch", {})
+            if not acknowledged.get("valid") or not acknowledged.get("gateAuthorized"):
+                fail(f"connected eligible fast read was not authorized: {acknowledged}")
+            if dispatch.get("code") != "ACKNOWLEDGED":
+                fail(f"connected Synergy command was not acknowledged: {dispatch}")
+            if dispatch.get("request", {}).get("txID") != fast_read["id"]:
+                fail("reader transaction ID was not preserved as the Synergy txID")
+            if dispatch.get("request", {}).get("laneID") != "06":
+                fail("Synergy did not use the reader's configured lane 06")
+            if dispatch.get("response", {}).get("gateState") != 1:
+                fail("Synergy acknowledgement did not report the opened gate")
+            if dispatch.get("response", {}).get("queueCount") != 1:
+                fail("first eligible fast read did not create exactly one queue entry")
+            if list(data_dir.glob("commands/*.json")):
+                fail("acknowledged Synergy command was persisted")
+
+            api_calls = len(tag_session.calls)
+            duplicate = driver.read(fast_read)
+            time.sleep(0.1)
+            if duplicate.get("lookup") != "duplicate":
+                fail(f"duplicate reader transaction was not suppressed: {duplicate}")
+            if len(tag_session.calls) != api_calls:
+                fail("duplicate reader transaction repeated the tag-status lookup")
+
+            slow = driver.read({
+                "id": "SLOW-TEST-1",
+                "tid": "TAG-1",
+                "lane": "06",
+                "side": "slow",
+                "passageID": fast_read["id"],
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "AUTHENTIC",
+                "date": datetime.now(timezone.utc).isoformat(),
+            })
+            slow_result = wait_for_result(driver, "SLOW-TEST-1")
+            if slow_result.get("code") != "ALREADY_AUTHORIZED" or len(tag_session.calls) != api_calls:
+                fail(f"slow-side read repeated a fast authorization: {slow_result}")
+
+            driver.read({
+                "id": "LOW-TEST-1",
+                "tid": "LOW-BALANCE",
+                "lane": "06",
+                "side": "fast",
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "AUTHENTIC",
+                "date": datetime.now(timezone.utc).isoformat(),
+            })
+            low_balance = wait_for_result(driver, "LOW-TEST-1")
+            if low_balance.get("valid") or low_balance.get("code") != "INSUFFICIENT_BALANCE":
+                fail(f"low-balance tag was not rejected: {low_balance}")
+            if low_balance.get("signDispatch", {}).get("response", {}).get("queueCount") != 1:
+                fail("low-balance fast read changed the Synergy queue")
+
+            driver.read(dict(fast_read, id="INACTIVE-TEST", tid="INACTIVE",
+                             date=datetime.now(timezone.utc).isoformat()))
+            inactive = wait_for_result(driver, "INACTIVE-TEST")
+            if inactive.get("valid") or inactive.get("code") != "STATUS_2":
+                fail(f"inactive tag with sufficient balance was not rejected: {inactive}")
+            if inactive.get("signDispatch", {}).get("response", {}).get("queueCount") != 1:
+                fail("inactive tag changed the Synergy queue")
+
+            calls_before_auth_failure = len(tag_session.calls)
+            driver.read({
+                "id": "AUTH-TEST-1",
+                "tid": "TAG-2",
+                "lane": "06",
+                "side": "fast",
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "INAUTHENTIC",
+                "date": datetime.now(timezone.utc).isoformat(),
+            })
+            auth_failure = wait_for_result(driver, "AUTH-TEST-1")
+            if auth_failure.get("code") != "AUTHENTICATION_FAILED":
+                fail(f"inauthentic fast read was not rejected: {auth_failure}")
+            if len(tag_session.calls) != calls_before_auth_failure:
+                fail("inauthentic fast read performed a tag-status lookup")
+
+            legacy = driver.trans({"id": "MCP-MUST-NOT-DISPATCH", "tid": "TAG-1"})
+            if legacy.get("code") != "MCP_DISPATCH_DISABLED":
+                fail(f"legacy MCP Synergy dispatch was not disabled: {legacy}")
+            client_state = client_status()
+            if client_state.get("lanes", {}).get("06", {}).get("queueCount") != 1:
+                fail("non-fast or legacy MCP activity changed the Synergy queue")
+
+            driver.read(dict(fast_read, id="NO-FARE-TEST", tid="NO-FARE"))
+            no_fare = wait_for_result(driver, "NO-FARE-TEST")
+            if no_fare.get("valid") or no_fare.get("code") != "LOOKUP_ERROR":
+                fail("a missing fare did not prevent authorization")
+            if no_fare.get("signDispatch", {}).get("response", {}).get("queueCount") != 1:
+                fail("a missing fare changed the Synergy queue")
+
+            if driver.lane_id != "":
+                fail("Synergy default lane ID must be empty")
+            second_lane_read = dict(
+                fast_read, id="LIVE-LANE-07", tid="TAG-07", lane="07",
+                akiraLaneID="OBSOLETE-OVERRIDE",
+                VehicleClass=2, PaidAmount=125,
+            )
+            driver.read(second_lane_read)
+            second_lane = wait_for_result(driver, second_lane_read["id"])
+            if not second_lane.get("valid"):
+                fail(f"lane 07 fast read was not authorized: {second_lane}")
+            if second_lane.get("dispatch", {}).get("request", {}).get("laneID") != "07":
+                fail("Synergy did not preserve configured lane 07 over the old override")
+            if second_lane["dispatch"]["response"].get("laneID") != "07" or second_lane["dispatch"]["response"]["queueCount"] != 1:
+                fail("Synergy combined the two lanes' queues or omitted response laneID")
+
+            lane_states = client_status()["lanes"]
+            if lane_states["06"]["queueCount"] != 1 or lane_states["07"]["queueCount"] != 1:
+                fail("Synergy simulator did not maintain independent lane queues")
+            unchanged_07 = {key: lane_states["07"][key] for key in ("gateState", "queueCount", "signMsg")}
+            sign = driver.set_sign_msg("LANE 06 ONLY", lane="06")
+            if not sign.get("ok") or sign["response"].get("laneID") != "06":
+                fail("Synergy sign command was not acknowledged for lane 06")
+            lane_states = client_status()["lanes"]
+            if lane_states["06"]["signMsg"] != "LANE 06 ONLY" or any(lane_states["07"][key] != value for key, value in unchanged_07.items()):
+                fail("lane 06 sign command changed lane 07")
+            with patch.object(driverSynergy, "_DRIVER", driver):
+                no_tag = driverSynergy.noTag("07", "slow")
+            if no_tag.get("response", {}).get("laneID") != "07":
+                fail("noTag discarded its configured reader lane")
+            lane_states = client_status()["lanes"]
+            if lane_states["06"]["signMsg"] != "LANE 06 ONLY" or lane_states["07"]["signMsg"] != "Tiada Tag":
+                fail("lane 07 no-tag command changed the wrong sign")
+            unchanged_07 = {key: lane_states["07"][key] for key in ("gateState", "queueCount", "signMsg")}
+            closed = driver.close_gate("LANE 06 CLOSED", lane="06")
+            if not closed.get("ok") or closed["response"].get("laneID") != "06":
+                fail("closeGate did not acknowledge lane 06")
+            lane_states = client_status()["lanes"]
+            if lane_states["06"]["gateState"] != 0 or lane_states["06"]["queueCount"] != 0 or any(lane_states["07"][key] != value for key, value in unchanged_07.items()):
+                fail("closing lane 06 altered lane 07's gate, queue, or sign")
+            for lane in (None, "99"):
+                rejected_sign = driver.set_sign_msg("INVALID LANE", lane=lane)
+                if rejected_sign.get("code") != "INVALID_COMMAND":
+                    fail("missing/unknown sign-command lane was not rejected")
+            server_states = json.loads((data_dir / "status.json").read_text())["lanes"]
+            if server_states["06"]["gateState"] != 0 or server_states["07"]["queueCount"] != 1:
+                fail("Synergy server did not retain independent lane status")
+
+            invalid_command = dict(second_lane["dispatch"]["request"], PaidAmount=-1)
+            if driver._dispatch(invalid_command).get("ok"):
+                fail("Synergy server accepted a negative PaidAmount")
+
+            # A validated preceding car is insufficient if the gate has since
+            # closed. The stopped-car fallback must then authorize this same
+            # passage once, and support continuous flow for the following car.
+            def submit_passage(attempt, passage, side="fast", **extra):
+                driver.read(dict(id=attempt, tid=attempt, lane="06", side=side,
+                                 passageID=passage, date=datetime.now(timezone.utc).isoformat(), **extra))
+                return wait_for_result(driver, attempt)
+
+            follow = submit_passage("FOLLOW-CLOSED", "FOLLOW-PASSAGE", laneClearAtFast=False,
+                                    previousPassageID=fast_read["id"])
+            if follow.get("code") != "GATE_NOT_OPEN" or follow.get("deliveryUncertain"):
+                fail(f"occupied-lane fast read reopened a closed gate: {follow}")
+            if not follow["dispatch"].get("notSent"):
+                fail("server did not confirm the blocked addQueue was unsent")
+            fallback = submit_passage("STOPPED-FALLBACK", "FOLLOW-PASSAGE", side="slow",
+                                      lastSeen=datetime.now(timezone.utc).isoformat())
+            if not fallback.get("gateAuthorized") or fallback["dispatch"]["response"]["queueCount"] != 1:
+                fail(f"slow fallback did not open and queue the stopped car: {fallback}")
+            repeated = submit_passage("DIFFERENT-SLOW-TID", "FOLLOW-PASSAGE", side="slow")
+            if repeated.get("code") != "ALREADY_AUTHORIZED":
+                fail("same passage with another observed slow TID authorized twice")
+            continued = submit_passage("FOLLOW-OPEN", "FOLLOWING-PASSAGE", laneClearAtFast=False,
+                                       previousPassageID="FOLLOW-PASSAGE")
+            if not continued.get("gateAuthorized") or continued["dispatch"]["response"]["queueCount"] != 2:
+                fail(f"validated slow passage did not enable open-gate fast flow: {continued}")
+            blocked = submit_passage("PREVIOUS-INVALID", "BLOCKED-PASSAGE", laneClearAtFast=False,
+                                     previousPassageID="UNVALIDATED")
+            if blocked.get("code") != "LANE_OCCUPIED" or blocked.get("gateAuthorized"):
+                fail("occupied lane accepted a car without previous-car validation")
+            stale = submit_passage("STALE-SLOW", "STALE-PASSAGE", side="slow",
+                                   lastSeen=(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat())
+            if stale.get("code") != "PASSAGE_EXPIRED":
+                fail("slow fallback renewed a stale RF observation")
+            states = client_status()["lanes"]
+            if states["06"]["queueCount"] != 2:
+                fail("duplicate, blocked or stale fallback changed the gate queue")
+
+            for client in clients:
+                client.terminate()
+                client.wait(timeout=3)
+            for client_log in client_logs.values():
+                client_log.flush()
+                client_log.seek(0)
+            logged_commands = []
+            logged_responses = []
+            direction_labels = set()
+            for line in (line for log in client_logs.values() for line in log):
+                if line.startswith(("SERVER -> TEST CLIENT", "TEST CLIENT -> SERVER")):
+                    direction_labels.add(line.strip())
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("event") == "server_command_received":
+                    logged_commands.append(record.get("command"))
+                elif record.get("event") == "client_response_sent":
+                    logged_responses.append(record)
+            if direction_labels != {"SERVER -> TEST CLIENT (received)", "TEST CLIENT -> SERVER (sent)"}:
+                fail("Synergy simulator did not label both message directions")
+            sent_response = next((record for record in logged_responses if record.get("txID") == fast_read["id"]), None)
+            if sent_response is None or sent_response.get("response") != dispatch.get("response"):
+                fail("Synergy simulator did not log the response sent for the first fast read")
+            logged_add_queue = next(
+                (
+                    command for command in logged_commands
+                    if isinstance(command, dict)
+                    and command.get("op") == "addQueue"
+                    and command.get("txID") == fast_read["id"]
+                ),
+                None,
+            )
+            if logged_add_queue is None:
+                fail("Synergy simulator did not log the complete addQueue command")
+            logged_lanes = {
+                command.get("txID"): command.get("laneID")
+                for command in logged_commands
+                if isinstance(command, dict) and command.get("op") == "addQueue"
+            }
+            if logged_lanes.get(fast_read["id"]) != "06" or logged_lanes.get("LIVE-LANE-07") != "07":
+                fail("Synergy wire commands did not preserve both configured reader lanes")
+            expected_fields = {
+                "op", "txID", "tagID", "laneID", "msgID", "signMsg", "dateTime",
+                "TagStatus", "AccountType", "VehiclePlateNo", "EntryLane",
+                "TcClass", "VehicleClass", "Fare", "PaidAmount",
+            }
+            if set(logged_add_queue) != expected_fields:
+                fail(
+                    "Synergy simulator addQueue log fields differ from the wire command: "
+                    + str(sorted(logged_add_queue))
+                )
+            expected_metadata = {
+                "TagStatus": 1, "AccountType": 3, "VehiclePlateNo": "TEST123",
+                "EntryLane": 6, "TcClass": 1, "VehicleClass": 1,
+                "Fare": 350, "PaidAmount": 350,
+            }
+            for field, value in expected_metadata.items():
+                if logged_add_queue[field] != value or type(logged_add_queue[field]) is not type(value):
+                    fail(f"wrong Synergy wire value/type for {field}")
+            second_wire = next(command for command in logged_commands if command.get("txID") == "LIVE-LANE-07")
+            if (second_wire["EntryLane"], second_wire["TcClass"], second_wire["VehicleClass"], second_wire["Fare"], second_wire["PaidAmount"]) != (7, 1, 2, 350, 125):
+                fail("distinct observed class or paid amount was lost on the wire")
+            clients = []
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                status = json.loads((data_dir / "status.json").read_text())
+                if not status.get("connected"):
+                    break
+                time.sleep(0.01)
+
+            driver.read({
+                "id": "NEVER-REPLAY",
+                "tid": "TAG-2",
+                "lane": "06",
+                "side": "fast",
+                "tidAuthentic": "AUTHENTIC",
+                "pwAuthentic": "AUTHENTIC",
+                "date": datetime.now(timezone.utc).isoformat(),
+            })
+            rejected = wait_for_result(driver, "NEVER-REPLAY")
+            if rejected.get("valid") or rejected.get("code") != "DISCONNECTED":
+                fail(f"post-disconnect fast read was not rejected: {rejected}")
+            if list(data_dir.glob("commands/*.json")):
+                fail("post-disconnect Synergy command was persisted")
+        finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.terminate()
+                    client.wait(timeout=3)
+            if server.poll() is None:
+                server.terminate()
+                server.wait(timeout=3)
+            server_log.close()
+            for client_log in client_logs.values():
+                client_log.close()
+
+
+def check_numato_inventory():
+    reset_script = BIN_DIR / "resetNumato"
+    if not os.access(reset_script, os.X_OK):
+        fail("resetNumato is not executable")
+
+    config = json.loads(CONFIG_PATH.read_text())
+    configured_boards = []
+
+    def collect_numato(value):
+        if isinstance(value, dict):
+            metadata = value.get("numato")
+            if isinstance(metadata, dict):
+                configured_boards.append({
+                    "name": str(value.get("name", "")),
+                    "address": str(value.get("ip", value.get("address", ""))),
+                    "type": str(metadata.get("type", "unknown")),
+                })
+            for child in value.values():
+                collect_numato(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_numato(child)
+
+    collect_numato(config)
+    if not configured_boards:
+        fail("Akira config has no explicitly tagged Numato boards")
+
+    result = subprocess.run(
+        [str(reset_script)],
+        cwd="/",
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail("resetNumato inventory failed: " + result.stderr.strip())
+    expected_output = [
+        f"Found {len(configured_boards)} Numato board(s)",
+        "Inventory only",
+    ]
+    expected_output.extend(
+        f"{board['name']} ({board['type']}) {board['address']}:80"
+        for board in configured_boards
+    )
+    for expected in expected_output:
+        if expected not in result.stdout:
+            fail(f"resetNumato inventory lacks {expected!r}")
+
+    selected_board = configured_boards[0]
+    selected = subprocess.run(
+        [str(reset_script), "--name", selected_board["name"]],
+        cwd="/",
+        capture_output=True,
+        text=True,
+    )
+    if selected.returncode != 0 or "Found 1 Numato board(s)" not in selected.stdout:
+        fail("resetNumato name selection failed")
+    for board in configured_boards[1:]:
+        if f"{board['name']} ({board['type']})" in selected.stdout:
+            fail("resetNumato name selection included unselected boards")
+
+
+def check_default_root():
+    env = os.environ.copy()
+    env.pop("AKIRA_ROOT", None)
+    env["PYTHONPATH"] = str(BIN_DIR)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    code = """
+import os
+os.makedirs = lambda *args, **kwargs: None
+import akiraCore
+print(akiraCore.PROJECT_ROOT)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail("default-root import failed: " + result.stderr.strip())
+    if result.stdout.strip() != str(ROOT):
+        fail(f"default root is {result.stdout.strip()}, expected {ROOT}")
+
+
+def check_isolated_runtime():
+    expected_config = json.loads(CONFIG_PATH.read_text())
+    expected_apis = expected_config.get("sidraApi")
+    if isinstance(expected_apis, str):
+        expected_apis = [expected_apis]
+    if not expected_apis:
+        fail("sidraApi is not configured")
+
+    with tempfile.TemporaryDirectory(prefix="akira-path-test-") as temp_dir:
+        temp_root = Path(temp_dir)
+        (temp_root / "etc").mkdir()
+        shutil.copy2(CONFIG_PATH, temp_root / "etc" / "akira.cfg")
+
+        code = """
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import subprocess
+import threading
+import time
+import akiraCore
+
+received = []
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        received.append(self.rfile.read(length).decode())
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.handle_request, daemon=True)
+thread.start()
+
+payload = json.dumps({"op": "pathTest"})
+queued = akiraCore.queueXmit(payload, ".test")
+transmitted = akiraCore.xmitEvent(
+    "http://127.0.0.1:" + str(server.server_port),
+    payload,
+)
+thread.join(timeout=2)
+server.server_close()
+
+probe = subprocess.Popen([
+    os.environ.get("PYTHON", "python3"),
+    "-c",
+    "import time; time.sleep(5)",
+    "akira-path-test-process",
+])
+time.sleep(0.1)
+process_detected = akiraCore.isRunning("akira-path-test-process")
+false_process_detected = akiraCore.isRunning("akira-path-test-process-missing")
+probe.terminate()
+probe.wait(timeout=2)
+
+runtime_dirs = [
+    akiraCore.LOG_DIR,
+    akiraCore.IMG_DIR,
+    akiraCore.ANPR_DIR,
+    akiraCore.TMP_DIR,
+    akiraCore.TRN_WORKING_DIR,
+    akiraCore.TRN_DONE_DIR,
+    akiraCore.TRN_TMP_DIR,
+    akiraCore.XMIT_STATE_DIR,
+    akiraCore.XMIT_BAD_DIR,
+    akiraCore.MASS_DIR,
+    akiraCore.STREAM_DIR,
+    akiraCore.MON_DIR,
+        akiraCore.DRV_DIR,
+        akiraCore.RTS_DIR,
+        akiraCore.SYNERGY_DIR,
+    ]
+print(json.dumps({
+    "root": akiraCore.PROJECT_ROOT,
+    "apis": akiraCore.sidraApiList(),
+    "dirs": all(os.path.isdir(path) for path in runtime_dirs),
+    "queued": queued,
+    "queue_files": len([name for name in os.listdir(akiraCore.XMIT_DIR) if name.endswith(".test")]),
+    "transmitted": transmitted,
+    "received": received,
+    "process_detected": process_detected,
+    "false_process_detected": false_process_detected,
+}))
+"""
+        env = os.environ.copy()
+        env["AKIRA_ROOT"] = str(temp_root)
+        env["PYTHONPATH"] = str(BIN_DIR)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd="/",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            fail("isolated import failed: " + result.stderr.strip())
+
+        details = json.loads(result.stdout)
+        if details["root"] != str(temp_root):
+            fail(f"wrong isolated root: {details['root']}")
+        if details["apis"] != expected_apis:
+            fail("sidraApi changed during isolated load")
+        if not details["dirs"]:
+            fail("runtime directory initialization is incomplete")
+        if not details["queued"] or details["queue_files"] != 1:
+            fail("isolated xmit queue did not write under the Akira root")
+        if not details["transmitted"] or details["received"] != ['{"op": "pathTest"}']:
+            fail("mock sidraApi transmission failed")
+        if not details["process_detected"] or details["false_process_detected"]:
+            fail("argv-aware process detection failed")
+
+        expected_bin = str(temp_root / "bin")
+        for command in ("up", "down", "rrts"):
+            control = subprocess.run(
+                [str(BIN_DIR / command), "--dry-run"],
+                cwd="/",
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if control.returncode != 0:
+                fail(f"{command} dry run failed: {control.stderr.strip()}")
+            if expected_bin not in control.stdout:
+                fail(f"{command} dry run did not use the isolated Akira bin path")
+
+
+def main():
+    check_legacy_paths()
+    check_legacy_names()
+    check_python_syntax()
+    check_shell_syntax()
+    check_logrotate_setup()
+    check_configs()
+    check_reader_topology()
+    check_mass_sensor_mapping()
+    check_mass_transition_reporting()
+    check_reader_passage_flow()
+    check_numato_transport()
+    check_mcp_restart_backlog()
+    check_synergy_transaction_fields()
+    check_synergy_lane_protocol()
+    check_synergy_live_dispatch()
+    subprocess.run([sys.executable, str(BIN_DIR / "test-synergy-ports")], check=True)
+    check_synergy_deadlines_and_storage()
+    check_synergy_passage_delivery()
+    check_numato_inventory()
+    check_multilane_reader()
+    check_reader_reconnect_strategy()
+    check_default_root()
+    check_isolated_runtime()
+    print("PASS: Akira path migration and offline configuration checks")
+
+
+if __name__ == "__main__":
+    main()

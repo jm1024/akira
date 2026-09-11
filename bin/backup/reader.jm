@@ -15,13 +15,13 @@ import os
 import signal
 import traceback
 
-import sidraCore
+import akiraCore
 
 import importlib
 
 #dynamically load all read drivers
 readDrivers = {}
-for driver in sidraCore.driversRead:
+for driver in akiraCore.driversRead:
     readDrivers[driver] = importlib.import_module(driver)
     print("Loaded read driver: " + driver)
 
@@ -69,7 +69,7 @@ region = "" # JM implement from .cfg
 #frequency 918.25 MHz - non MY
 #frequency = "918250"
 #frequency 919.25 - MY
-frequency = "919250" # loaded from sidra.cfg
+frequency = "919250" # loaded from akira.cfg
 
 DEBUG = True
 DEBUG_READER_RECV = False
@@ -100,15 +100,15 @@ GEN_FAKE_TAG_RESPONSE = True
 
 #event log
 LOG_EVENTS = True
-LOG_EVENTS_FILE = "/var/sidra/log/events.log"
+LOG_EVENTS_FILE = "/var/akira/log/events.log"
 
 #detailed log # of reads etc
 LOG_STATS = True
-LOG_STATS_FILE = "/var/sidra/log/stats.log"
+LOG_STATS_FILE = "/var/akira/log/stats.log"
 
 #log all reads
 LOG_READS = False
-LOG_READS_FILE = "/var/sidra/log/reads.log"
+LOG_READS_FILE = "/var/akira/log/reads.log"
 
 
 AUTH_AUTHENTIC = "AUTHENTIC"
@@ -188,12 +188,12 @@ def monitorNotifications(tn, stop_event):
                 print("massQ FULL - laneThread not draining?")
 
             if LOG_READS:
-                sidraCore.appendFile(LOG_READS_FILE, json.dumps(massEvent, default=sidraCore.jsonConverter) + '\n')
+                akiraCore.appendFile(LOG_READS_FILE, json.dumps(massEvent, default=akiraCore.jsonConverter) + '\n')
 
             try:
-                massFile = sidraCore.MASS_DIR + "/" + str(lane) + sidraCore.STATE_EXTENSION_MASS
+                massFile = akiraCore.MASS_DIR + "/" + str(lane) + akiraCore.STATE_EXTENSION_MASS
                 #print(massFile)
-                sidraCore.writeFile(massFile, json.dumps(massEvent, default=sidraCore.jsonConverter))
+                akiraCore.writeFile(massFile, json.dumps(massEvent, default=akiraCore.jsonConverter))
             except Exception as ex:
                 msg  = f"reader.monitorNotifications error writing mass file {lane} {str(ex)}"
                 print(msg)
@@ -501,7 +501,7 @@ def parseEvent(event):
 
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(arrival, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(arrival, default=akiraCore.jsonConverter) + '\n')
 
         if DEBUG_ARRIVE:
             output = "==============================================="
@@ -530,7 +530,7 @@ def parseEvent(event):
         arrival['lane'] = lane
         arrival['side'] = side
 
-        #dtDate = sidraCore.rfStrToDt(date)
+        #dtDate = akiraCore.rfStrToDt(date)
 
 
         report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
@@ -549,7 +549,7 @@ def parseEvent(event):
         report['side'] = side
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=akiraCore.jsonConverter) + '\n')
 
         # if not squelched add
         if not isSquelched(tid, side):
@@ -622,7 +622,7 @@ def parseEvent(event):
         except Exception as ex:
             print("ERROR: reader: truncating tid: " + str(ex))
 
-        #date = sidraCore.rfStrToDt(sDate)
+        #date = akiraCore.rfStrToDt(sDate)
         date = datetime.now() # <--- JM GO BACK TO TITAN TIME
 
         report = {'date':date, 'antenna':antenna, 'rssi':rssi, 'epc':epc, 'tid':tid, 'userData':userData, 'tidAuthentic':tidAuthentic, 'pwAuthentic':pwAuthentic, 'freq':freq}
@@ -646,7 +646,7 @@ def parseEvent(event):
         report['side'] = side
 
         if LOG_READS:
-            sidraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=sidraCore.jsonConverter) + '\n')
+            akiraCore.appendFile(LOG_READS_FILE, json.dumps(report, default=akiraCore.jsonConverter) + '\n')
 
         # if not squelched add
         if not isSquelched(report['tid'], report['side']):
@@ -747,13 +747,13 @@ def parseEvent(event):
             if userData == "":
                 userData = arrivals[epc].get('userData')
             #print(arrivals)
-            arrivals = sidraCore.removeDictKey(arrivals, epc)
+            arrivals = akiraCore.removeDictKey(arrivals, epc)
             #print(arrivals)
         else:
             #print("NO ARRIVAL DATA")
             if DEBUG_ARRIVAL_MATCH:
                 print("NO ARRIVAL DATA")
-            sidraCore.log("NO ARRIVAL DATA: " + str(epc))
+            akiraCore.log("NO ARRIVAL DATA: " + str(epc))
 
 
         #print(epc)
@@ -774,11 +774,11 @@ def parseEvent(event):
 def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userData, tidAuthentic, pwAuthentic):
 
     # get plate and class from userData
-    tagPlate, tagClass = sidraCore.decodeUserData(userData)
+    tagPlate, tagClass = akiraCore.decodeUserData(userData)
 
     trnId = str(uuid.uuid4())
 
-    trn = sidraCore.trnPrefix() + trnId
+    trn = akiraCore.trnPrefix() + trnId
     #tDate = str(date) #datetime.now()
     #print(" ------>DT " + str(dt))
     #print("RSSI trans: " + str(rssi))
@@ -812,7 +812,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    driver.read(tData)
     #driverRts.read(tData)
 
-    #tDate = sidraCore.rfStrToDt(tDate)
+    #tDate = akiraCore.rfStrToDt(tDate)
     #sAuth = "n"
     #if pwAuthentic == "AUTHENTIC":
     #    sAuth = "y"
@@ -838,7 +838,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #    if hasattr(driverModule, "read"):
     #        driverModule.read(tData)
 
-    sidraCore.saveTransaction(trn + sidraCore.TRN_EXTENSION_READER, json.dumps(tData, default=sidraCore.jsonConverter))
+    akiraCore.saveTransaction(trn + akiraCore.TRN_EXTENSION_READER, json.dumps(tData, default=akiraCore.jsonConverter))
 
     output = str(date)
     output = output + " RF  > lane: " + str(lane)
@@ -852,7 +852,7 @@ def transaction(date, reader, lane, side, antenna, rssi, reads, epc, tid, userDa
     #output = output + " tagP: " + str(tagPlate)
     #output = output + " date: " + str(dt)
 
-    sidraCore.log(output)
+    akiraCore.log(output)
 
 ##################################################
 # threads
@@ -881,7 +881,7 @@ def massThread(stop_event):
     global tnConn
     #print("massThread init: " + str(lane))
 
-    for mass in sidraCore.massSensors:
+    for mass in akiraCore.massSensors:
         if mass["lane"] == lane:
             massName = mass["name"]
             #lane = mass["lane"]
@@ -1015,7 +1015,7 @@ def laneThread(stop_event):
                             try:
                                 if response['type'] == "tagResult":
                                     out = f">>> {response['tid']} code: {response['code']} {response['valid']}"
-                                    sidraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
+                                    akiraCore.appendFile(LOG_EVENTS_FILE, out + '\n')
                             except Exception as ex:
                                 print(f"reader.laneThread() error logging response {str(ex)}")
 
@@ -1024,7 +1024,7 @@ def laneThread(stop_event):
                         #send response to sidraApi
                         response['op'] = "addResp"
                         #print("XMIT RESP PREP")
-                        sidraCore.queueXmit(json.dumps(response, default=sidraCore.jsonConverter), sidraCore.QUEUE_EXTENSION_RESPONSE)
+                        akiraCore.queueXmit(json.dumps(response, default=akiraCore.jsonConverter), akiraCore.QUEUE_EXTENSION_RESPONSE)
 
                         if lastFastGood:
                             if response['tid'] == lastFastTid and response['valid']:
@@ -1131,7 +1131,7 @@ def laneThread(stop_event):
 
                 #flushReports(ANTENNA_FAST)
                 if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
+                    akiraCore.appendFile(LOG_STATS_FILE,f"fast: {read['tid']} {datetime.now().time()}\n")
 
                 #make a fake tag response - only for debugging
                 if GEN_FAKE_TAG_RESPONSE:
@@ -1160,7 +1160,7 @@ def laneThread(stop_event):
 
                 #flushReports(ANTENNA_SLOW)
                 if LOG_STATS:
-                    sidraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
+                    akiraCore.appendFile(LOG_STATS_FILE,f"slow: {read['tid']} {datetime.now().time()}\n")
 
             #################
             #check for expired windows
@@ -1218,14 +1218,14 @@ def laneThread(stop_event):
                             fcs = "   -"
                         if scs == "   0":
                             scs = "   -"
-                        sidraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
+                        akiraCore.appendFile(LOG_STATS_FILE,f"{fcs}{scs}  {datetime.now().time()}\n")
                 lastFc = fc
                 lastSc = sc
 
         except Exception as ex:
             print(f"laneThread crashed: {ex}")
             traceback.print_exc()
-            sidraCore.log(f"laneThread crashed: {ex}")
+            akiraCore.log(f"laneThread crashed: {ex}")
 
 #######################
 def checkReads(window, side, minReads):
@@ -1370,13 +1370,13 @@ def checkReads(window, side, minReads):
                             print("#############################################")
                             print(f"Multi Pool Squelch - {tid}")
                             print("#############################################")
-                            sidraCore.log(f"Multi Pool Squelch -> {tid} kept: {accepted['tid']}")
+                            akiraCore.log(f"Multi Pool Squelch -> {tid} kept: {accepted['tid']}")
                             addSquelch(tid, ANTENNA_FAST, SQUELCH_TIME)
                             addSquelch(tid, ANTENNA_SLOW, SQUELCH_TIME)
             if DEBUG:
                 out = f"<<< {side}: {accepted['tid']} count: {accepted['count']} {accepted['tidAuthentic']}"
                 if LOG_EVENTS:
-                    sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
+                    akiraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
                 print(out)
             ret = accepted
 
@@ -1435,7 +1435,7 @@ def addSquelch(tid, side, duration):
         removeReports(tid, side)
 
         if LOG_STATS and DEBUG_SQUELCH:
-            sidraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
+            akiraCore.appendFile(LOG_STATS_FILE,f"squelch: {tid}\n")
 
         if DEBUG_SQUELCH:
             print(f"squelched: {tid} {side} {end} {datetime.now()}")
@@ -1592,10 +1592,10 @@ def debugMass(massTrip, massMain, massRear, fastWindow, slowWindow, lastMass):
     print(out)
 
     if LOG_STATS:
-        sidraCore.appendFile(LOG_STATS_FILE,out + '\n')
+        akiraCore.appendFile(LOG_STATS_FILE,out + '\n')
 
     if LOG_EVENTS:
-        sidraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
+        akiraCore.appendFile(LOG_EVENTS_FILE,out + '\n')
 
     if massTrip == 0 and massMain == 0 and massRear == 0:
         print('')
@@ -1686,9 +1686,9 @@ CONFIGURE = True
 
 readerName = sys.argv[1]
 
-sidraCore.log("Reader " + readerName + " Starting")
+akiraCore.log("Reader " + readerName + " Starting")
 
-for reader in sidraCore.readers:
+for reader in akiraCore.readers:
     #print(reader['name'])
     if reader['name'] == readerName:
         readerIp = reader['ip']
@@ -1848,4 +1848,3 @@ try:
         time.sleep(1)
 except KeyboardInterrupt:
     stopThreads(stop_event, threads)
-

@@ -12,7 +12,7 @@ import requests
 #import psutil
 
 # sidra imports
-sys.path.append('/var/sidra/bin')
+sys.path.append('/var/akira/bin')
 import fileLock
 
 VERSION = "0.02.06"
@@ -44,24 +44,24 @@ servers = []
 imageRetentionSeconds = 36000
 trnRetentionSeconds = 36000
 
-BIN_DIR = "/var/sidra/bin"
-LOG_DIR = "/var/sidra/log"
-ETC_DIR = "/var/sidra/etc"
-IMG_DIR = "/var/sidra/img"
-ANPR_DIR = "/var/sidra/anpr"
-TMP_DIR = "/var/sidra/tmp"
-TRN_DIR = "/var/sidra/trn"
-TRN_WORKING_DIR = "/var/sidra/trn/working"
-TRN_DONE_DIR = "/var/sidra/trn/done"
-TRN_TMP_DIR = "/var/sidra/trn/tmp"
-XMIT_DIR = "/var/sidra/xmit"
-MASS_DIR = "/var/sidra/mass"
-STREAM_DIR = "/var/sidra/stream"
-LOG_FILE = "sidra.log"
+BIN_DIR = "/var/akira/bin"
+LOG_DIR = "/var/akira/log"
+ETC_DIR = "/var/akira/etc"
+IMG_DIR = "/var/akira/img"
+ANPR_DIR = "/var/akira/anpr"
+TMP_DIR = "/var/akira/tmp"
+TRN_DIR = "/var/akira/trn"
+TRN_WORKING_DIR = "/var/akira/trn/working"
+TRN_DONE_DIR = "/var/akira/trn/done"
+TRN_TMP_DIR = "/var/akira/trn/tmp"
+XMIT_DIR = "/var/akira/xmit"
+MASS_DIR = "/var/akira/mass"
+STREAM_DIR = "/var/akira/stream"
+LOG_FILE = "akira.log"
 ERR_LOG_FILE = "errors.log"
 TRN_LOG_FILE = "transactions.log"
 MCP_LOG_FILE = "mcp.log"
-CONFIG_FILE = "sidra.cfg"
+CONFIG_FILE = "akira.cfg"
 
 STATE_EXTENSION_MASS = ".ms"
 STATE_EXTENSION_MASS_LOCK = ".ml"
@@ -129,7 +129,7 @@ def loadConfig():
     global logMode
 
     if not os.path.isfile(ETC_DIR + "/" + CONFIG_FILE):
-        log("sidraCore: loadConfig: config missing using defaults")
+        log("akiraCore: loadConfig: config missing using defaults")
         return
 
     #Open and read the JSON file
@@ -384,7 +384,7 @@ def decodeUserData(userData):
         tagPlate = tagPlate.strip('\0x00')
         #tagPlate = plateHex.decode("hex")
     except Exception as ex:
-        #print("sidraCore.decodeUserData err: " + str(ex))
+        #print("akiraCore.decodeUserData err: " + str(ex))
         log("decudeUserData() error: " + str(ex) + " userData: " + str(userData))
 
     return tagPlate, tagClass
@@ -427,7 +427,7 @@ def massState(name):
         raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
         ret = json.loads(raw)
     except Exception as ex:
-        msg = f"sidraCore.massState() error: {ex}"
+        msg = f"akiraCore.massState() error: {ex}"
         print(msg)
 
     return ret
@@ -763,7 +763,7 @@ def appendFile(fileName, data):
 
         return True
     except Exception as ex:
-        log("sidraCore.appendFile error: " + str(fileName) + "  " + str(ex))
+        log("akiraCore.appendFile error: " + str(fileName) + "  " + str(ex))
         return False
 
 #########################################

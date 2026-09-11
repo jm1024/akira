@@ -1,3 +1,5 @@
 #!/bin/bash
-cd /var/sidra/img
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+AKIRA_ROOT="${AKIRA_ROOT:-$(dirname -- "$SCRIPT_DIR")}"
+cd "$AKIRA_ROOT/img" || exit 1
 python3 -m http.server 2080 &

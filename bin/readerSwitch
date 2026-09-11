@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 import sys
-import time
-import telnetlib
 
-USER = b"admin"
-PASS = b"admin"
+from numatoTelnet import NumatoConnection
+
+USER = "admin"
+PASS = "admin"
 PORT = 23
 
 RELAY_INDEX = "000"  # change to 1 if firmware is 1-based
 
 #######################
-def state_to_cmd(s: str) -> bytes:
+def state_to_cmd(s: str) -> str:
     v = s.strip().lower()
     if v in ("1", "on", "true", "high"):
-        return b"on"
+        return "on"
     if v in ("0", "off", "false", "low"):
-        return b"off"
+        return "off"
     raise ValueError("state must be 0/1 or off/on")
 
 ##############################################
@@ -35,30 +35,28 @@ def main() -> int:
     tn = None 
 
     try:
-        tn = telnetlib.Telnet(ip, PORT, timeout=5)
+        tn = NumatoConnection(ip, PORT, timeout=5)
 
         # Wait for "User Name:" then send username
-        tn.read_until(b"User Name", timeout=5)
-        tn.write(USER + b"\r\n")
+        tn.read_until("User Name", timeout=5)
+        tn.write_line(USER)
 
         # Wait for "Password:" then send password
-        tn.read_until(b"Password", timeout=5)
-        tn.write(PASS + b"\r\n")
+        tn.read_until("Password", timeout=5)
+        tn.write_line(PASS)
 
         # Give it a moment and read whatever it prints
-        time.sleep(0.2)
-        out = tn.read_very_eager().lower()
+        out = tn.read_available(timeout=0.2).lower()
         
-        if b"denied" in out or b"bad user" in out:
+        if "denied" in out or "bad user" in out:
             print("Auth failed: access denied", file=sys.stderr)
             return 3  # The finally block will still run before it actually returns
 
         # Send relay command
-        cmd = b"relay " + onoff + b" " + str(RELAY_INDEX).encode("ascii") + b"\r\n"
-        tn.write(cmd)
+        cmd = "relay " + onoff + " " + RELAY_INDEX
+        tn.write_line(cmd)
 
-        time.sleep(0.2)
-        resp = tn.read_very_eager().decode("ascii", errors="replace").strip()
+        resp = tn.read_available(timeout=0.2).strip()
         print(resp if resp else "Command sent.")
         
         return 0

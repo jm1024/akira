@@ -2,8 +2,8 @@
 #if [$1 -eq 0]
 #then
 #    echo no lane
-#    tail -f /var/sidra/log/sidra.log
+#    tail -f /var/akira/log/akira.log
 #else
 #    echo lane
-    tail -f /var/sidra/log/sidra.log 
+    tail -f /var/akira/log/akira.log
 #fi

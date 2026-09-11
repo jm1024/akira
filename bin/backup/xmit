@@ -8,7 +8,7 @@ import uuid
 import sys
 import fcntl
 
-import sidraCore
+import akiraCore
 
 DEBUG = True
 DEBUG_LOAD = True
@@ -33,7 +33,7 @@ def isFileLocked(path):
 ##############################################################################################
 # main
 
-#sidraCore.log("mcp Starting")
+#akiraCore.log("mcp Starting")
 
 run = True
 
@@ -47,12 +47,12 @@ events = []
 
 while run:
 
-    #sidraCore.log("mcp L-1")
+    #akiraCore.log("mcp L-1")
     #if DEBUG:
     #    print("LOAD: init")
 
     # get list of new files
-    files = sidraCore.fileList(sidraCore.XMIT_DIR, newestFirst=True, max=100)
+    files = akiraCore.fileList(akiraCore.XMIT_DIR, newestFirst=True, max=100)
 
     #let files finish writing out to disk
     time.sleep(.1) # was .5 before file locking implemented - if file locks dont work maybe make this 1
@@ -65,7 +65,7 @@ while run:
     # work on each file
     for file in files:  # JM wrap this in a try
 
-        fullPath = sidraCore.XMIT_DIR + "/" + file
+        fullPath = akiraCore.XMIT_DIR + "/" + file
         #if not isFileStable(fullPath):
         #    print("File still growing")
         #    continue
@@ -76,28 +76,28 @@ while run:
         xmitResp = False
 
         #load contents
-        #data = json.loads(sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file))
-        data = sidraCore.readFile(sidraCore.XMIT_DIR + "/" + file)
+        #data = json.loads(akiraCore.readFile(akiraCore.XMIT_DIR + "/" + file))
+        data = akiraCore.readFile(akiraCore.XMIT_DIR + "/" + file)
 
         fileCount = fileCount + 1
 
         try:
             dataSize = len(data)
             ts = datetime.now()
-            xmitResp = sidraCore.xmitEvent(sidraCore.sidraApi, data)
+            xmitResp = akiraCore.xmitEvent(akiraCore.sidraApi, data)
             td = datetime.now() - ts
             if xmitResp:
                 if DEBUG:
                     print("xmit: ok: " + str(file) + " " + str(td.microseconds / 1000) + " " + str(dataSize))
-                sidraCore.deleteFile(sidraCore.XMIT_DIR + "/" + file)
+                akiraCore.deleteFile(akiraCore.XMIT_DIR + "/" + file)
             else:
                 msg = "xmit: failed: " + str(file)
                 if DEBUG:
                     print(msg)
-                sidraCore.log((msg))
+                akiraCore.log((msg))
                 time.sleep(.5)
         except Exception as ex:
-            sidraCore.log("xmit: error: " + str(ex), True)
+            akiraCore.log("xmit: error: " + str(ex), True)
 
 
     if DEBUG:

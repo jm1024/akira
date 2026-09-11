@@ -4,9 +4,9 @@ import uuid
 import json
 import os
 
-import sidraCore
+import akiraCore
 
-DATA_DIR = "/var/sidra/drv"
+DATA_DIR = "/var/akira/drv"
 
 ENABLE_FILE = "akiraEnabled.rts"
 
@@ -28,18 +28,18 @@ RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "02":"Insufficient Balance",
 #############################
 def setEnable(state = True):
 	try:
-		#sidraCore.log(f"{datetime.now()} driverRts.setEnable() {str(state)}") # test this!
-		sidraCore.log("driverRts.setEnable() " + str(state))
+		#akiraCore.log(f"{datetime.now()} driverRts.setEnable() {str(state)}") # test this!
+		akiraCore.log("driverRts.setEnable() " + str(state))
 	except Exception as ex:
 		print("driverRts.setEnable() error " + str(ex))
-	sidraCore.writeFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
+	akiraCore.writeFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
 
 #############################
 def getEnable():
 
 	ret = True
 	try:
-		result = sidraCore.readFile(sidraCore.TMP_DIR + "/" + ENABLE_FILE)
+		result = akiraCore.readFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE)
 		if result == "False":
 			ret = False
 	except Exception as ex:
@@ -63,7 +63,7 @@ def getResponses():
 
 			try:
 				# read contents
-				data = sidraCore.readFile(fullPath)
+				data = akiraCore.readFile(fullPath)
 
 				# oJSON-decode
 				data = json.loads(data)
@@ -71,13 +71,13 @@ def getResponses():
 				responses.append(data)
 
 			except Exception as ex:
-				sidraCore.log("driverRts.getResponses() error processing " + fname + " : " + str(ex))
+				akiraCore.log("driverRts.getResponses() error processing " + fname + " : " + str(ex))
 
 			# delete file
-			sidraCore.deleteFile(fullPath)
+			akiraCore.deleteFile(fullPath)
 
 	except Exception as ex:
-		sidraCore.log("driverRts.getResponses() error listing dir: " + str(ex))
+		akiraCore.log("driverRts.getResponses() error listing dir: " + str(ex))
 
 	parsed = []
 	try:
@@ -88,7 +88,7 @@ def getResponses():
 
 	except Exception as ex:
 		err = "driverRts.getResponses() error parsing " + str(ex)
-		sidraCore.log(err)
+		akiraCore.log(err)
 		print(err)
 
 	return parsed
@@ -144,7 +144,7 @@ def read(data):
 	# get sensor name for this lane
 	thisLane = data['lane']
 	thisDt = data['date']
-	#thisDt = sidraCore.rfStrToDt(thisDtS)
+	#thisDt = akiraCore.rfStrToDt(thisDtS)
 	thisTID = data['tid']
 	shortTID = thisTID[-5:]
 	shortTime = thisDt.time()
@@ -161,11 +161,11 @@ def read(data):
 
 	if DEBUG_XMIT:
 		print(xmitDebug)
-		sidraCore.appendFile("/var/sidra/log/rtsDebug.log", xmitDebug + "\n")
+		akiraCore.appendFile("/var/akira/log/rtsDebug.log", xmitDebug + "\n")
 
 	#dt = datetime.now().isoformat()
 	#thisDtS = data['date']
-	#thisDt = sidraCore.rfStrToDt(thisDtS)
+	#thisDt = akiraCore.rfStrToDt(thisDtS)
 	dt = thisDt.isoformat()
 
 	authentic = data['tidAuthentic']
@@ -191,7 +191,7 @@ def read(data):
 			"body": {
 				"TxID": data['id'],
 				"TagID": data['tid'],
-				"PlazaID": sidraCore.plazaId,
+				"PlazaID": akiraCore.plazaId,
 				"LaneID": data['lane'],
 				"DetectedTime": dt,
 				"Antenna": side,
@@ -200,7 +200,7 @@ def read(data):
 		}
 
 		if xmit:
-			sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			akiraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
 
@@ -216,7 +216,7 @@ def read(data):
 			"body": {
 				"TxID": data['id'],
 				"TagID": data['tid'],
-				"PlazaID": sidraCore.plazaId,
+				"PlazaID": akiraCore.plazaId,
 				"LaneID": data['lane'],
 				"DetectedTime": dt,
 				"Result":"01",
@@ -226,7 +226,7 @@ def read(data):
 		}
 
 		if xmit:
-			sidraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			akiraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
 
@@ -285,7 +285,7 @@ def trans_DISABLED(data):
 			}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=akiraCore.jsonConverter))
 
 	msg = ""
 	xmit = True
@@ -309,7 +309,7 @@ def trans_DISABLED(data):
 		}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=akiraCore.jsonConverter))
 
 
 ######################
@@ -334,7 +334,7 @@ def noTag(lane, antenna):
 		'body':{
 		'TxID':transId,
 		'TagID':None,
-		'PlazaID':str(sidraCore.plazaId),
+		'PlazaID':str(akiraCore.plazaId),
 		'LaneID':str(lane),
 		'Result':"00",
 		'Antenna':str(antenna),
@@ -344,7 +344,7 @@ def noTag(lane, antenna):
 		}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_READ, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" + transId + EXT_READ, json.dumps(msgNTD, default=akiraCore.jsonConverter))
 
 ######################
 def laneClear(lane):
@@ -366,7 +366,7 @@ def laneClear(lane):
 		},
 		'body':{
 		'TxID':transId,
-		'PlazaID':str(sidraCore.plazaId),
+		'PlazaID':str(akiraCore.plazaId),
 		'LaneID':str(lane),
 		'Result':"00",
 		'ClearedTime':datetime.now().isoformat(),
@@ -375,7 +375,7 @@ def laneClear(lane):
 		}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=akiraCore.jsonConverter))
 
 ######################
 def cam(data):
@@ -391,14 +391,14 @@ def cam(data):
 	print(data)
 
 
-	dt = sidraCore.camStrToDt(data['transit']['timestamps']['start'])
+	dt = akiraCore.camStrToDt(data['transit']['timestamps']['start'])
 	#dt = thisDt.isoformat()
 	id = str(uuid.uuid4())
 
 	# get dateTime
 	try:
 		thisDtS = data['transit']['timestamps']["image"]
-		thisDt = sidraCore.camStrToDt(thisDtS)
+		thisDt = akiraCore.camStrToDt(thisDtS)
 	except:
 		thisDt = datetime.now()
 
@@ -414,7 +414,7 @@ def cam(data):
 
 	#get plate score
 	try:
-		plateScore = sidraCore.scoreToInt(data['transit']['plate']['score'])
+		plateScore = akiraCore.scoreToInt(data['transit']['plate']['score'])
 	except:
 		plateScore = 0
 
@@ -430,9 +430,9 @@ def cam(data):
 
 	imageBin = ""
 	try:
-		imageBin = sidraCore.encodeImage(sidraCore.IMG_DIR + "/" + imageFile)
+		imageBin = akiraCore.encodeImage(akiraCore.IMG_DIR + "/" + imageFile)
 	except Exception as ex:
-		sidraCore.log("ERROR: mcp loading main image " + imageFile + " " + str(ex), True)
+		akiraCore.log("ERROR: mcp loading main image " + imageFile + " " + str(ex), True)
 
 
 	msg = {
@@ -443,7 +443,7 @@ def cam(data):
 		'body':{
 		'TxID':id,
 		'TagID':'',
-		'PlazaID':sidraCore.plazaId,
+		'PlazaID':akiraCore.plazaId,
 		'LaneID':lane,
 		'CapturedTime':dt.isoformat(),
 		'AnprID':id,
@@ -454,7 +454,7 @@ def cam(data):
 		}
 
 	if xmit:
-		sidraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=sidraCore.jsonConverter))
+		akiraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=akiraCore.jsonConverter))
 
 ######################
 def genFakeTagResponse_X(tid):
@@ -492,4 +492,4 @@ def writeResponse(msg):
 
 	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + EXT_RESPONSE
 	responseFile = DATA_DIR + "/" + fileName
-	sidraCore.writeFile(responseFile, json.dumps(msg))
+	akiraCore.writeFile(responseFile, json.dumps(msg))

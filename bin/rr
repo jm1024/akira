@@ -1,3 +1,42 @@
 #!/bin/bash
-killall reader
-./readerInit
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+READER_PATTERN="$SCRIPT_DIR/reader "
+GRACE_SECONDS=8
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: rr must run as root (use sudo $SCRIPT_DIR/rr)." >&2
+    exit 1
+fi
+
+# SIGINT lets reader stop its workers, disable Numato notifications, and close
+# the GPIO sessions before a replacement process tries to reconnect.
+pkill -INT -f -- "$READER_PATTERN" 2>/dev/null || true
+
+for ((attempt = 0; attempt < GRACE_SECONDS * 10; attempt++)); do
+    if ! pgrep -f -- "$READER_PATTERN" >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+if pgrep -f -- "$READER_PATTERN" >/dev/null; then
+    echo "WARNING: reader did not stop gracefully; sending SIGTERM." >&2
+    pkill -TERM -f -- "$READER_PATTERN" 2>/dev/null || true
+    sleep 1
+fi
+
+if pgrep -f -- "$READER_PATTERN" >/dev/null; then
+    echo "WARNING: reader ignored SIGTERM; sending SIGKILL." >&2
+    pkill -KILL -f -- "$READER_PATTERN" 2>/dev/null || true
+    sleep 0.2
+fi
+
+if pgrep -f -- "$READER_PATTERN" >/dev/null; then
+    echo "ERROR: old reader survived SIGKILL; refusing to start a duplicate." >&2
+    exit 1
+fi
+
+exec "$SCRIPT_DIR/readerInit"

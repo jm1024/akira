@@ -9,7 +9,7 @@ import signal
 import traceback
 from datetime import datetime, timedelta
 
-import sidraCore
+import akiraCore
 
 PORT = 23
 
@@ -279,7 +279,7 @@ def updateMass(current):
 
     current["date"] = datetime.now()
     tripState, massState = getStates(current)
-    lastLockState = sidraCore.massLock(name)
+    lastLockState = akiraCore.massLock(name)
     
     
     #if DEBUG_STATE:
@@ -338,7 +338,7 @@ def updateMass(current):
                 lastEnd = newLock['end']
                 
         #see if the lane is already locked by something else - dont set window
-        fileMass = sidraCore.massLock(name)
+        fileMass = akiraCore.massLock(name)
         if  fileMass['locked']:
             print("override lock set") 
             newLock['end'] = ""
@@ -346,7 +346,7 @@ def updateMass(current):
             #updateLock = False
 
     if updateLock:
-        sidraCore.massLockSet(name, newLock)
+        akiraCore.massLockSet(name, newLock)
         debugMsg = "updateMass " + str(datetime.now()) + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
         debugMsg = "updateMass " + " c: " + str(newLock['count']) + " t: " + str(tripState) + " m: " + str(massState) + " locked: " + str(newLock['locked']) 
                 
@@ -355,9 +355,9 @@ def updateMass(current):
         print(debugMsg)
         
         
-    output = json.dumps(current, default=sidraCore.jsonConverter)
-    fileName = sidraCore.MASS_DIR + "/" + name + sidraCore.STATE_EXTENSION_MASS 
-    sidraCore.writeFile(fileName, output)
+    output = json.dumps(current, default=akiraCore.jsonConverter)
+    fileName = akiraCore.MASS_DIR + "/" + name + akiraCore.STATE_EXTENSION_MASS
+    akiraCore.writeFile(fileName, output)
 
 #############################
 def handleSignal(signum, frame):
@@ -403,7 +403,7 @@ if __name__ == "__main__":
 
     name = args.name
 
-    for mass in sidraCore.massSensors:
+    for mass in akiraCore.massSensors:
         #print(name)
         #print(mass["name"])
         #print(mass["ip"])

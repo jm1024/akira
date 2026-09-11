@@ -1,5 +1,5 @@
 #!/bin/bash
-rm /var/sidra/img/*
-rm /var/sidra/trn/*
-rm /var/sidra/trn/working/*
-rm /var/sidra/trn/done/*
+rm /var/akira/img/*
+rm /var/akira/trn/*
+rm /var/akira/trn/working/*
+rm /var/akira/trn/done/*

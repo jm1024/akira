@@ -5,11 +5,11 @@ import json
 import base64
 import importlib
 
-import sidraCore
+import akiraCore
 
 #dynamically load all read drivers
 camDrivers = {}
-for driver in sidraCore.driversCam:
+for driver in akiraCore.driversCam:
     camDrivers[driver] = importlib.import_module(driver)
     print("Loaded cam driver: " + driver)
 
@@ -17,7 +17,7 @@ for driver in sidraCore.driversCam:
 #LOCAL_URL_PREFIX = "http://10.2.10.10:2080/"
 
 #cam map
-cams = sidraCore.cams
+cams = akiraCore.cams
 
 MIN_PLATE_SCORE = 0
 
@@ -159,7 +159,7 @@ class handler(BaseHTTPRequestHandler):
         d["transit"]["image"] = d["transit"]["uuid"] + ".jpg"
         imgdata = base64.b64decode(imgString)
         fileName = d["transit"]["uuid"] + ".jpg"
-        with open(sidraCore.IMG_DIR + "/" +  fileName, 'wb') as f:
+        with open(akiraCore.IMG_DIR + "/" +  fileName, 'wb') as f:
             f.write(imgdata)
 
         # plate
@@ -167,7 +167,7 @@ class handler(BaseHTTPRequestHandler):
         d["transit"]["image_plate"] = d["transit"]["uuid"] + "-p.jpg"
         imgdata = base64.b64decode(imgString)
         fileNamePlate = d["transit"]["uuid"] + "-p.jpg"
-        with open(sidraCore.IMG_DIR + "/" +  fileNamePlate, 'wb') as f:
+        with open(akiraCore.IMG_DIR + "/" +  fileNamePlate, 'wb') as f:
             f.write(imgdata)
 
         # anpr
@@ -177,7 +177,7 @@ class handler(BaseHTTPRequestHandler):
             d["transit"]["image_anpr"] = d["transit"]["uuid"] + "-a.jpg"
             imgdata = base64.b64decode(imgString)
             fileNameAnpr = d["transit"]["uuid"] + "-a.jpg"
-            #with open(sidraCore.ANPR_DIR + "/" +  fileNameAnpr, 'wb') as f:
+            #with open(akiraCore.ANPR_DIR + "/" +  fileNameAnpr, 'wb') as f:
             #    f.write(imgdata)
         except Exception as ex:
             print("missing anpr image: " + str(ex))
@@ -204,9 +204,9 @@ class handler(BaseHTTPRequestHandler):
                 driverModule.cam(d)
             
         #save transaction
-        sidraCore.logTrn("----------")
-        sidraCore.logTrn(json.dumps(d))
-        sidraCore.saveTransaction(sidraCore.trnPrefix() + d["transit"]["uuid"] + sidraCore.TRN_EXTENSION_CAM, json.dumps(d))
+        akiraCore.logTrn("----------")
+        akiraCore.logTrn(json.dumps(d))
+        akiraCore.saveTransaction(akiraCore.trnPrefix() + d["transit"]["uuid"] + akiraCore.TRN_EXTENSION_CAM, json.dumps(d))
 
         #2024-05-29_14:28:18.958
         dtFormat = "%Y-%m-%d_%H:%M:%S"
@@ -216,7 +216,7 @@ class handler(BaseHTTPRequestHandler):
         #milliseconds = int(s2[1])
         #tDate = tDate.replace(microsecond=milliseconds * 1000)
 
-        tDate = sidraCore.camStrToDt(sDate)
+        tDate = akiraCore.camStrToDt(sDate)
         print("times cam: " + str(tDate) + " server: " + str(datetime.now()))
 
         output = str(tDate)
@@ -242,7 +242,7 @@ class handler(BaseHTTPRequestHandler):
         #output = output + " direction:" + d["transit"]["direction"]
         #output = output + " speed:" + d["transit"]["speed"]
 
-        sidraCore.log(output)
+        akiraCore.log(output)
 
         if DEBUG:
             print(output)
@@ -250,7 +250,7 @@ class handler(BaseHTTPRequestHandler):
 
 ####################################################
 
-sidraCore.log("Camera Server Starting")
+akiraCore.log("Camera Server Starting")
 #print("Camera Server Starting")
 
 with HTTPServer(('', 8000), handler) as server:

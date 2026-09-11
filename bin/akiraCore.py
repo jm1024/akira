@@ -5,21 +5,57 @@ import os
 import base64
 import json
 import fcntl
+import shlex
 from decimal import Decimal
 from datetime import date, datetime, timedelta
 from urllib import request, parse
 import requests
 #import psutil
 
-# sidra imports
-sys.path.append('/var/sidra/bin')
+# Akira runtime paths. AKIRA_ROOT is primarily useful for isolated tests; normal
+# deployments derive the root from this file and therefore do not depend on the
+# caller's current working directory.
+PROJECT_ROOT = os.path.abspath(
+    os.environ.get(
+        "AKIRA_ROOT",
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    )
+)
+BIN_DIR = os.path.join(PROJECT_ROOT, "bin")
+LOG_DIR = os.path.join(PROJECT_ROOT, "log")
+ETC_DIR = os.path.join(PROJECT_ROOT, "etc")
+IMG_DIR = os.path.join(PROJECT_ROOT, "img")
+ANPR_DIR = os.path.join(PROJECT_ROOT, "anpr")
+TMP_DIR = os.path.join(PROJECT_ROOT, "tmp")
+TRN_DIR = os.path.join(PROJECT_ROOT, "trn")
+TRN_WORKING_DIR = os.path.join(TRN_DIR, "working")
+TRN_DONE_DIR = os.path.join(TRN_DIR, "done")
+TRN_TMP_DIR = os.path.join(TRN_DIR, "tmp")
+XMIT_DIR = os.path.join(PROJECT_ROOT, "xmit")
+XMIT_STATE_DIR = os.path.join(XMIT_DIR, "state")
+XMIT_BAD_DIR = os.path.join(XMIT_DIR, "bad")
+MASS_DIR = os.path.join(PROJECT_ROOT, "mass")
+STREAM_DIR = os.path.join(PROJECT_ROOT, "stream")
+MON_DIR = os.path.join(PROJECT_ROOT, "mon")
+DRV_DIR = os.path.join(PROJECT_ROOT, "drv")
+RTS_DIR = os.path.join(PROJECT_ROOT, "rts")
+SYNERGY_DIR = os.path.join(PROJECT_ROOT, "synergy")
+LIB_DIR = os.path.join(PROJECT_ROOT, "lib")
+
+if BIN_DIR not in sys.path:
+    sys.path.insert(0, BIN_DIR)
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
 import fileLock
+import massSensor
 
 VERSION = "0.02.06"
 
 #config defaults
 sidraApi = ""  #API server to use
 plazaId = "000"
+deviceName = ""
 laneMode = "single"
 eventMargin = 8     #time margin for accepting events as together
 
@@ -31,6 +67,7 @@ lanes = []
 ipList = []
 cams = []
 readers = []
+backupReaders = []
 massSensors = []
 lidar = []
 driversRead = []
@@ -44,24 +81,11 @@ servers = []
 imageRetentionSeconds = 36000
 trnRetentionSeconds = 36000
 
-BIN_DIR = "/var/sidra/bin"
-LOG_DIR = "/var/sidra/log"
-ETC_DIR = "/var/sidra/etc"
-IMG_DIR = "/var/sidra/img"
-ANPR_DIR = "/var/sidra/anpr"
-TMP_DIR = "/var/sidra/tmp"
-TRN_DIR = "/var/sidra/trn"
-TRN_WORKING_DIR = "/var/sidra/trn/working"
-TRN_DONE_DIR = "/var/sidra/trn/done"
-TRN_TMP_DIR = "/var/sidra/trn/tmp"
-XMIT_DIR = "/var/sidra/xmit"
-MASS_DIR = "/var/sidra/mass"
-STREAM_DIR = "/var/sidra/stream"
-LOG_FILE = "sidra.log"
+LOG_FILE = "akira.log"
 ERR_LOG_FILE = "errors.log"
 TRN_LOG_FILE = "transactions.log"
 MCP_LOG_FILE = "mcp.log"
-CONFIG_FILE = "sidra.cfg"
+CONFIG_FILE = "akira.cfg"
 
 STATE_EXTENSION_MASS = ".ms"
 STATE_EXTENSION_MASS_LOCK = ".ml"
@@ -104,6 +128,16 @@ POS_MAX = 1000
 ###############################################################
 
 #########################################
+def rejectDuplicateJsonKeys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+#########################################
 def loadConfig():
 
     global config
@@ -112,6 +146,7 @@ def loadConfig():
     #system info
     global sidraApi
     global plazaId
+    global deviceName
     global laneMode
     global driversRead
     global driversTrans
@@ -122,6 +157,7 @@ def loadConfig():
     global ipList
     global cams
     global readers
+    global backupReaders
     global massSensors
     global lidar
     global imageRetentionSeconds
@@ -129,12 +165,12 @@ def loadConfig():
     global logMode
 
     if not os.path.isfile(ETC_DIR + "/" + CONFIG_FILE):
-        log("sidraCore: loadConfig: config missing using defaults")
+        log("akiraCore: loadConfig: config missing using defaults")
         return
 
     #Open and read the JSON file
     with open(ETC_DIR  + "/" + CONFIG_FILE, 'r') as file:
-        cfg = json.load(file)
+        cfg = json.load(file, object_pairs_hook=rejectDuplicateJsonKeys)
 
     #save raw json
     config = cfg
@@ -190,10 +226,14 @@ def loadConfig():
     #readers
     if not cfg.get("readers") == None:
         readers = cfg.get("readers")
+        
+    #backupReaders
+    if not cfg.get("backupReaders") == None:
+        backupReaders = cfg.get("backupReaders")
 
     #massSensors
     if not cfg.get("massSensors") == None:
-        massSensors = cfg.get("massSensors")
+        massSensors = [massSensor.normalizeConfig(sensor) for sensor in cfg.get("massSensors")]
 
     #lidar
     if not cfg.get("lidar") == None:
@@ -201,7 +241,7 @@ def loadConfig():
 
     #device info
     if not cfg.get("deviceName") == None:
-        sidraApi = cfg.get("deviceName")
+        deviceName = cfg.get("deviceName")
 
     #max image age
     if not cfg.get("imageRetentionSeconds") == None:
@@ -309,6 +349,31 @@ def logMcp(msg):
 ####################################################
 
 ###########################
+def sidraApiList():
+
+    apis = sidraApi
+
+    if apis in [None, ""]:
+        return []
+
+    if isinstance(apis, str):
+        apis = [apis]
+
+    if not isinstance(apis, list):
+        return []
+
+    ret = []
+    for api in apis:
+        if not isinstance(api, str):
+            continue
+
+        api = api.strip()
+        if api and api not in ret:
+            ret.append(api)
+
+    return ret
+
+###########################
 def queueXmit(payload, extension = ".x"):
 
     ret = False
@@ -384,7 +449,7 @@ def decodeUserData(userData):
         tagPlate = tagPlate.strip('\0x00')
         #tagPlate = plateHex.decode("hex")
     except Exception as ex:
-        #print("sidraCore.decodeUserData err: " + str(ex))
+        #print("akiraCore.decodeUserData err: " + str(ex))
         log("decudeUserData() error: " + str(ex) + " userData: " + str(userData))
 
     return tagPlate, tagClass
@@ -427,7 +492,7 @@ def massState(name):
         raw = readFile(MASS_DIR + "/" + name + STATE_EXTENSION_MASS)
         ret = json.loads(raw)
     except Exception as ex:
-        msg = f"sidraCore.massState() error: {ex}"
+        msg = f"akiraCore.massState() error: {ex}"
         print(msg)
 
     return ret
@@ -435,20 +500,17 @@ def massState(name):
 ###########################
 def massOccupied(name):
 
-    state = massState(name)
-    #print("ST: " + str(state))
-    occupied = True
-
-    for mass in massSensors:
-        if name == mass['name']:
-            trip = mass['trip']
-            main = mass['main']
-
-    #if state.get(trip) == MASS_EMPTY and state.get(main) == MASS_EMPTY:
-    if state.get(main) == MASS_EMPTY:
-        occupied = False
-
-    return occupied
+    config = next(
+        (
+            sensor
+            for sensor in massSensors
+            if name in (str(sensor.get("name")), str(sensor.get("lane")))
+        ),
+        None,
+    )
+    stateName = str(config.get("lane")) if config is not None else name
+    state = massState(stateName)
+    return massSensor.occupied(state, config)
 
 ####################################################
 # image encoding/decoding
@@ -683,19 +745,53 @@ def isRunning_PSU(process_name):
 
 #########################################
 def isRunning(process_name):
-    cmd = "ps -eaf | grep '" + process_name + "' | grep -v grep"
-    ps = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-    output = ps.stdout.read().strip()
-    ps.stdout.close()
-    ps.wait()
-    ##print("OUTPUT: " + str(output))
-    #log("ISRUUNNING: " + process_name + " = " + str(output))
-    if len(output) > 5:
-        #log("ISRUUNNING: True")
-        return True
-    else:
-        #log("ISRUUNNING: False")
+    try:
+        targets = shlex.split(str(process_name))
+    except ValueError:
         return False
+
+    if not targets:
+        return False
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return False
+
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2:
+            continue
+
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+
+        if pid == os.getpid():
+            continue
+
+        try:
+            arguments = shlex.split(fields[1])
+        except ValueError:
+            continue
+
+        for start in range(0, len(arguments) - len(targets) + 1):
+            matches = True
+            for offset, target in enumerate(targets):
+                argument = arguments[start + offset]
+                if argument != target and os.path.basename(argument) != target:
+                    matches = False
+                    break
+            if matches:
+                return True
+
+    return False
 
 ###############################################################
 # file io
@@ -763,7 +859,7 @@ def appendFile(fileName, data):
 
         return True
     except Exception as ex:
-        log("sidraCore.appendFile error: " + str(fileName) + "  " + str(ex))
+        log("akiraCore.appendFile error: " + str(fileName) + "  " + str(ex))
         return False
 
 #########################################
@@ -844,7 +940,37 @@ def makeDir(path):
         os.makedirs(path)
 
 
+#########################################
+def ensureRuntimeDirs():
+
+    runtimeDirs = [
+        LOG_DIR,
+        IMG_DIR,
+        ANPR_DIR,
+        TMP_DIR,
+        TRN_DIR,
+        TRN_WORKING_DIR,
+        TRN_DONE_DIR,
+        TRN_TMP_DIR,
+        XMIT_DIR,
+        XMIT_STATE_DIR,
+        XMIT_BAD_DIR,
+        MASS_DIR,
+        STREAM_DIR,
+        MON_DIR,
+        DRV_DIR,
+        RTS_DIR,
+        SYNERGY_DIR,
+    ]
+
+    for path in runtimeDirs:
+        makeDir(path)
+
+
 ###################################################################
+
+# Create runtime storage before configuration loading can emit a log entry.
+ensureRuntimeDirs()
 
 #load runtime config from etc
 loadConfig()

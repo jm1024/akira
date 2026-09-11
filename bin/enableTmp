@@ -1,7 +1,21 @@
 #!/bin/bash
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: enableTmp must run as root so it updates the live Akira crontab." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+ENTRY="*/1 * * * * $SCRIPT_DIR/tmpCron"
+CRON_FILE="$(mktemp)"
+trap 'rm -f -- "$CRON_FILE"' EXIT
+
+crontab -l 2>/dev/null > "$CRON_FILE" || true
+
 echo "enabling tmp transmission in cron"
-if crontab -l | grep --quiet "/var/sidra/bin/tmpCron"; then
+if grep --fixed-strings --line-regexp --quiet -- "$ENTRY" "$CRON_FILE"; then
   echo " - cron already configured"
 else
-  crontab -l | { cat; echo "*/1 * * * * /var/sidra/bin/tmpCron"; } | crontab -
+  printf '%s\n' "$ENTRY" >> "$CRON_FILE"
+  crontab "$CRON_FILE"
 fi
