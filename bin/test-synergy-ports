@@ -124,10 +124,12 @@ def check_single_port_client():
     assert len({args.lock_file for args in parsed}) == len(ports)
     assert len({args.status_file for args in parsed}) == len(ports)
     lanes = list(ports)
-    invalid = [[], ["--port", "0"], ["--port", "65536"],
-               ["--port", str(ports[lanes[0]]), "--lane", ",".join(lanes)]]
+    invalid = [[], ["--port", "0"], ["--port", "65536"]]
     if len(lanes) > 1:
-        invalid.append(["--port", str(ports[lanes[0]]), "--lane", lanes[1]])
+        invalid.extend([
+            ["--port", str(ports[lanes[0]]), "--lane", ",".join(lanes)],
+            ["--port", str(ports[lanes[0]]), "--lane", lanes[1]],
+        ])
     for argv in invalid:
         with contextlib.redirect_stderr(io.StringIO()):
             try:

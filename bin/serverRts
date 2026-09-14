@@ -1,477 +1,428 @@
 #!/usr/bin/env python3
+import json
 import os
 import socket
 import threading
 import time
 import traceback
-import json
 import uuid
 from datetime import datetime, timedelta
 
 import akiraCore
 import driverRts
+from rtsProtocol import (
+    ANPR_CHANNEL,
+    RFID_CHANNEL,
+    encode_lane,
+    lane_endpoints,
+    local_lane_id,
+    queue_lane,
+)
 
-PORTS = [2060, 2061] # kill 2215
+
+BIND_ADDRESS, LANE_PORTS = lane_endpoints(akiraCore.PROJECT_ROOT)
+PORT_ROUTES = {
+    port: (lane, channel)
+    for lane, channels in LANE_PORTS.items()
+    for channel, port in channels.items()
+}
+PORTS = tuple(PORT_ROUTES)
+
 SCAN_INTERVAL_SECONDS = 0.01
 BUFFER_SIZE = 4096
 DEBUG = True
 
 clientsByPort = {port: set() for port in PORTS}
 clientsLock = threading.Lock()
+responseLocks = {lane: threading.RLock() for lane in LANE_PORTS}
+
 
 #############################
 def log(message):
-	if DEBUG:
-		print(message, flush=True)
-
-#############################
-def logResponse(msg):
-
-	current = []
-
-	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
-
-	if not akiraCore.fileExist(responseFile):
-		current = []
-	else:
-		current = json.loads(akiraCore.readFile(responseFile))
-
-	current.append(msg)
-
-	akiraCore.writeFile(responseFile, json.dumps(current))
-
-#############################
-def writeResponse(msg):
-
-	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + driverRts.EXT_RESPONSE
-	responseFile = driverRts.DATA_DIR + "/" + fileName
-	akiraCore.writeFile(responseFile, json.dumps(msg))
-
-#############################
-def sendAckAlive():
-
-	id = str(uuid.uuid4())
-	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-
-	ack = {
-		'header':{
-		'command':"IsAlive",
-		'timestamp':datetime.now().isoformat()
-		},
-		'body':{
-		'Result':"ACK",
-		'hmac':"XXXX"
-		}
-	}
-
-	akiraCore.writeFile(responseFile, json.dumps(ack))
-
-#############################
-def sendAckInitialize():
-
-	id = str(uuid.uuid4())
-	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-
-	ack = {
-		'header':{
-		'command':"InitializeReader",
-		'timestamp':datetime.now().isoformat()
-		},
-		'body':{
-		'Result':"ACK",
-		'hmac':"XXXX"
-		}
-	}
-
-	akiraCore.writeFile(responseFile, json.dumps(ack))
-
-#############################
-def sendAckAbort():
-
-	id = str(uuid.uuid4())
-	responseFile = driverRts.DATA_DIR + "/" + id + driverRts.EXT_TRANS
-
-	ack = {
-		'header':{
-		'command':"AbortReader",
-		'timestamp':datetime.now().isoformat()
-		},
-		'body':{
-		'Result':"ACK",
-		'hmac':"XXXX"
-		}
-	}
-
-	akiraCore.writeFile(responseFile, json.dumps(ack))
+    if DEBUG:
+        print(message, flush=True)
 
 
 #############################
-def replaceTransId(fileName):
+def responseFile(lane):
+    return os.path.join(
+        driverRts.DATA_DIR,
+        "response.rts-lane-" + encode_lane(str(lane)) + ".log",
+    )
 
-	pruneResponses(1)
-
-	newTransId = ""
-
-	#print("serverRts.replaceTransId() - starting")
-
-	try:
-		contents = json.loads(akiraCore.readFile(driverRts.DATA_DIR + "/" + fileName))
-
-		#if it's an ANPR
-		if contents['header']['command'] == "ANPRInfo":
-			#print("FTID")
-			newTransId = findTransId(contents['body']['TagID'])
-			contents['body']['AnprID'] = newTransId
-
-			akiraCore.writeFile(driverRts.DATA_DIR + "/" + fileName, json.dumps(contents))
-
-			if DEBUG:
-				c2 = contents
-				c2['body']['AnprImage'] = ""
-				print("SENDING TRANSACTION TO RTS: " + str(c2))
-
-	except Exception as ex:
-		print("Error serverRts.replaceTransId() " + str(ex))
 
 #############################
-def findTransId(tid):
+def logResponse(msg, lane):
+    path = responseFile(lane)
+    with responseLocks[lane]:
+        if akiraCore.fileExist(path):
+            current = json.loads(akiraCore.readFile(path))
+        else:
+            current = []
+        current.append(msg)
+        akiraCore.writeFile(path, json.dumps(current))
 
-	ret = ""
-
-	responses = []
-
-	responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
-
-	if akiraCore.fileExist(responseFile):
-		responses = json.loads(akiraCore.readFile(responseFile))
-	else:
-		print("serverRts.findTansId - no RTS response file")
-
-	for msg in responses:
-		try:
-			if msg['header']['command'] == "TagResult":
-				if msg['body']['TagID'] == tid:
-					ret = msg['body']['AnprID']
-					print("serverRts.findTansId - FOUND: " + str(msg['body']['AnprID']))
-		except Exception as ex:
-			print("serverRts.findTansId - findTransId() " + str(ex))
-			pass
-
-	return ret
 
 #############################
-def pruneResponses(maxAgeMinutes=10):
+def writeResponse(msg, lane):
+    identifier = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    driverRts.queueMessage(identifier, lane, driverRts.EXT_RESPONSE, msg)
 
-	"""
-	Remove response entries older than maxAgeMinutes based on header.timestamp.
-	Timestamp format expected: "YYYY-MM-DD HH:MM:SS[.ffffff]"
-	"""
-	try:
-		responseFile = driverRts.DATA_DIR + "/" + driverRts.RESPONSE_FILE
 
-		if not akiraCore.fileExist(responseFile):
-			return True  # nothing to prune
+#############################
+def sendAck(command, lane):
+    ack = {
+        "header": {
+            "command": command,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "body": {
+            "Result": "ACK",
+            "hmac": "XXXX",
+        },
+    }
+    # Preserve the existing RTS flow: acknowledgements use the transaction queue.
+    driverRts.queueMessage(str(uuid.uuid4()), lane, driverRts.EXT_TRANS, ack)
 
-		raw = akiraCore.readFile(responseFile)
-		if not raw:
-			return True  # empty file
 
-		responses = json.loads(raw)
-		if not isinstance(responses, list):
-			log(f"pruneResponses(): response file is not a list: {type(responses)}")
-			return False
+def sendAckAlive(lane):
+    sendAck("IsAlive", lane)
 
-		cutoff = datetime.now() - timedelta(minutes=maxAgeMinutes)
 
-		kept = []
-		prunedCount = 0
+def sendAckInitialize(lane):
+    sendAck("InitializeReader", lane)
 
-		for msg in responses:
-			try:
-				ts = msg.get("header", {}).get("timestamp")
-				if not ts:
-					kept.append(msg)
-					continue
 
-				# Accept both "...SS" and "...SS.ffffff"
-				# datetime.fromisoformat handles "YYYY-MM-DD HH:MM:SS.ffffff"
-				msgTime = datetime.fromisoformat(ts)
+def sendAckAbort(lane):
+    sendAck("AbortReader", lane)
 
-				if msgTime >= cutoff:
-					kept.append(msg)
-				else:
-					prunedCount += 1
-			except Exception:
-				# If timestamp is malformed, keep the message (safer)
-				kept.append(msg)
 
-		if prunedCount:
-			akiraCore.writeFile(responseFile, json.dumps(kept))
+#############################
+def replaceTransId(fileName, lane):
+    pruneResponses(lane, 1)
 
-		log(f"pruneResponses(): pruned={prunedCount}, kept={len(kept)}")
-		return True
+    try:
+        path = os.path.join(driverRts.DATA_DIR, fileName)
+        contents = json.loads(akiraCore.readFile(path))
 
-	except Exception as ex:
-		print("Error serverRts.pruneResponses() " + str(ex))
-		return False
+        if contents["header"]["command"] == "ANPRInfo":
+            contents["body"]["AnprID"] = findTransId(contents["body"]["TagID"], lane)
+            akiraCore.writeFile(path, json.dumps(contents))
+
+            if DEBUG:
+                printable = json.loads(json.dumps(contents))
+                printable["body"]["AnprImage"] = ""
+                print("SENDING TRANSACTION TO RTS: " + str(printable))
+
+    except Exception as ex:
+        print("Error serverRts.replaceTransId() " + str(ex))
+
+
+#############################
+def findTransId(tid, lane):
+    ret = ""
+    path = responseFile(lane)
+
+    with responseLocks[lane]:
+        if akiraCore.fileExist(path):
+            responses = json.loads(akiraCore.readFile(path))
+        else:
+            responses = []
+            print("serverRts.findTansId - no RTS response file for lane " + str(lane))
+
+        for msg in responses:
+            try:
+                if msg["header"]["command"] == "TagResult" and msg["body"]["TagID"] == tid:
+                    ret = msg["body"]["AnprID"]
+                    print("serverRts.findTansId - FOUND: " + str(ret))
+            except Exception as ex:
+                print("serverRts.findTansId - findTransId() " + str(ex))
+
+    return ret
+
+
+#############################
+def pruneResponses(lane, maxAgeMinutes=10):
+    """Remove old correlation entries from one lane's response history."""
+    try:
+        path = responseFile(lane)
+        with responseLocks[lane]:
+            if not akiraCore.fileExist(path):
+                return True
+
+            raw = akiraCore.readFile(path)
+            if not raw:
+                return True
+
+            responses = json.loads(raw)
+            if not isinstance(responses, list):
+                log(f"pruneResponses(): response file is not a list: {type(responses)}")
+                return False
+
+            cutoff = datetime.now() - timedelta(minutes=maxAgeMinutes)
+            kept = []
+            prunedCount = 0
+
+            for msg in responses:
+                try:
+                    timestamp = msg.get("header", {}).get("timestamp")
+                    if not timestamp or datetime.fromisoformat(timestamp) >= cutoff:
+                        kept.append(msg)
+                    else:
+                        prunedCount += 1
+                except Exception:
+                    kept.append(msg)
+
+            if prunedCount:
+                akiraCore.writeFile(path, json.dumps(kept))
+
+        log(f"pruneResponses(): lane={lane}, pruned={prunedCount}, kept={len(kept)}")
+        return True
+
+    except Exception as ex:
+        print("Error serverRts.pruneResponses() " + str(ex))
+        return False
+
 
 #############################
 def broadcastFile(filePath, targetPorts=None):
-	"""
-	Read a file and send its contents to all connected clients
-	on the given ports (or all ports if targetPorts is None).
-	"""
+    """Send a queued message to connected clients on the selected port."""
+    ret = True
+    data = akiraCore.readFile(filePath)
 
-	ret = True
-	data = akiraCore.readFile(filePath)
+    if not data:
+        log(f"File {filePath} is empty, skipping broadcast")
+        return False
 
-	if not data:
-		log(f"File {filePath} is empty, skipping broadcast")
-		return
+    dataBytes = data.encode("utf-8") if isinstance(data, str) else data
+    if targetPorts is None:
+        targetPorts = PORTS
 
-	# Ensure we always send bytes
-	if isinstance(data, str):
-		dataBytes = data.encode("utf-8")
-	else:
-		dataBytes = data  # assume it's already bytes
+    log(f"Broadcasting file: {filePath} ({len(dataBytes)} bytes) to ports {targetPorts}")
+    deadClients = []
 
-	if targetPorts is None:
-		targetPorts = PORTS
+    with clientsLock:
+        for port in targetPorts:
+            for clientSocket in list(clientsByPort.get(port, set())):
+                try:
+                    log(f"Sending to client {clientSocket} on port {port}")
+                    clientSocket.sendall(dataBytes)
+                    ret = True
+                except Exception as error:
+                    ret = False
+                    log(f"Error sending to client {clientSocket} on port {port}: {error}")
+                    deadClients.append((port, clientSocket))
 
-	log(f"Broadcasting file: {filePath} ({len(dataBytes)} bytes) to ports {targetPorts}")
+        for port, clientSocket in deadClients:
+            try:
+                clientSocket.close()
+            except Exception:
+                pass
+            clientsByPort.get(port, set()).discard(clientSocket)
+            log(f"Removed dead client {clientSocket} from port {port}")
 
-	deadClients = []
-
-	with clientsLock:
-		#print(targetPorts)
-		for port in targetPorts:
-			socketSet = clientsByPort.get(port, set())
-			for clientSocket in list(socketSet):
-				try:
-					log(f"Sending to client {clientSocket} on port {port}")
-					clientSocket.sendall(dataBytes)
-					ret = True
-				except Exception as e:
-					ret = False
-					log(f"Error sending to client {clientSocket} on port {port}: {e}")
-					deadClients.append((port, clientSocket))
-
-		for port, clientSocket in deadClients:
-			try:
-				clientSocket.close()
-			except Exception:
-				pass
-			if clientSocket in clientsByPort.get(port, set()):
-				clientsByPort[port].remove(clientSocket)
-			log(f"Removed dead client {clientSocket} from port {port}")
-
-	return ret
-
-#############################
-def handleClientMessage(clientSocket, clientAddr, port, data):
-
-	try:
-		text = None
-		try:
-			text = data.decode("utf-8", errors="replace")
-			log(f"serverRts from {clientAddr} on port {port}: {text!r}")
-		except Exception:
-			log(f"serverRts from {clientAddr} on port {port} (raw bytes): {data!r}")
-
-		try:
-			if not text:
-				return  # nothing usable to parse
-
-			msg = json.loads(text)
-			logResponse(msg)
-			writeResponse(msg)
-			command = msg.get('header', {}).get('command')
-
-			if command == "IsAlive":
-				sendAckAlive()
-			elif command == "AbortReader":
-				sendAckAbort()
-				driverRts.setEnable(False)
-				log("driverRts disabled via AbortReader")
-			elif command == "InitializeReader":
-				sendAckInitialize()
-				driverRts.setEnable(True)
-				log("driverRts enabled via InitializeReader")
-
-		except Exception as ex:
-			print("serverRts.handleClientMessage() " + str(ex))
-
-	except Exception as e:
-		log(f"Error in handleClientMessage from {clientAddr} on port {port}: {e}")
-		traceback.print_exc()
+    return ret
 
 
 #############################
-def clientLoop(clientSocket, clientAddr, port):
-	"""
-	Per-client thread: receive data from this client until it disconnects.
-	"""
-	log(f"Client thread started for {clientAddr} on port {port}")
+def messageLane(msg, queuedLane, portLane=None):
+    bodyLane = msg.get("body", {}).get("LaneID")
+    if bodyLane is not None:
+        bodyLane = local_lane_id(akiraCore.PROJECT_ROOT, str(bodyLane))
 
-	with clientsLock:
-		clientsByPort[port].add(clientSocket)
+    known = [lane for lane in (queuedLane, portLane, bodyLane) if lane is not None]
+    if not known:
+        if len(LANE_PORTS) == 1:
+            known = [next(iter(LANE_PORTS))]
+        else:
+            raise ValueError("RTS message has no lane context")
+    if len(set(known)) != 1:
+        raise ValueError("RTS lane in message, queue, and TCP port must match")
+    lane = known[0]
+    if lane not in LANE_PORTS:
+        raise ValueError(f"RTS message references unconfigured lane {lane!r}")
+    return lane
 
-	try:
-		while True:
-			data = clientSocket.recv(BUFFER_SIZE)
-			if not data:
-				log(f"Client {clientAddr} disconnected from port {port}")
-				break
 
-			handleClientMessage(clientSocket, clientAddr, port, data)
+#############################
+def routeQueuedFile(fileName):
+    if fileName.endswith(driverRts.EXT_READ):
+        channel = RFID_CHANNEL
+    elif fileName.endswith(driverRts.EXT_TRANS):
+        channel = ANPR_CHANNEL
+    else:
+        raise ValueError("unknown RTS queue suffix")
 
-	except Exception as e:
-		log(f"Error in clientLoop for {clientAddr} on port {port}: {e}")
-		traceback.print_exc()
+    path = os.path.join(driverRts.DATA_DIR, fileName)
+    msg = json.loads(akiraCore.readFile(path))
+    lane = messageLane(msg, queue_lane(fileName))
+    return lane, channel, LANE_PORTS[lane][channel]
 
-	finally:
-		with clientsLock:
-			if clientSocket in clientsByPort.get(port, set()):
-				try:
-					clientSocket.close()
-				except Exception:
-					pass
-				clientsByPort[port].remove(clientSocket)
-		log(f"Client thread exiting for {clientAddr} on port {port}")
+
+#############################
+def processQueuedFile(fileName):
+    path = os.path.join(driverRts.DATA_DIR, fileName)
+    lane, channel, port = routeQueuedFile(fileName)
+    if channel == ANPR_CHANNEL:
+        replaceTransId(fileName, lane)
+    if not broadcastFile(path, targetPorts=[port]):
+        return False
+
+    try:
+        os.remove(path)
+        log(f"Deleted file: {path}")
+    except Exception as error:
+        log(f"Error deleting file {path}: {error}")
+        traceback.print_exc()
+        return False
+    return True
+
+
+#############################
+def handleClientMessage(clientSocket, clientAddr, port, lane, channel, data):
+    try:
+        text = data.decode("utf-8", errors="replace")
+        log(f"serverRts from {clientAddr} on lane {lane} {channel} port {port}: {text!r}")
+        if not text:
+            return False
+
+        msg = json.loads(text)
+        messageLane(msg, None, lane)
+        logResponse(msg, lane)
+        writeResponse(msg, lane)
+        command = msg.get("header", {}).get("command")
+
+        if command == "IsAlive":
+            sendAckAlive(lane)
+        elif command == "AbortReader":
+            sendAckAbort(lane)
+            driverRts.setEnable(False, lane)
+            log(f"driverRts disabled via AbortReader for lane {lane}")
+        elif command == "InitializeReader":
+            sendAckInitialize(lane)
+            driverRts.setEnable(True, lane)
+            log(f"driverRts enabled via InitializeReader for lane {lane}")
+        return True
+
+    except Exception as error:
+        log(f"Error handling message from {clientAddr} on lane {lane} port {port}: {error}")
+        return False
+
+
+#############################
+def clientLoop(clientSocket, clientAddr, port, lane, channel):
+    """Receive RTS messages for one configured lane/channel until disconnect."""
+    log(f"Client thread started for {clientAddr} on lane {lane} {channel} port {port}")
+
+    with clientsLock:
+        clientsByPort[port].add(clientSocket)
+
+    try:
+        while True:
+            data = clientSocket.recv(BUFFER_SIZE)
+            if not data:
+                log(f"Client {clientAddr} disconnected from lane {lane} port {port}")
+                break
+            handleClientMessage(clientSocket, clientAddr, port, lane, channel, data)
+    except Exception as error:
+        log(f"Error in clientLoop for {clientAddr} on lane {lane} port {port}: {error}")
+        traceback.print_exc()
+    finally:
+        with clientsLock:
+            clientsByPort.get(port, set()).discard(clientSocket)
+        try:
+            clientSocket.close()
+        except Exception:
+            pass
+        log(f"Client thread exiting for {clientAddr} on lane {lane} port {port}")
 
 
 #############################
 def watchDir():
-	"""
-	Watch driverRts.DATA_DIR for new files and broadcast them:
+    """Route lane-tagged RTS queue files to that lane's RFID or ANPR port."""
+    if not os.path.isdir(driverRts.DATA_DIR):
+        log(f"Stream directory {driverRts.DATA_DIR} does not exist, creating it")
+        try:
+            os.makedirs(driverRts.DATA_DIR, exist_ok=True)
+        except Exception as error:
+            log(f"Failed to create directory {driverRts.DATA_DIR}: {error}")
+            return
 
-		*.rts-r  -> only to clients on port 2060
-		*.rts-t  -> only to clients on port 2061
-
-	Anything else is skipped (but logged).
-	"""
-	if not os.path.isdir(driverRts.DATA_DIR):
-		log(f"Stream directory {driverRts.DATA_DIR} does not exist, creating it")
-		try:
-			os.makedirs(driverRts.DATA_DIR, exist_ok=True)
-		except Exception as e:
-			log(f"Failed to create directory {driverRts.DATA_DIR}: {e}")
-			return
-
-	log(f"Watching directory: {driverRts.DATA_DIR}")
-
-	while True:
-		try:
-			files = sorted(os.listdir(driverRts.DATA_DIR))
-
-			for fileName in files:
-				filePath = os.path.join(driverRts.DATA_DIR, fileName)
-				if not os.path.isfile(filePath):
-					continue
-
-				# Decide which port(s) to send to based on suffix
-				if fileName.endswith(".rts-r"):
-					targetPorts = [2060]
-				elif fileName.endswith(".rts-t"):
-					targetPorts = [2061]
-					replaceTransId(fileName) #replace transaction id if possible with transId from previous responses
-				else:
-					#log(f"Skipping file with unknown RTS suffix: {fileName}")
-					continue
-
-				if broadcastFile(filePath, targetPorts=targetPorts):
-
-					# delete the file immediately
-					try:
-						os.remove(filePath)
-						log(f"Deleted file: {filePath}")
-					except Exception as e:
-						log(f"Error deleting file {filePath}: {e}")
-						traceback.print_exc()
-				else:
-					log("Error sending file")
-
-		except Exception as e:
-			log(f"Error while watching directory: {e}")
-			traceback.print_exc()
-
-		time.sleep(SCAN_INTERVAL_SECONDS)
+    log(f"Watching directory: {driverRts.DATA_DIR}")
+    while True:
+        try:
+            for fileName in sorted(os.listdir(driverRts.DATA_DIR)):
+                path = os.path.join(driverRts.DATA_DIR, fileName)
+                if not os.path.isfile(path):
+                    continue
+                if not fileName.endswith((driverRts.EXT_READ, driverRts.EXT_TRANS)):
+                    continue
+                try:
+                    processQueuedFile(fileName)
+                except Exception as error:
+                    log(f"Error routing RTS queue file {fileName}: {error}")
+        except Exception as error:
+            log(f"Error while watching directory: {error}")
+            traceback.print_exc()
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 #############################
-def acceptConnections(serverSocket, port):
-	"""Accept incoming TCP connections on a given socket and spawn a thread for each client."""
-	log(f"Server listening on port {port}")
-	while True:
-		clientSocket, clientAddr = serverSocket.accept()
-		log(f"New client connected from {clientAddr} on port {port}")
-		clientSocket.setblocking(True)
-
-		t = threading.Thread(
-			target=clientLoop,
-			args=(clientSocket, clientAddr, port),
-			daemon=True
-		)
-		t.start()
+def acceptConnections(serverSocket, port, lane, channel):
+    """Accept connections for one lane/channel port."""
+    log(f"Server listening for lane {lane} {channel} on port {port}")
+    while True:
+        clientSocket, clientAddr = serverSocket.accept()
+        log(f"New client connected from {clientAddr} on lane {lane} {channel} port {port}")
+        clientSocket.setblocking(True)
+        threading.Thread(
+            target=clientLoop,
+            args=(clientSocket, clientAddr, port, lane, channel),
+            daemon=True,
+        ).start()
 
 
 #############################
 def main():
+    serverSockets = []
+    try:
+        driverRts.initializeEnableFiles(LANE_PORTS)
+        for port, (lane, channel) in PORT_ROUTES.items():
+            serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            serverSocket.bind((BIND_ADDRESS, port))
+            serverSocket.listen(5)
+            serverSockets.append((serverSocket, port, lane, channel))
 
-	#sendAckInitialize()
-	#sendAckAbort()
+        threading.Thread(target=watchDir, daemon=True).start()
+        for serverSocket, port, lane, channel in serverSockets:
+            threading.Thread(
+                target=acceptConnections,
+                args=(serverSocket, port, lane, channel),
+                daemon=True,
+            ).start()
 
-	serverSockets = []
-
-	# create listeners for all ports
-	for port in PORTS:
-		serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		serverSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-		serverSocket.bind(("", port))
-		serverSocket.listen(5)
-		serverSockets.append((serverSocket, port))
-
-	# start directory watcher
-	watcherThread = threading.Thread(target=watchDir, daemon=True)
-	watcherThread.start()
-
-	# start accept loops for each port
-	for serverSocket, port in serverSockets:
-		t = threading.Thread(
-			target=acceptConnections,
-			args=(serverSocket, port),
-			daemon=True
-		)
-		t.start()
-
-	try:
-		# keep main thread alive to catch KeyboardInterrupt
-		while True:
-			time.sleep(1)
-	except KeyboardInterrupt:
-		log("KeyboardInterrupt received, shutting down...")
-	finally:
-		# close listener sockets
-		for serverSocket, _ in serverSockets:
-			try:
-				serverSocket.close()
-			except Exception:
-				pass
-
-		# close client sockets per port
-		with clientsLock:
-			for port, socketSet in clientsByPort.items():
-				for clientSocket in list(socketSet):
-					try:
-						#print(str(clientSocket))
-						clientSocket.close()
-					except Exception:
-						pass
-				socketSet.clear()
-
-		log("Server shut down cleanly")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log("KeyboardInterrupt received, shutting down...")
+    finally:
+        for serverSocket, _, _, _ in serverSockets:
+            try:
+                serverSocket.close()
+            except Exception:
+                pass
+        with clientsLock:
+            for socketSet in clientsByPort.values():
+                for clientSocket in list(socketSet):
+                    try:
+                        clientSocket.close()
+                    except Exception:
+                        pass
+                socketSet.clear()
+        log("Server shut down cleanly")
 
 
 #############################
 if __name__ == "__main__":
-	main()
+    main()

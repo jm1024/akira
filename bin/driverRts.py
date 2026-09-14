@@ -5,10 +5,11 @@ import json
 import os
 
 import akiraCore
+from rtsProtocol import lane_state_filename, local_lane_id, queue_filename, wire_lane_id
 
 DATA_DIR = akiraCore.DRV_DIR
 
-ENABLE_FILE = "akiraEnabled.rts"
+LEGACY_ENABLE_FILE = "akiraEnabled.rts"
 
 EXT_READ = ".rts-r"
 EXT_TRANS = ".rts-t"
@@ -25,21 +26,60 @@ TAG_AUTHENTIC = "AUTHENTIC"
 
 RTS_CODES = {"00":"Valid Tag", "01":"Zero Balance", "02":"Insufficient Balance", "03":"Ivalid Tag", "04":"Suspended Tag", "05":"Terminated Tag", "06":"Not Registered Tag", "07":"Last Detected Tag", "99":"Others", }
 
-#############################
-def setEnable(state = True):
-	try:
-		#akiraCore.log(f"{datetime.now()} driverRts.setEnable() {str(state)}") # test this!
-		akiraCore.log("driverRts.setEnable() " + str(state))
-	except Exception as ex:
-		print("driverRts.setEnable() error " + str(ex))
-	akiraCore.writeFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE, str(state))
+# The legacy RTS lane flow only permits another fast read while the lane is
+# occupied after the preceding fast read has received a valid response.
+requireValidatedFastFlow = True
+
+# RTS uses the configured slow edge window once. It must not keep searching
+# while the vehicle remains on the slow sensor because a following car's tag
+# can otherwise be assigned to the tagless vehicle at the gate.
+retrySlowWhileOccupied = False
 
 #############################
-def getEnable():
+def enableFile(lane=None):
+	if lane is None:
+		raise ValueError("RTS enable state requires a lane")
+	return akiraCore.TMP_DIR + "/" + lane_state_filename(lane)
+
+#############################
+def initializeEnableFiles(lanes):
+	legacyFile = akiraCore.TMP_DIR + "/" + LEGACY_ENABLE_FILE
+	initialState = "True"
+	if akiraCore.fileExist(legacyFile):
+		legacyState = akiraCore.readFile(legacyFile).strip()
+		if legacyState in ("True", "False"):
+			initialState = legacyState
+	for lane in lanes:
+		stateFile = enableFile(lane)
+		if not akiraCore.fileExist(stateFile):
+			akiraCore.writeFile(stateFile, initialState)
+
+#############################
+def queueMessage(identifier, lane, extension, message):
+	fileName = queue_filename(str(identifier), str(lane), extension)
+	akiraCore.writeFile(DATA_DIR + "/" + fileName, json.dumps(message, default=akiraCore.jsonConverter))
+	return fileName
+
+#############################
+def setEnable(state = True, lane=None):
+	if lane is None:
+		raise ValueError("driverRts.setEnable() requires a lane")
+	try:
+		#akiraCore.log(f"{datetime.now()} driverRts.setEnable() {str(state)}") # test this!
+		akiraCore.log("driverRts.setEnable() " + str(state) + (" lane " + str(lane) if lane is not None else ""))
+	except Exception as ex:
+		print("driverRts.setEnable() error " + str(ex))
+	akiraCore.writeFile(enableFile(lane), str(state))
+
+#############################
+def getEnable(lane=None):
+	if lane is None:
+		raise ValueError("driverRts.getEnable() requires a lane")
 
 	ret = True
 	try:
-		result = akiraCore.readFile(akiraCore.TMP_DIR + "/" + ENABLE_FILE)
+		stateFile = enableFile(lane)
+		result = akiraCore.readFile(stateFile)
 		if result == "False":
 			ret = False
 	except Exception as ex:
@@ -120,7 +160,7 @@ def parseResponses(responses):
 				"code":response["body"]["Result"],
 				"name": thisResponseName,
 				"plaza":response["body"]["PlazaID"],
-				"lane":response["body"]["LaneID"],
+				"lane":local_lane_id(akiraCore.PROJECT_ROOT, response["body"]["LaneID"]),
 				"plate":response["body"]["RegPlateNum"]
 			}
 			parsed.append(new)
@@ -133,8 +173,10 @@ def parseResponses(responses):
 ######################
 def read(data):
 
+	thisLane = data['lane']
+
 	#check wether RTS wants akira data
-	if not getEnable():
+	if not getEnable(thisLane):
 		if DEBUG:
 			print("driverRts.read() akira is disabled, aborting")
 		return
@@ -142,7 +184,6 @@ def read(data):
 	xmit = True
 
 	# get sensor name for this lane
-	thisLane = data['lane']
 	thisDt = data['date']
 	#thisDt = akiraCore.rfStrToDt(thisDtS)
 	thisTID = data['tid']
@@ -192,7 +233,7 @@ def read(data):
 				"TxID": data['id'],
 				"TagID": data['tid'],
 				"PlazaID": akiraCore.plazaId,
-				"LaneID": data['lane'],
+				"LaneID": wire_lane_id(akiraCore.PROJECT_ROOT, thisLane),
 				"DetectedTime": dt,
 				"Antenna": side,
 			},
@@ -200,7 +241,7 @@ def read(data):
 		}
 
 		if xmit:
-			akiraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			queueMessage(data['id'], thisLane, thisExt, contents)
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
 
@@ -217,7 +258,7 @@ def read(data):
 				"TxID": data['id'],
 				"TagID": data['tid'],
 				"PlazaID": akiraCore.plazaId,
-				"LaneID": data['lane'],
+				"LaneID": wire_lane_id(akiraCore.PROJECT_ROOT, thisLane),
 				"DetectedTime": dt,
 				"Result":"01",
 				"Antenna": side,
@@ -226,7 +267,7 @@ def read(data):
 		}
 
 		if xmit:
-			akiraCore.writeFile(DATA_DIR + "/" + data['id'] + thisExt, json.dumps(contents))
+			queueMessage(data['id'], thisLane, thisExt, contents)
 			if DEBUG_XMIT:
 				print("driverRTS sent: " + str(datetime.now()))
 
@@ -256,7 +297,7 @@ def read(data):
 def trans_DISABLED(data):
 
 	#check wether RTS wants akira data
-	if not getEnable():
+	if not getEnable(data['lane']):
 		print("driverRts.trans() akira is disabled, aborting")
 		return
 
@@ -277,7 +318,7 @@ def trans_DISABLED(data):
 			'TxID':data['id'],
 			'TagID':None,
 			'PlazaID':data['plaza'],
-			'LaneID':data['lane'],
+			'LaneID':wire_lane_id(akiraCore.PROJECT_ROOT, data['lane']),
 			'Result':"00",
 			'DetectedTime':None,
 			},
@@ -285,7 +326,7 @@ def trans_DISABLED(data):
 			}
 
 	if xmit:
-		akiraCore.writeFile(DATA_DIR + "/" +data['id'] + EXT_READ, json.dumps(msgNTD, default=akiraCore.jsonConverter))
+		queueMessage(data['id'], data['lane'], EXT_READ, msgNTD)
 
 	msg = ""
 	xmit = True
@@ -299,7 +340,7 @@ def trans_DISABLED(data):
 		'TxID':data['id'],
 		'TagID':data['tid'],
 		'PlazaID':data['plaza'],
-		'LaneID':data['lane'],
+		'LaneID':wire_lane_id(akiraCore.PROJECT_ROOT, data['lane']),
 		'CapturedTime':data['date'].isoformat(),
 		'AnprID':data['id'],
 		'AnprResult':data['plate'],
@@ -309,14 +350,14 @@ def trans_DISABLED(data):
 		}
 
 	if xmit:
-		akiraCore.writeFile(DATA_DIR + "/" + data['id'] + EXT_TRANS, json.dumps(msg, default=akiraCore.jsonConverter))
+		queueMessage(data['id'], data['lane'], EXT_TRANS, msg)
 
 
 ######################
 def noTag(lane, antenna):
 
 	#check wether RTS wants akira data
-	if not getEnable():
+	if not getEnable(lane):
 		print("driverRts.noTag() akira is disabled, aborting")
 		return
 
@@ -335,7 +376,7 @@ def noTag(lane, antenna):
 		'TxID':transId,
 		'TagID':None,
 		'PlazaID':str(akiraCore.plazaId),
-		'LaneID':str(lane),
+		'LaneID':wire_lane_id(akiraCore.PROJECT_ROOT, lane),
 		'Result':"00",
 		'Antenna':str(antenna),
 		'DetectedTime':None,
@@ -344,13 +385,13 @@ def noTag(lane, antenna):
 		}
 
 	if xmit:
-		akiraCore.writeFile(DATA_DIR + "/" + transId + EXT_READ, json.dumps(msgNTD, default=akiraCore.jsonConverter))
+		queueMessage(transId, lane, EXT_READ, msgNTD)
 
 ######################
 def laneClear(lane):
 
 	#check wether RTS wants akira data
-	if not getEnable():
+	if not getEnable(lane):
 		print("driverRts.laneClear() akira is disabled, aborting")
 		return
 
@@ -367,7 +408,7 @@ def laneClear(lane):
 		'body':{
 		'TxID':transId,
 		'PlazaID':str(akiraCore.plazaId),
-		'LaneID':str(lane),
+		'LaneID':wire_lane_id(akiraCore.PROJECT_ROOT, lane),
 		'Result':"00",
 		'ClearedTime':datetime.now().isoformat(),
 		},
@@ -375,13 +416,16 @@ def laneClear(lane):
 		}
 
 	if xmit:
-		akiraCore.writeFile(DATA_DIR + "/" + transId + EXT_TRANS, json.dumps(msgNTD, default=akiraCore.jsonConverter))
+		queueMessage(transId, lane, EXT_TRANS, msgNTD)
 
 ######################
 def cam(data):
+	dev    = data.get('device', {})
+	device = dev.get('name', 'UNKNOWN')
+	lane   = dev.get('lane', 0)
 
 	#check wether RTS wants akira data
-	if not getEnable():
+	if not getEnable(lane):
 		print("driverRts.cam() akira is disabled, aborting")
 		return
 
@@ -401,10 +445,6 @@ def cam(data):
 		thisDt = akiraCore.camStrToDt(thisDtS)
 	except:
 		thisDt = datetime.now()
-
-	dev    = data.get('device', {})
-	device = dev.get('name', 'UNKNOWN')
-	lane   = dev.get('lane', 0)
 
 	#get plate
 	try:
@@ -444,7 +484,7 @@ def cam(data):
 		'TxID':id,
 		'TagID':'',
 		'PlazaID':akiraCore.plazaId,
-		'LaneID':lane,
+		'LaneID':wire_lane_id(akiraCore.PROJECT_ROOT, lane),
 		'CapturedTime':dt.isoformat(),
 		'AnprID':id,
 		'AnprResult':plate, #data['plate'],
@@ -454,7 +494,7 @@ def cam(data):
 		}
 
 	if xmit:
-		akiraCore.writeFile(DATA_DIR + "/" + id + EXT_TRANS, json.dumps(msg, default=akiraCore.jsonConverter))
+		queueMessage(id, lane, EXT_TRANS, msg)
 
 ######################
 def genFakeTagResponse_X(tid):
@@ -490,6 +530,8 @@ def genFakeTagResponse_X(tid):
 #############################
 def writeResponse(msg):
 
-	fileName = datetime.now().strftime("%Y%m%d%H%M%S%f") + EXT_RESPONSE
-	responseFile = DATA_DIR + "/" + fileName
-	akiraCore.writeFile(responseFile, json.dumps(msg))
+	wireLane = msg.get("body", {}).get("LaneID")
+	if wireLane is None:
+		raise ValueError("RTS response is missing body.LaneID")
+	lane = local_lane_id(akiraCore.PROJECT_ROOT, wireLane)
+	queueMessage(datetime.now().strftime("%Y%m%d%H%M%S%f"), lane, EXT_RESPONSE, msg)

@@ -10,3 +10,4 @@ lib/*
 synergy/*
 __pycache__/
 *.py[cod]
+tmp/akiraEnabled.*.rts

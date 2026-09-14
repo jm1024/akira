@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Offline RTS multi-lane routing and isolation checks."""
+
+import contextlib
+import io
+import json
+import os
+import runpy
+import socket
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+
+BIN = Path(__file__).resolve().parent
+
+
+def expect_value_error(callable_):
+    try:
+        callable_()
+    except ValueError:
+        return
+    raise AssertionError("invalid RTS lane configuration was accepted")
+
+
+def child_checks(root):
+    import akiraCore
+    import driverRts
+    from rtsProtocol import (
+        ANPR_CHANNEL,
+        RFID_CHANNEL,
+        lane_endpoints,
+        lane_id_maps,
+        local_lane_id,
+        queue_lane,
+        wire_lane_id,
+    )
+
+    config_path = root / "etc" / "akira.cfg"
+    valid_config = json.loads(config_path.read_text())
+    assert driverRts.requireValidatedFastFlow is True
+    assert driverRts.retrySlowWhileOccupied is False
+    assert lane_endpoints(root) == (
+        "127.0.0.1",
+        {
+            "06": {"rfid": 3060, "anpr": 3061},
+            "07": {"rfid": 3070, "anpr": 3071},
+        },
+    )
+    assert lane_id_maps(root) == (
+        {"06": "SITE06", "07": "SITE07"},
+        {"SITE06": "06", "SITE07": "07"},
+    )
+    assert wire_lane_id(root, "06") == "SITE06"
+    assert local_lane_id(root, "SITE07") == "07"
+
+    invalid_mappings = (
+        {"06": {"rfid": 3060}, "07": {"rfid": 3070, "anpr": 3071}},
+        {"06": {"rfid": 3060, "anpr": 3061}, "07": {"rfid": 3060, "anpr": 3071}},
+        {"06": {"rfid": 3060, "anpr": 3061}, "99": {"rfid": 3090, "anpr": 3091}},
+    )
+    for mapping in invalid_mappings:
+        invalid = json.loads(json.dumps(valid_config))
+        invalid["driverConfig"]["serverRts"]["lanePorts"] = mapping
+        config_path.write_text(json.dumps(invalid))
+        expect_value_error(lambda: lane_endpoints(root))
+    config_path.write_text(json.dumps(valid_config))
+
+    duplicate_wire_ids = json.loads(json.dumps(valid_config))
+    duplicate_wire_ids["driverConfig"]["driverRts"]["laneAliases"]["07"] = "SITE06"
+    config_path.write_text(json.dumps(duplicate_wire_ids))
+    expect_value_error(lambda: lane_endpoints(root))
+    config_path.write_text(json.dumps(valid_config))
+
+    server = runpy.run_path(str(BIN / "serverRts"))
+    server["log"].__globals__["DEBUG"] = False
+    assert server["PORT_ROUTES"] == {
+        3060: ("06", RFID_CHANNEL),
+        3061: ("06", ANPR_CHANNEL),
+        3070: ("07", RFID_CHANNEL),
+        3071: ("07", ANPR_CHANNEL),
+    }
+
+    legacy = root / "tmp" / driverRts.LEGACY_ENABLE_FILE
+    legacy.write_text("False")
+    driverRts.initializeEnableFiles(("06", "07"))
+    assert driverRts.enableFile("06") == str(root / "tmp" / "akiraEnabled.06.rts")
+    assert driverRts.enableFile("07") == str(root / "tmp" / "akiraEnabled.07.rts")
+    assert not driverRts.getEnable("06") and not driverRts.getEnable("07")
+    driverRts.setEnable(True, "06")
+    assert driverRts.getEnable("06") and not driverRts.getEnable("07")
+    driverRts.setEnable(True, "07")
+
+    driverRts.setEnable(False, "06")
+    tmp_cron = runpy.run_path(str(BIN / "tmpCron"))
+    tmp_globals = tmp_cron["main"].__globals__
+    payloads = []
+    tmp_globals["akiraCore"].sidraApiList = lambda: ["http://test.invalid"]
+    tmp_globals["localXmitEvent"] = lambda url, payload: payloads.append(json.loads(payload)) or True
+    with contextlib.redirect_stdout(io.StringIO()):
+        tmp_cron["main"]()
+    assert payloads == [{
+        "akiraEnabled": {"06": "False", "07": "True"},
+        "op": "updateTmp",
+    }]
+    driverRts.setEnable(True, "06")
+
+    detected = {
+        "id": "READ-06",
+        "tid": "TID-SHARED",
+        "date": datetime(2026, 9, 11, 12, 0, 0),
+        "rssi": -42,
+        "side": "fast",
+        "lane": "06",
+        "tidAuthentic": "AUTHENTIC",
+    }
+    driverRts.read(detected)
+    queued = [path for path in (root / "drv").iterdir() if path.name.endswith(driverRts.EXT_READ)]
+    assert len(queued) == 1 and queue_lane(queued[0].name) == "06"
+    wire = json.loads(queued[0].read_text())
+    assert wire == {
+        "header": {"command": "TagDetected", "timestamp": "2026-09-11T12:00:00"},
+        "body": {
+            "TxID": "READ-06",
+            "TagID": "TID-SHARED",
+            "PlazaID": "PRO_PLZ",
+            "LaneID": "SITE06",
+            "DetectedTime": "2026-09-11T12:00:00",
+            "Antenna": "fast",
+        },
+        "hmac": "XXXX",
+    }
+    assert server["routeQueuedFile"](queued[0].name) == ("06", RFID_CHANNEL, 3060)
+
+    peers = {}
+    try:
+        for port in server["PORTS"]:
+            sender, receiver = socket.socketpair()
+            receiver.settimeout(0.05)
+            server["clientsByPort"][port].add(sender)
+            peers[port] = (sender, receiver)
+        assert server["processQueuedFile"](queued[0].name)
+        assert json.loads(peers[3060][1].recv(65536)) == wire
+        for port in (3061, 3070, 3071):
+            try:
+                peers[port][1].recv(1)
+            except socket.timeout:
+                pass
+            else:
+                raise AssertionError(f"lane 06 RFID message leaked to port {port}")
+    finally:
+        for port, (sender, receiver) in peers.items():
+            server["clientsByPort"][port].discard(sender)
+            sender.close()
+            receiver.close()
+
+    now = datetime.now().isoformat()
+    results = {
+        lane: {
+            "header": {"command": "TagResult", "timestamp": now},
+            "body": {
+                "TagID": "TID-SHARED",
+                "LaneID": "SITE" + lane,
+                "AnprID": "ANPR-" + lane,
+                "Result": "00",
+                "PlazaID": "TEST",
+                "RegPlateNum": "TEST" + lane,
+            },
+            "hmac": "XXXX",
+        }
+        for lane in ("06", "07")
+    }
+    for lane, result in results.items():
+        server["logResponse"](result, lane)
+    assert server["findTransId"]("TID-SHARED", "06") == "ANPR-06"
+    assert server["findTransId"]("TID-SHARED", "07") == "ANPR-07"
+    parsed = driverRts.parseResponses(list(results.values()))
+    assert [response["lane"] for response in parsed] == ["06", "07"]
+
+    for lane in ("06", "07"):
+        anpr = {
+            "header": {"command": "ANPRInfo", "timestamp": now},
+            "body": {
+                "TxID": "TX-" + lane,
+                "TagID": "TID-SHARED",
+                "PlazaID": "PRO_PLZ",
+                "LaneID": "SITE" + lane,
+                "CapturedTime": now,
+                "AnprID": "ORIGINAL-" + lane,
+                "AnprResult": "TEST" + lane,
+                "AnprImage": "",
+            },
+            "hmac": "XXXX",
+        }
+        name = driverRts.queueMessage("CAM-" + lane, lane, driverRts.EXT_TRANS, anpr)
+        assert server["routeQueuedFile"](name) == (
+            lane,
+            ANPR_CHANNEL,
+            valid_config["driverConfig"]["serverRts"]["lanePorts"][lane]["anpr"],
+        )
+        server["replaceTransId"](name, lane)
+        updated = json.loads((root / "drv" / name).read_text())
+        assert updated["body"]["AnprID"] == "ANPR-" + lane
+        (root / "drv" / name).unlink()
+
+    before = set((root / "drv").iterdir())
+    mismatch = {
+        "header": {"command": "TagResult", "timestamp": now},
+        "body": {"LaneID": "SITE07", "TagID": "WRONG", "Result": "00"},
+        "hmac": "XXXX",
+    }
+    assert not server["handleClientMessage"](
+        None, ("test", 1), 3060, "06", RFID_CHANNEL, json.dumps(mismatch).encode()
+    )
+    assert set((root / "drv").iterdir()) == before
+
+    abort = {
+        "header": {"command": "AbortReader", "timestamp": now},
+        "body": {"LaneID": "SITE06"},
+        "hmac": "XXXX",
+    }
+    assert server["handleClientMessage"](
+        None, ("test", 1), 3060, "06", RFID_CHANNEL, json.dumps(abort).encode()
+    )
+    assert not driverRts.getEnable("06") and driverRts.getEnable("07")
+    ack_files = [path for path in (root / "drv").iterdir() if path.name.endswith(driverRts.EXT_TRANS)]
+    assert len(ack_files) == 1
+    ack = json.loads(ack_files[0].read_text())
+    assert ack["header"]["command"] == "AbortReader"
+    assert ack["body"] == {"Result": "ACK", "hmac": "XXXX"}
+    assert server["routeQueuedFile"](ack_files[0].name) == ("06", ANPR_CHANNEL, 3061)
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--child":
+        child_checks(Path(sys.argv[2]))
+        print("RTS per-lane port checks passed")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="akira-rts-lanes-") as temp:
+        root = Path(temp)
+        (root / "etc").mkdir()
+        config = {
+            "driversRead": [],
+            "driversTrans": [],
+            "driversCam": [],
+            "driversXmit": [],
+            "driversServer": [],
+            "driverConfig": {
+                "serverRts": {
+                    "bind": "127.0.0.1",
+                    "lanePorts": {
+                        "06": {"rfid": 3060, "anpr": 3061},
+                        "07": {"rfid": 3070, "anpr": 3071},
+                    },
+                },
+                "driverRts": {
+                    "laneAliases": {"06": "SITE06", "07": "SITE07"},
+                },
+            },
+            "plazaId": "PRO_PLZ",
+            "lanes": [{"number": "06"}, {"number": "07"}],
+            "readers": [],
+            "backupReaders": [],
+            "cams": [],
+            "massSensors": [],
+            "ipList": [],
+        }
+        (root / "etc" / "akira.cfg").write_text(json.dumps(config))
+        env = os.environ.copy()
+        env["AKIRA_ROOT"] = str(root)
+        env["PYTHONPATH"] = str(BIN)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--child", str(root)],
+            cwd="/",
+            env=env,
+            check=True,
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -290,14 +290,15 @@ def check_reader_passage_flow():
     assert list(flow.waiting) == [fresh] and flow.retired == [obsolete], "clear approach retained phantom startup cars"
 
     names = {"LaneContext", "laneThread", "resetWindow", "readWindow", "windowExpired",
-             "massClearReady", "lockoutBreak"}
+             "massClearReady", "lockoutBreak", "recordFastAcceptance",
+             "recordFastValidation", "fastTriggerAllowed"}
     tree = ast.parse((BIN_DIR / "reader").read_text())
     module = ast.Module(body=[node for node in tree.body
                              if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names],
                         type_ignores=[])
 
-    for mode in ("miss", "fast", "pending"):
-        fast_success = mode != "miss"
+    for mode in ("miss", "fast", "pending", "rts-miss"):
+        fast_success = mode not in ("miss", "rts-miss")
         sent, errors, ended, flows = [], [], [], []
         allow_slow = threading.Event()
         stopped = threading.Event()
@@ -319,7 +320,13 @@ def check_reader_passage_flow():
             "cleanOldRf": lambda *a: None, "cleanSquelch": lambda *a: None,
             "notifyLaneClear": lambda *a: None, "debugMass": lambda *a: None,
             "akiraCore": SimpleNamespace(log=errors.append),
-            "readDrivers": {"test": SimpleNamespace(noTag=lambda *a: None, passageEnd=lambda lane, passage: ended.append(passage))},
+            "readDrivers": {
+                "test": SimpleNamespace(
+                    noTag=lambda *a: None,
+                    passageEnd=lambda lane, passage: ended.append(passage),
+                    retrySlowWhileOccupied=mode != "rts-miss",
+                )
+            },
         }
         for name in ("DEBUG_MASS", "DEBUG_DRIVER", "DEBUG_DRIVER_RESPONSES", "GEN_FAKE_TAG_RESPONSE",
                      "LOG_STATS", "DEBUG_SQUELCH", "DEBUG_READ_MONITOR", "DEBUG_WINDOW"):
@@ -370,7 +377,8 @@ def check_reader_passage_flow():
                 mass(0, 1, 1)
                 wait_until(lambda: flows[0].slow is not None)
                 # Remain stopped beyond several configured slow windows before
-                # RF becomes usable. The slow antenna must still authorize.
+                # RF becomes usable. Drivers with retries enabled must still
+                # authorize; RTS must stop after its original window expires.
                 time.sleep(0.18)
                 allow_slow.set()
                 if fast_success:
@@ -380,9 +388,13 @@ def check_reader_passage_flow():
                         context.responseQ.put(dict(type="tagResult", id=sent[0]["id"], passageID=passage_id, gateAuthorized=True))
                         wait_until(lambda: flows[0].slow.authorized)
                     assert [r["side"] for r in sent] == ["fast"], "authorized fast car was submitted again at slow"
-                else:
+                elif mode == "miss":
                     wait_until(lambda: bool(sent))
                     assert [r["side"] for r in sent] == ["slow"], "missed fast read never reached slow fallback"
+                else:
+                    time.sleep(0.08)
+                    assert not sent, "RTS reopened an expired slow window while the lane remained occupied"
+                    continue
                 assert sent[0]["passageID"] == passage_id, "slow lost its original sensor passage identity"
                 mass(0, 1, 0)
                 wait_until(lambda: flows[0].slow is not None and flows[0].slow.release_at is not None)
@@ -396,6 +408,55 @@ def check_reader_passage_flow():
                 stopped.set()
                 worker.join(2)
                 assert not worker.is_alive()
+
+    # RTS restores the proven fast-flow rule: an occupied-lane fast trigger is
+    # allowed only once after the previous fast TID receives a valid result.
+    policy_names = {"LaneContext", "recordFastAcceptance", "recordFastValidation",
+                    "fastTriggerAllowed"}
+    policy_module = ast.Module(
+        body=[node for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in policy_names],
+        type_ignores=[],
+    )
+    policy_namespace = {
+        "queue": queue,
+        "threading": threading,
+        "massSensor": massSensor,
+        "readDrivers": {
+            "driverRts": SimpleNamespace(
+                requireValidatedFastFlow=True,
+                retrySlowWhileOccupied=False,
+            )
+        },
+    }
+    exec(compile(policy_module, str(BIN_DIR / "reader"), "exec"), policy_namespace)
+    rts_context = policy_namespace["LaneContext"](
+        "06", {"ports": {"fast": [0], "mid": [1], "slow": [2]}},
+    )
+    assert not rts_context.retrySlowWhileOccupied, "RTS slow retries were not disabled"
+    record_acceptance = policy_namespace["recordFastAcceptance"]
+    record_validation = policy_namespace["recordFastValidation"]
+    trigger_allowed = policy_namespace["fastTriggerAllowed"]
+    record_acceptance(rts_context, {"tid": "FIRST"})
+    record_validation(rts_context, {"tid": "OTHER", "valid": True})
+    assert not trigger_allowed(rts_context, 1, 0), "RTS accepted validation for another TID"
+    record_validation(rts_context, {"tid": "FIRST", "valid": True})
+    assert not trigger_allowed(rts_context, 1, 0), "late RTS validation leaked past a blocked car"
+    record_acceptance(rts_context, {"tid": "INVALID"})
+    record_validation(rts_context, {"tid": "INVALID", "valid": False})
+    assert not trigger_allowed(rts_context, 1, 0), "RTS accepted an invalid result"
+    record_acceptance(rts_context, {"tid": "VALID"})
+    record_validation(rts_context, {"tid": "VALID", "valid": True})
+    assert trigger_allowed(rts_context, 1, 0), "RTS blocked validated fast flow"
+    assert not trigger_allowed(rts_context, 1, 0), "RTS reused a previous validation"
+    assert trigger_allowed(rts_context, 0, 0), "RTS blocked a clear-lane fast trigger"
+
+    policy_namespace["readDrivers"] = {"driverSynergy": SimpleNamespace()}
+    synergy_context = policy_namespace["LaneContext"](
+        "06", {"ports": {"fast": [0], "mid": [1], "slow": [2]}},
+    )
+    assert synergy_context.retrySlowWhileOccupied, "Synergy slow retries were disabled"
+    assert trigger_allowed(synergy_context, 1, 1), "RTS fast-flow policy affected Synergy"
 
 
 def check_mass_transition_reporting():
@@ -1933,6 +1994,7 @@ def main():
     check_synergy_lane_protocol()
     check_synergy_live_dispatch()
     subprocess.run([sys.executable, str(BIN_DIR / "test-synergy-ports")], check=True)
+    subprocess.run([sys.executable, str(BIN_DIR / "test-rts-lanes")], check=True)
     check_synergy_deadlines_and_storage()
     check_synergy_passage_delivery()
     check_numato_inventory()

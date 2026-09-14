@@ -3,9 +3,8 @@ import os
 import json
 import requests
 import akiraCore
-
-# Define file paths
-AKIRA_FILE = "akiraEnabled.rts"
+from rtsProtocol import lane_state_filename
+from synergyProtocol import configured_lane_ids
 
 #######################################
 def checkFile(file_path):
@@ -48,10 +47,14 @@ def localXmitEvent(url, payload):
 
 def main():
     data = {}
-    
-    akiraPath = os.path.join(akiraCore.TMP_DIR, AKIRA_FILE)
-    if os.path.exists(akiraPath):
-        data['akiraEnabled'] = checkFile(akiraPath)
+
+    laneStates = {}
+    for lane in configured_lane_ids(akiraCore.PROJECT_ROOT):
+        akiraPath = os.path.join(akiraCore.TMP_DIR, lane_state_filename(lane))
+        if os.path.exists(akiraPath):
+            laneStates[lane] = checkFile(akiraPath)
+    if laneStates:
+        data['akiraEnabled'] = laneStates
     
     if not data:
         print("No files found to transmit.")

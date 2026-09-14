@@ -161,6 +161,44 @@ class LaneContext:
         self.squelch = []
         self.lock = threading.RLock()
         self.arbitrationWindowActivity = None
+        self.requireValidatedFastFlow = any(
+            bool(getattr(driverModule, "requireValidatedFastFlow", False))
+            for driverModule in readDrivers.values()
+        )
+        self.retrySlowWhileOccupied = all(
+            bool(getattr(driverModule, "retrySlowWhileOccupied", True))
+            for driverModule in readDrivers.values()
+        )
+        self.lastFastGood = False
+        self.lastFastTid = None
+        self.lastFastValid = False
+
+
+def recordFastAcceptance(context, read):
+    if not context.requireValidatedFastFlow:
+        return
+    context.lastFastGood = True
+    context.lastFastTid = read.get("tid")
+    context.lastFastValid = False
+
+
+def recordFastValidation(context, response):
+    if not context.requireValidatedFastFlow or not context.lastFastGood:
+        return
+    if response.get("tid") == context.lastFastTid and response.get("valid"):
+        context.lastFastValid = True
+
+
+def fastTriggerAllowed(context, mid, slow):
+    if not context.requireValidatedFastFlow:
+        return True
+    previousFastValid = context.lastFastGood and context.lastFastValid
+    # Every real fast edge supersedes the preceding one. Consume its state even
+    # when this trigger is blocked so a late response cannot authorize a third car.
+    context.lastFastGood = False
+    context.lastFastTid = None
+    context.lastFastValid = False
+    return previousFastValid or (mid == 0 and slow == 0)
 
 
 class ReaderCommandError(RuntimeError):
@@ -1623,6 +1661,7 @@ def laneThread(context, stop_event):
 
             for response in responses:
                 if response.get('type') == "tagResult":
+                    recordFastValidation(context, response)
                     passages.response(response, datetime.now() + timedelta(seconds=1))
 
             # if mass has changed state - set windows
@@ -1701,9 +1740,18 @@ def laneThread(context, stop_event):
                             if hasattr(driverModule, "passageEnd"):
                                 driverModule.passageEnd(lane, retired)
                     passages.retired.clear()
-                    begin = massDate + timedelta(milliseconds=fastPre)
-                    end = massDate + timedelta(milliseconds=fastPost)
-                    fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
+                    if fastTriggerAllowed(context, massMain, massRear):
+                        begin = massDate + timedelta(milliseconds=fastPre)
+                        end = massDate + timedelta(milliseconds=fastPost)
+                        fastWindow = readWindow(fastWindow, begin, end, f"fast - trip sensor {massTrip}{massMain}{massRear}")
+                    else:
+                        fastWindow = resetWindow(
+                            f"fast - lane occupied without validated flow {massTrip}{massMain}{massRear}"
+                        )
+                        print(
+                            f"lane:{lane} NOT READING FAST {massTrip}{massMain}{massRear} "
+                            "- lane occupied without a valid previous fast read"
+                        )
 
 
                 # Save change timestamps before replacing the previous state.
@@ -1745,6 +1793,7 @@ def laneThread(context, stop_event):
                 acceptCandidate(context, read)
                 read.update(passages.fast.read_metadata())
                 passages.fast.pending_id = read['id']
+                recordFastAcceptance(context, read)
                 sendRead(read)
 
                 #flushReports(ANTENNA_FAST)
@@ -1776,7 +1825,8 @@ def laneThread(context, stop_event):
             slowReady = (massRear == 1 and slowPassage is not None and not slowPassage.authorized
                          and not slowPassage.uncertain and slowPassage.pending_id is None
                          and datetime.now() >= slowPassage.retry_at)
-            if slowReady and massRear == 1 and not slowWindow['reading']:
+            if (context.retrySlowWhileOccupied and slowReady
+                    and massRear == 1 and not slowWindow['reading']):
                 now = datetime.now()
                 slowWindow = readWindow(slowWindow, now + timedelta(milliseconds=slowPre),
                                         now + timedelta(milliseconds=slowPost), "slow - stopped-car retry")
