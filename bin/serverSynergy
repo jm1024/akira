@@ -6,7 +6,7 @@ UTF-8 JSON terminated by LF. Each configured lane has its own TCP port and
 controller connection. The port determines the lane; a response may omit laneID
 but must match that lane if supplied. Each lane is polled on connect and after
 200 ms of inactivity, with retransmission when no laneState response arrives
-within 20 ms.
+within 40 ms.
 
 Local Akira processes submit commands through a Unix socket. A command is
 accepted only while the XLC connection is live and must complete inside the
@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_DATA_DIR = str(PROJECT_ROOT / "synergy")
 DEFAULT_HEARTBEAT_MS = 200.0
-DEFAULT_RETRY_MS = 20.0
+DEFAULT_RETRY_MS = 40.0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_COMMAND_POLL_MS = 10.0
 DEFAULT_MAX_LINE_BYTES = 64 * 1024

@@ -50,6 +50,16 @@ list. Server `--lanes 06,07` (or `AKIRA_LANES`) explicitly overrides its support
 IDs when testing another configuration. The test client serves one configured
 lane, inferred from its required port argument or specified with `--lane`.
 
+When a configured lane ID is not numeric, map it to the numeric `EntryLane`
+transaction field under `driverConfig.driverSynergy.entryLanes`:
+
+```json
+"entryLanes": {"w08": 8, "e08": 8}
+```
+
+The configured string remains the wire `laneID`; only `EntryLane` uses the
+mapped integer. Numeric lane IDs continue to work without an explicit mapping.
+
 The server rejects local commands with missing or unknown lanes. There is no
 broadcast or fallback to another lane. If a reply supplies `laneID`, it must
 exactly match the port's lane; a mismatched reply cannot complete an exchange or

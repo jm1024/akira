@@ -944,6 +944,23 @@ def check_synergy_transaction_fields():
     job = {"id": "TEST", "tid": "TEST", "lane": "06"}
     with tempfile.TemporaryDirectory(prefix="akira-synergy-fields-") as temp_dir:
         driver = AkiraDriver(data_dir=temp_dir, driver_config=config)
+        mapped_config = deepcopy(config)
+        mapped_config["entryLanes"] = {"w08": 8, "e08": "8"}
+        mapped_driver = AkiraDriver(data_dir=temp_dir, driver_config=mapped_config)
+        mapped_result = mapped_driver._evaluate_lookup(
+            dict(job, lane="w08"), response, "test", 1
+        )
+        if mapped_result["synergyFields"]["EntryLane"] != 8:
+            fail("Synergy did not map the configured lane ID to numeric EntryLane")
+        for entry_lanes in ([], {"": 8}, {"w08": True}, {"w08": 1000}):
+            invalid_config = deepcopy(config)
+            invalid_config["entryLanes"] = entry_lanes
+            try:
+                AkiraDriver(data_dir=temp_dir, driver_config=invalid_config)
+            except ValueError:
+                pass
+            else:
+                fail(f"Synergy accepted invalid entryLanes mapping: {entry_lanes!r}")
         for section, field, value in (
             ("tag", "type", None), ("tag", "type", True),
             ("tag", "type", "100"), ("tag", "balance", "NaN"),

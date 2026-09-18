@@ -199,9 +199,24 @@ class AkiraDriver:
         self.default_timezone = _timezone_from_offset(timezone_offset)
 
         driver_config = dict(driver_config or {})
+        entry_lanes = driver_config.get("entryLanes", {})
         tag_status = driver_config.get("tagStatus", {})
         eligibility = driver_config.get("eligibility", {})
         dispatch = driver_config.get("dispatch", {})
+        if not isinstance(entry_lanes, dict):
+            raise ValueError("driverSynergy.entryLanes must be an object")
+        self.entry_lanes = {}
+        for configured_lane, entry_lane in entry_lanes.items():
+            if not isinstance(configured_lane, str) or not configured_lane.strip():
+                raise ValueError("driverSynergy.entryLanes keys must be non-empty lane strings")
+            parsed_entry_lane = _integer_code(
+                entry_lane, f"driverSynergy.entryLanes.{configured_lane}"
+            )
+            if parsed_entry_lane > 999:
+                raise ValueError(
+                    f"driverSynergy.entryLanes.{configured_lane} is outside its permitted range"
+                )
+            self.entry_lanes[configured_lane] = parsed_entry_lane
         if not isinstance(tag_status, dict):
             raise ValueError("driverSynergy.tagStatus must be an object")
         if not isinstance(eligibility, dict):
@@ -317,6 +332,12 @@ class AkiraDriver:
             self.workers[lane] = worker
             worker.start()
             return jobs
+
+    def _entry_lane(self, lane):
+        lane = str(lane or "")
+        if lane in self.entry_lanes:
+            return self.entry_lanes[lane]
+        return _integer_code(lane, "EntryLane")
 
     def _expired(self, job):
         with self.worker_lock:
@@ -598,7 +619,7 @@ class AkiraDriver:
                 "VehiclePlateNo": _first_value(mappings, ("vehiclePlateNum", "vehiclePlateNo")),
                 "TcClass": _integer_code(fare.get("vehicleClass"), "TcClass"),
                 "Fare": fare_sen,
-                "EntryLane": _integer_code(job.get("lane"), "EntryLane"),
+                "EntryLane": self._entry_lane(job.get("lane")),
             }
             fields["VehicleClass"] = _integer_code(
                 job.get("VehicleClass", fields["TcClass"]), "VehicleClass"
