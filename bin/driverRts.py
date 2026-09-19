@@ -35,6 +35,11 @@ requireValidatedFastFlow = True
 # can otherwise be assigned to the tagless vehicle at the gate.
 retrySlowWhileOccupied = False
 
+# A slow edge may submit only a passage already established by a fast edge or
+# by downstream occupancy present when the reader starts. After a confirmed
+# lane clear, an isolated slow edge must not create and submit a new RTS passage.
+requireTrackedSlowPassage = True
+
 #############################
 def enableFile(lane=None):
 	if lane is None:

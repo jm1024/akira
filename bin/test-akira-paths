@@ -291,13 +291,13 @@ def check_reader_passage_flow():
 
     names = {"LaneContext", "laneThread", "resetWindow", "readWindow", "windowExpired",
              "massClearReady", "lockoutBreak", "recordFastAcceptance",
-             "recordFastValidation", "fastTriggerAllowed"}
+             "recordFastValidation", "resetFastValidation", "fastTriggerAllowed"}
     tree = ast.parse((BIN_DIR / "reader").read_text())
     module = ast.Module(body=[node for node in tree.body
                              if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names],
                         type_ignores=[])
 
-    for mode in ("miss", "fast", "pending", "rts-miss"):
+    for mode in ("miss", "fast", "pending", "rts-miss", "rts-clear", "rts-orphan-slow"):
         fast_success = mode not in ("miss", "rts-miss")
         sent, errors, ended, flows = [], [], [], []
         allow_slow = threading.Event()
@@ -324,7 +324,11 @@ def check_reader_passage_flow():
                 "test": SimpleNamespace(
                     noTag=lambda *a: None,
                     passageEnd=lambda lane, passage: ended.append(passage),
-                    retrySlowWhileOccupied=mode != "rts-miss",
+                    requireValidatedFastFlow=mode in ("rts-miss", "rts-clear"),
+                    retrySlowWhileOccupied=mode not in (
+                        "rts-miss", "rts-clear", "rts-orphan-slow"
+                    ),
+                    requireTrackedSlowPassage=mode == "rts-orphan-slow",
                 )
             },
         }
@@ -403,6 +407,23 @@ def check_reader_passage_flow():
                 assert flows[0].slow.id == passage_id and not ended, "brief slow clear split the car into two passages"
                 mass(0, 0, 0)
                 wait_until(lambda: passage_id in ended)
+                if mode in ("rts-clear", "rts-orphan-slow"):
+                    wait_until(lambda: not context.lastFastGood)
+                if mode == "rts-clear":
+                    sent_before_blocked_fast = len(sent)
+                    mass(0, 1, 0)
+                    mass(1, 1, 0)
+                    time.sleep(0.08)
+                    assert len(sent) == sent_before_blocked_fast, (
+                        "RTS reused validation from a passage that had fully cleared"
+                    )
+                elif mode == "rts-orphan-slow":
+                    sent_before_orphan_slow = len(sent)
+                    mass(0, 0, 1)
+                    time.sleep(0.08)
+                    assert len(sent) == sent_before_orphan_slow, (
+                        "RTS submitted an untracked slow passage after lane clear"
+                    )
                 assert not errors, errors
             finally:
                 stopped.set()
@@ -412,7 +433,7 @@ def check_reader_passage_flow():
     # RTS restores the proven fast-flow rule: an occupied-lane fast trigger is
     # allowed only once after the previous fast TID receives a valid result.
     policy_names = {"LaneContext", "recordFastAcceptance", "recordFastValidation",
-                    "fastTriggerAllowed"}
+                    "resetFastValidation", "fastTriggerAllowed"}
     policy_module = ast.Module(
         body=[node for node in tree.body
               if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in policy_names],
@@ -426,6 +447,7 @@ def check_reader_passage_flow():
             "driverRts": SimpleNamespace(
                 requireValidatedFastFlow=True,
                 retrySlowWhileOccupied=False,
+                requireTrackedSlowPassage=True,
             )
         },
     }
@@ -434,8 +456,10 @@ def check_reader_passage_flow():
         "06", {"ports": {"fast": [0], "mid": [1], "slow": [2]}},
     )
     assert not rts_context.retrySlowWhileOccupied, "RTS slow retries were not disabled"
+    assert rts_context.requireTrackedSlowPassage, "RTS accepted untracked slow passages"
     record_acceptance = policy_namespace["recordFastAcceptance"]
     record_validation = policy_namespace["recordFastValidation"]
+    reset_validation = policy_namespace["resetFastValidation"]
     trigger_allowed = policy_namespace["fastTriggerAllowed"]
     record_acceptance(rts_context, {"tid": "FIRST"})
     record_validation(rts_context, {"tid": "OTHER", "valid": True})
@@ -450,6 +474,10 @@ def check_reader_passage_flow():
     assert trigger_allowed(rts_context, 1, 0), "RTS blocked validated fast flow"
     assert not trigger_allowed(rts_context, 1, 0), "RTS reused a previous validation"
     assert trigger_allowed(rts_context, 0, 0), "RTS blocked a clear-lane fast trigger"
+    record_acceptance(rts_context, {"tid": "CLEARED"})
+    record_validation(rts_context, {"tid": "CLEARED", "valid": True})
+    reset_validation(rts_context)
+    assert not trigger_allowed(rts_context, 1, 0), "RTS reused validation after lane clear"
 
     policy_namespace["readDrivers"] = {"driverSynergy": SimpleNamespace()}
     synergy_context = policy_namespace["LaneContext"](
@@ -477,6 +505,7 @@ def check_mass_transition_reporting():
     snapshots, logged = {}, []
     namespace = {
         "queue": queue, "threading": threading, "massSensor": massSensor,
+        "readDrivers": {},
         "datetime": datetime, "timedelta": timedelta, "json": json,
         "LOG_READS": True, "LOG_READS_FILE": "test-reads.log", "DEBUG_MASS_DETAIL": False,
         "sendLine": lambda *args: None, "parseGpio": massSensor.parseGpio,

@@ -42,6 +42,7 @@ def child_checks(root):
     valid_config = json.loads(config_path.read_text())
     assert driverRts.requireValidatedFastFlow is True
     assert driverRts.retrySlowWhileOccupied is False
+    assert driverRts.requireTrackedSlowPassage is True
     assert lane_endpoints(root) == (
         "127.0.0.1",
         {

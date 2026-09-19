@@ -169,6 +169,10 @@ class LaneContext:
             bool(getattr(driverModule, "retrySlowWhileOccupied", True))
             for driverModule in readDrivers.values()
         )
+        self.requireTrackedSlowPassage = any(
+            bool(getattr(driverModule, "requireTrackedSlowPassage", False))
+            for driverModule in readDrivers.values()
+        )
         self.lastFastGood = False
         self.lastFastTid = None
         self.lastFastValid = False
@@ -189,15 +193,19 @@ def recordFastValidation(context, response):
         context.lastFastValid = True
 
 
+def resetFastValidation(context):
+    context.lastFastGood = False
+    context.lastFastTid = None
+    context.lastFastValid = False
+
+
 def fastTriggerAllowed(context, mid, slow):
     if not context.requireValidatedFastFlow:
         return True
     previousFastValid = context.lastFastGood and context.lastFastValid
     # Every real fast edge supersedes the preceding one. Consume its state even
     # when this trigger is blocked so a late response cannot authorize a third car.
-    context.lastFastGood = False
-    context.lastFastTid = None
-    context.lastFastValid = False
+    resetFastValidation(context)
     return previousFastValid or (mid == 0 and slow == 0)
 
 
@@ -1692,6 +1700,7 @@ def laneThread(context, stop_event):
                         slowWindow = resetWindow(f"slow - lane clear {massTrip}{massMain}{massRear}")
                         lastMass["lastUnlocked"] = datetime.now()
                         lastMass["unlockLockout"] = False
+                        resetFastValidation(context)
                         notifyLaneClear(lane)
                         passages.clear()
                     else:
@@ -1708,14 +1717,24 @@ def laneThread(context, stop_event):
                 #################
                 #if theres a change in rear
                 if massRear == 1 and lastMass['rear'] != 1:
+                    trackedSlowPassage = passages.slow is not None or bool(passages.waiting)
                     passage = passages.slow_trigger()
                     for driverModule in readDrivers.values():
                         if hasattr(driverModule, "passageState"):
                             driverModule.passageState(lane, passage.id, True)
-                    begin = massDate + timedelta(milliseconds=slowPre)
-                    end   = massDate + timedelta(milliseconds=slowPost)
-                    #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
-                    slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
+                    if context.requireTrackedSlowPassage and not trackedSlowPassage:
+                        slowWindow = resetWindow(
+                            f"slow - no tracked passage {massTrip}{massMain}{massRear}"
+                        )
+                        print(
+                            f"lane:{lane} NOT READING SLOW {massTrip}{massMain}{massRear} "
+                            "- no tracked passage"
+                        )
+                    else:
+                        begin = massDate + timedelta(milliseconds=slowPre)
+                        end   = massDate + timedelta(milliseconds=slowPost)
+                        #fastWindow = lockWindow("fast - main sensor") # <--- JM do we want this?
+                        slowWindow = readWindow(slowWindow, begin, end, f"slow - rear sensor {massTrip}{massMain}{massRear}")
                 elif massRear == 0 and lastMass['rear'] == 1:
                     passage = passages.slow
                     passages.pause_slow(massDate + timedelta(milliseconds=context.mass_config['slowClearDebounceMs']))
@@ -1890,6 +1909,7 @@ def laneThread(context, stop_event):
                 context.clear_debounce_ms,
             )
             if lockoutChanged:
+                resetFastValidation(context)
                 notifyLaneClear(lane)
                 passages.clear()
                 debugMass(context, massTrip, massMain, massRear, fastWindow, slowWindow, lastMass)
